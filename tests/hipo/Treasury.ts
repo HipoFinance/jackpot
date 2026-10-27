@@ -1,0 +1,1355 @@
+import {
+    Address,
+    beginCell,
+    Builder,
+    Cell,
+    Contract,
+    contractAddress,
+    ContractProvider,
+    ContractState,
+    Dictionary,
+    DictionaryValue,
+    Sender,
+    SendMode,
+    Slice,
+    TupleBuilder,
+} from '@ton/core'
+import { op, tonValue } from './common'
+
+export interface Times {
+    currentRoundSince: bigint
+    participateSince: bigint
+    participateUntil: bigint
+    nextRoundSince: bigint
+    nextRoundUntil: bigint
+    stakeHeldFor: bigint
+}
+
+export interface TreasuryFees {
+    requestLoanFee: bigint
+    depositCoinsFee: bigint
+    unstakeAllTokensFee: bigint
+}
+
+export enum ParticipationState {
+    Open,
+    Distributing,
+    Staked,
+    Validating,
+    Held,
+    Recovering,
+    ReadyToBurn,
+    Burning,
+}
+
+export interface Request {
+    minPayment: bigint
+    /** Out of 65535. A bid made on the old 0-255 scale is exactly this value divided by 257. */
+    borrowerRewardShare: bigint
+    loanAmount: bigint
+    accrueAmount: bigint
+    stakeAmount: bigint
+    /** borrowerFee snapshotted when the request was made, so a later change cannot reprice it. */
+    requestFee: bigint
+    /**
+     * The borrower's cap on loan + accrue + collateral, 0n for none. Absent on a request packed before the
+     * field existed, which the treasury reads as uncapped; leave it out here to build such a request.
+     */
+    maxStake?: bigint
+    newStakeMsg: Cell
+}
+
+export interface LoanRequest {
+    /** False when the round is unknown or the borrower has no request in it. Every other field is 0 then. */
+    found: boolean
+    /** The participation state the request is conceptually in. Meaningless unless `found`. */
+    stage: ParticipationState
+    minPayment: bigint
+    /** Out of 65535. */
+    borrowerRewardShare: bigint
+    loanAmount: bigint
+    accrueAmount: bigint
+    stakeAmount: bigint
+    /** The borrower fee snapshotted when the request was made. */
+    requestFee: bigint
+    /** The borrower's cap on loan + accrue + collateral, 0n for none. */
+    maxStake: bigint
+}
+
+export interface Participation {
+    state?: ParticipationState
+    size?: bigint
+    sorted?: Dictionary<bigint, Dictionary<bigint, unknown>>
+    requests?: Dictionary<bigint, Request>
+    /**
+     * Internal to the loan decision, like `accepted` and `accrued`: the requests the decision turned
+     * down, held only until `process_loan_requests` refunds them, seconds later. Kept as the raw
+     * dictionary cell and deliberately NOT parsed; do not read it. `getLoanRequest` finds a borrower's
+     * request in any stage.
+     */
+    rejected?: Cell | null
+    /**
+     * Internal to `decide_loan_requests`: the accepted loans, held only between the messages of one
+     * decide chain and keyed however that loop needs (today by room per GRAM, then address). Kept as
+     * the raw dictionary cell and deliberately NOT parsed, so its layout can change with the contract
+     * without breaking any reader. Round-tripped untouched; do not read it.
+     */
+    accepted?: Cell | null
+    /**
+     * Internal to the loan decision, like `accepted`: the decided loans waiting for
+     * `process_loan_requests` to send their stakes, held only between the messages of that chain. Kept
+     * as the raw dictionary cell and deliberately NOT parsed; do not read it. A decided loan is in
+     * `staked` once its stake is sent, and `getLoanRequest` finds a borrower's request in any stage.
+     */
+    accrued?: Cell | null
+    staked?: Dictionary<bigint, Request>
+    recovering?: Dictionary<bigint, Request>
+    totalStaked?: bigint
+    totalRecovered?: bigint
+    currentVsetHash?: bigint
+    stakeHeldFor?: bigint
+    stakeHeldUntil?: bigint
+}
+
+export interface TreasuryConfig {
+    totalCoins: bigint
+    totalTokens: bigint
+    totalStaking: bigint
+    totalUnstaking: bigint
+    totalBorrowersStake: bigint
+    totalRequestFees: bigint
+    /**
+     * How much pool money defaulting borrowers walked away with, since the governor last cleared the
+     * counter. Returned by `get_treasury_state` in its storage position.
+     */
+    deficit: bigint
+    parent: Address | null
+    participations: Dictionary<bigint, Participation>
+    roundsImbalance: bigint
+    stopped: boolean
+    instantMint: boolean
+    loanCodes: Dictionary<bigint, Cell>
+    previousRate: bigint
+    currentRate: bigint
+    /**
+     * How long `previousRate` took to grow into `currentRate`, in seconds: the span the published
+     * window covers, measured between the `round_since` of two barrier releases. Not the length of a
+     * round -- the window covers **two** releases, so in steady state this is about two rounds, and
+     * it widens further across rounds where nothing was lent. It is the denominator an APY built on
+     * `previousRate`/`currentRate` needs, and pairing it with the wrong one is the mistake it exists
+     * to prevent. Renamed from `roundDuration` when the window widened, so the break is a compile
+     * error rather than a silently halved APY.
+     */
+    windowDuration: bigint
+    /** The highest round whose reward is in `currentRate`. Only ever moves forwards. */
+    lastSettledRound: bigint
+    halter: Address
+    governor: Address
+    proposedGovernor: Cell | null
+    governanceFee: bigint
+    borrowerFee: bigint
+    /**
+     * The borrower's contractual share of a loan's reward, out of 65535, set by the protocol rather
+     * than bid. `request_loan` snapshots it into every request, so changing it cannot reprice a loan
+     * already committed. Returned LAST by `get_treasury_state`; see
+     * `docs/specs/2026-09-19-protocol-set-reward-share.md`.
+     */
+    rewardShare: bigint
+    collectionCodes: Dictionary<bigint, Cell>
+    billCodes: Dictionary<bigint, Cell>
+    oldParents: Dictionary<bigint, unknown>
+    /**
+     * The middle observation of the three the window slides over: the rate at the previous release
+     * and the round it happened on. Not published for its own sake -- it is the slot that lets
+     * `previousRate` lag two releases instead of one, which is what cancels the round-to-round
+     * oscillation that `roundsImbalance` produces. Stored next to the rate pair but returned LAST by
+     * `get_treasury_state`, which is append-only so that no positional reader ever moves; see
+     * `docs/specs/2026-09-07-two-round-rate-window.md`.
+     */
+    midRate: bigint
+    midRound: bigint
+    /**
+     * The auction floors, all governor-set by `set_auction_floors` and 0 for off: `request_loan`
+     * refuses a bid whose efficiency (the first part of the sort key) is below `minEfficiency`, or whose
+     * loan + collateral is below `minRequestStake`, and raises a non-zero `max_stake` below
+     * `stakeCapFloor` to it. The two stakes are in WHOLE GRAM, not nanoGRAM. Appended to
+     * `get_treasury_state`; see `docs/specs/2026-09-28-auction-floors-and-forced-accrual.md`. -1 when
+     * read from a treasury that predates them.
+     */
+    minEfficiency?: bigint
+    minRequestStake?: bigint
+    stakeCapFloor?: bigint
+}
+
+export function treasuryConfigToCell(config: TreasuryConfig): Cell {
+    const treasuryExtension = beginCell()
+        .storeCoins(config.previousRate)
+        .storeCoins(config.currentRate)
+        .storeUint(config.windowDuration, 32)
+        .storeUint(config.lastSettledRound, 32)
+        .storeCoins(config.midRate)
+        .storeUint(config.midRound, 32)
+        .storeAddress(config.halter)
+        .storeAddress(config.governor)
+        .storeMaybeRef(config.proposedGovernor)
+        .storeRef(beginCell().storeDictDirect(config.collectionCodes))
+        .storeRef(beginCell().storeDictDirect(config.billCodes))
+        .storeDict(config.oldParents)
+    // The settings only the loan side reads, in the root's ref slot; see
+    // docs/specs/2026-09-29-loan-config-cell.md.
+    const loanConfig = beginCell()
+        .storeUint(config.governanceFee, 16)
+        .storeUint(config.borrowerFee, 16)
+        .storeUint(config.rewardShare, 16)
+        .storeUint(config.roundsImbalance, 8)
+        .storeUint(config.minEfficiency ?? 0n, 24)
+        .storeUint(config.minRequestStake ?? 0n, 32)
+        .storeUint(config.stakeCapFloor ?? 0n, 32)
+        .storeRef(beginCell().storeDictDirect(config.loanCodes))
+    return beginCell()
+        .storeCoins(config.totalCoins)
+        .storeCoins(config.totalTokens)
+        .storeCoins(config.totalStaking)
+        .storeCoins(config.totalUnstaking)
+        .storeCoins(config.totalBorrowersStake)
+        .storeCoins(config.totalRequestFees)
+        .storeCoins(config.deficit)
+        .storeAddress(config.parent)
+        .storeDict(config.participations)
+        .storeBit(config.stopped)
+        .storeBit(config.instantMint)
+        .storeRef(loanConfig)
+        .storeRef(treasuryExtension)
+        .endCell()
+}
+
+export const emptyDictionaryValue: DictionaryValue<unknown> = {
+    serialize: function () {
+        return
+    },
+    parse: function (): unknown {
+        return {}
+    },
+}
+
+export const sortedDictionaryValue: DictionaryValue<Dictionary<bigint, unknown>> = {
+    serialize: function (src: Dictionary<bigint, unknown>, builder: Builder) {
+        builder.storeRef(beginCell().storeDictDirect(src))
+    },
+    parse: function (src: Slice): Dictionary<bigint, unknown> {
+        return src.loadRef().beginParse().loadDictDirect(Dictionary.Keys.BigUint(256), emptyDictionaryValue)
+    },
+}
+
+export const requestDictionaryValue: DictionaryValue<Request> = {
+    serialize: function (src: Request, builder: Builder) {
+        builder
+            .storeCoins(src.minPayment)
+            .storeUint(src.borrowerRewardShare, 16)
+            .storeCoins(src.loanAmount)
+            .storeCoins(src.accrueAmount)
+            .storeCoins(src.stakeAmount)
+            .storeUint(src.requestFee, 16)
+        if (src.maxStake !== undefined) {
+            builder.storeCoins(src.maxStake)
+        }
+        builder.storeRef(src.newStakeMsg)
+    },
+    parse: function (src: Slice): Request {
+        const request: Request = {
+            minPayment: src.loadCoins(),
+            borrowerRewardShare: src.loadUintBig(16),
+            loanAmount: src.loadCoins(),
+            accrueAmount: src.loadCoins(),
+            stakeAmount: src.loadCoins(),
+            requestFee: src.loadUintBig(16),
+            newStakeMsg: Cell.EMPTY,
+        }
+        if (src.remainingBits > 0) {
+            request.maxStake = src.loadCoins()
+        }
+        request.newStakeMsg = src.loadRef()
+        return request
+    },
+}
+
+export const participationDictionaryValue: DictionaryValue<Participation> = {
+    serialize: function (src: Participation, builder: Builder) {
+        builder
+            .storeUint(src.state ?? 0, 4)
+            .storeUint(src.size ?? 0, 16)
+            .storeDict(src.sorted)
+            .storeDict(src.requests)
+            .storeMaybeRef(src.rejected ?? null)
+            .storeMaybeRef(src.accepted ?? null)
+            .storeMaybeRef(src.accrued ?? null)
+            .storeDict(src.staked)
+            .storeDict(src.recovering)
+            .storeCoins(src.totalStaked ?? 0)
+            .storeCoins(src.totalRecovered ?? 0)
+            .storeUint(src.currentVsetHash ?? 0, 256)
+            .storeUint(src.stakeHeldFor ?? 0, 32)
+            .storeUint(src.stakeHeldUntil ?? 0, 32)
+    },
+    parse: function (src: Slice): Participation {
+        return {
+            state: src.loadUint(4),
+            size: src.loadUintBig(16),
+            sorted: src.loadDict(Dictionary.Keys.BigUint(120), sortedDictionaryValue),
+            requests: src.loadDict(Dictionary.Keys.BigUint(256), requestDictionaryValue),
+            rejected: src.loadMaybeRef(),
+            accepted: src.loadMaybeRef(),
+            accrued: src.loadMaybeRef(),
+            staked: src.loadDict(Dictionary.Keys.BigUint(256), requestDictionaryValue),
+            recovering: src.loadDict(Dictionary.Keys.BigUint(256), requestDictionaryValue),
+            totalStaked: src.loadCoins(),
+            totalRecovered: src.loadCoins(),
+            currentVsetHash: src.loadUintBig(256),
+            stakeHeldFor: src.loadUintBig(32),
+            stakeHeldUntil: src.loadUintBig(32),
+        }
+    },
+}
+
+export class Treasury implements Contract {
+    constructor(
+        readonly address: Address,
+        readonly init?: { code: Cell; data: Cell },
+    ) {}
+
+    static createFromAddress(address: Address) {
+        return new Treasury(address)
+    }
+
+    static createFromConfig(config: TreasuryConfig, code: Cell, workchain = 0) {
+        const data = treasuryConfigToCell(config)
+        const init = { code, data }
+        return new Treasury(contractAddress(workchain, init), init)
+    }
+
+    async sendMessage(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            body?: Cell | string
+        },
+    ) {
+        await provider.internal(via, opts)
+    }
+
+    async sendDeploy(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+        },
+    ) {
+        await this.sendTopUp(provider, via, opts)
+    }
+
+    async sendTopUp(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.topUp, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .endCell(),
+        })
+    }
+
+    async sendDepositCoins(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            owner?: Address
+            coins?: bigint
+            ownershipAssignedAmount?: bigint
+            referrer?: Address
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.depositCoins, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeAddress(opts.owner)
+                .storeCoins(opts.coins ?? 0)
+                .storeCoins(opts.ownershipAssignedAmount ?? 0)
+                .storeAddress(opts.referrer)
+                .endCell(),
+        })
+    }
+
+    async sendProvideCurrentQuote(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            customPayload?: Cell
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.provideCurrentQuote, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeMaybeRef(opts.customPayload)
+                .endCell(),
+        })
+    }
+
+    async sendRequestLoan(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            roundSince: bigint
+            loanAmount: bigint | string
+            minPayment: bigint | string
+            /**
+             * The most this loan will stake in total -- loan + accrue + collateral, own stake included --
+             * or 0 for no cap. Required, as it is on the wire.
+             */
+            maxStake: bigint | string
+            newStakeMsg: Cell
+        },
+    ) {
+        const body = beginCell()
+            .storeUint(op.requestLoan, 32)
+            .storeUint(opts.queryId ?? 0, 64)
+            .storeUint(opts.roundSince, 32)
+            .storeCoins(tonValue(opts.loanAmount))
+            .storeCoins(tonValue(opts.minPayment))
+            .storeCoins(tonValue(opts.maxStake))
+            .storeRef(opts.newStakeMsg)
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: body.endCell(),
+        })
+    }
+
+    async sendParticipateInElection(
+        provider: ContractProvider,
+        opts: {
+            queryId?: bigint
+            roundSince: bigint
+        },
+    ) {
+        const message = beginCell()
+            .storeUint(op.participateInElection, 32)
+            .storeUint(opts.queryId ?? 0, 64)
+            .storeUint(opts.roundSince, 32)
+            .endCell()
+        await provider.external(message)
+    }
+
+    async sendVsetChanged(
+        provider: ContractProvider,
+        opts: {
+            queryId?: bigint
+            roundSince: bigint
+        },
+    ) {
+        const message = beginCell()
+            .storeUint(op.vsetChanged, 32)
+            .storeUint(opts.queryId ?? 0, 64)
+            .storeUint(opts.roundSince, 32)
+            .endCell()
+        await provider.external(message)
+    }
+
+    async sendFinishParticipation(
+        provider: ContractProvider,
+        opts: {
+            queryId?: bigint
+            roundSince: bigint
+        },
+    ) {
+        const message = beginCell()
+            .storeUint(op.finishParticipation, 32)
+            .storeUint(opts.queryId ?? 0, 64)
+            .storeUint(opts.roundSince, 32)
+            .endCell()
+        await provider.external(message)
+    }
+
+    async sendProposeGovernor(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            newGovernor: Address
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.proposeGovernor, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeAddress(opts.newGovernor)
+                .endCell(),
+        })
+    }
+
+    async sendAcceptGovernance(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.acceptGovernance, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .endCell(),
+        })
+    }
+
+    async sendSetHalter(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            newHalter: Address
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.setHalter, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeAddress(opts.newHalter)
+                .endCell(),
+        })
+    }
+
+    async sendSetStopped(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            newStopped: boolean
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.setStopped, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeBit(opts.newStopped)
+                .endCell(),
+        })
+    }
+
+    async sendSetInstantMint(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            newInstantMint: boolean
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.setInstantMint, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeBit(opts.newInstantMint)
+                .endCell(),
+        })
+    }
+
+    async sendSetBorrowerFee(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            /** Out of 65535 of each borrower's contractual share of a round's reward. 0 disables. */
+            newBorrowerFee: bigint
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.setBorrowerFee, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeUint(opts.newBorrowerFee, 16)
+                .endCell(),
+        })
+    }
+
+    async sendSetRewardShare(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            newRewardShare: bigint
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.setRewardShare, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeUint(opts.newRewardShare, 16)
+                .endCell(),
+        })
+    }
+
+    /**
+     * Sets the three auction floors at once. `minRequestStake` and `stakeCapFloor` are in WHOLE GRAM;
+     * a non-zero `stakeCapFloor` below `minRequestStake` is refused. 0 turns a floor off.
+     */
+    async sendSetAuctionFloors(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            minEfficiency: bigint
+            minRequestStake: bigint
+            stakeCapFloor: bigint
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.setAuctionFloors, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeUint(opts.minEfficiency, 24)
+                .storeUint(opts.minRequestStake, 32)
+                .storeUint(opts.stakeCapFloor, 32)
+                .endCell(),
+        })
+    }
+
+    async sendSetGovernanceFee(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            newGovernanceFee: bigint
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.setGovernanceFee, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeUint(opts.newGovernanceFee, 16)
+                .endCell(),
+        })
+    }
+
+    async sendSetDeficit(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            newDeficit: bigint
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.setDeficit, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeCoins(opts.newDeficit)
+                .endCell(),
+        })
+    }
+
+    async sendSetRoundsImbalance(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            newRoundsImbalance: bigint
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.setRoundsImbalance, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeUint(opts.newRoundsImbalance, 8)
+                .endCell(),
+        })
+    }
+
+    async sendSendMessageToLoan(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            borrower: Address
+            roundSince: bigint
+            message: Cell
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.sendMessageToLoan, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeAddress(opts.borrower)
+                .storeUint(opts.roundSince, 32)
+                .storeRef(opts.message)
+                .endCell(),
+        })
+    }
+
+    async sendRetryRecoverStakes(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            roundSince: bigint
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.retryRecoverStakes, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeUint(opts.roundSince, 32)
+                .endCell(),
+        })
+    }
+
+    async sendRetryMintBill(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            roundSince: bigint
+            amount: bigint
+            unstake: boolean
+            owner: Address
+            parent: Address
+            ownershipAssignedAmount: bigint
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.retryMintBill, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeUint(opts.roundSince, 32)
+                .storeCoins(opts.amount)
+                .storeBit(opts.unstake)
+                .storeAddress(opts.owner)
+                .storeAddress(opts.parent)
+                .storeCoins(opts.ownershipAssignedAmount)
+                .endCell(),
+        })
+    }
+
+    async sendRetryBurnAll(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            roundSince: bigint
+            startIndex?: bigint
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.retryBurnAll, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeUint(opts.roundSince, 32)
+                .storeUint(opts.startIndex ?? 0, 64)
+                .endCell(),
+        })
+    }
+
+    async sendRetryBurnReady(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.retryBurnReady, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .endCell(),
+        })
+    }
+
+    async sendSetParent(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            newParent: Address
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.setParent, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeAddress(opts.newParent)
+                .endCell(),
+        })
+    }
+
+    async sendProxySetContent(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            destination: Address
+            newContent: Cell
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.proxySetContent, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeAddress(opts.destination)
+                .storeRef(opts.newContent)
+                .endCell(),
+        })
+    }
+
+    async sendWithdrawSurplus(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            destination: Address
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.withdrawSurplus, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeAddress(opts.destination)
+                .endCell(),
+        })
+    }
+
+    async sendProxyWithdrawSurplus(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            destination: Address
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.proxyWithdrawSurplus, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeAddress(opts.destination)
+                .endCell(),
+        })
+    }
+
+    async sendUpgradeCode(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            newCode: Cell
+            migrateCode?: Cell
+            returnExcess?: Address
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.upgradeCode, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeRef(opts.newCode)
+                .storeMaybeRef(opts.migrateCode)
+                .storeAddress(opts.returnExcess ?? via.address)
+                .endCell(),
+        })
+    }
+
+    async sendProxyUpgradeCode(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            destination: Address
+            newCode: Cell
+            migrateCode?: Cell
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.proxyUpgradeCode, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeAddress(opts.destination)
+                .storeRef(opts.newCode)
+                .storeMaybeRef(opts.migrateCode)
+                .endCell(),
+        })
+    }
+
+    async sendSendUpgradeWallet(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            destination: Address
+            owner: Address
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.sendUpgradeWallet, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeAddress(opts.destination)
+                .storeAddress(opts.owner)
+                .endCell(),
+        })
+    }
+
+    async sendProxyAddLibrary(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            destination: Address
+            code: Cell
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.proxyAddLibrary, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeAddress(opts.destination)
+                .storeRef(opts.code)
+                .endCell(),
+        })
+    }
+
+    async sendProxyRemoveLibrary(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            destination: Address
+            codeHash: bigint
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.proxyRemoveLibrary, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeAddress(opts.destination)
+                .storeUint(opts.codeHash, 256)
+                .endCell(),
+        })
+    }
+
+    async sendGiftCoins(
+        provider: ContractProvider,
+        via: Sender,
+        opts: {
+            value: bigint | string
+            bounce?: boolean
+            sendMode?: SendMode
+            queryId?: bigint
+            coins: bigint
+        },
+    ) {
+        await this.sendMessage(provider, via, {
+            value: opts.value,
+            bounce: opts.bounce,
+            sendMode: opts.sendMode,
+            body: beginCell()
+                .storeUint(op.giftCoins, 32)
+                .storeUint(opts.queryId ?? 0, 64)
+                .storeCoins(opts.coins)
+                .endCell(),
+        })
+    }
+
+    async getTimes(provider: ContractProvider): Promise<Times> {
+        const { stack } = await provider.get('get_times', [])
+        return {
+            currentRoundSince: stack.readBigNumber(),
+            participateSince: stack.readBigNumber(),
+            participateUntil: stack.readBigNumber(),
+            nextRoundSince: stack.readBigNumber(),
+            nextRoundUntil: stack.readBigNumber(),
+            stakeHeldFor: stack.readBigNumber(),
+        }
+    }
+
+    /**
+     * The tuple is append-only and covers every field the treasury stores; it does not mirror storage
+     * order.
+     */
+    async getTreasuryState(provider: ContractProvider): Promise<TreasuryConfig> {
+        const { stack } = await provider.get('get_treasury_state', [])
+
+        const totalCoins = stack.readBigNumber()
+        const totalTokens = stack.readBigNumber()
+        const totalStaking = stack.readBigNumber()
+        const totalUnstaking = stack.readBigNumber()
+        const totalBorrowersStake = stack.readBigNumber()
+        const deficit = stack.readBigNumber()
+        const parent = stack.readAddressOpt()
+        const participations = Dictionary.loadDirect(
+            Dictionary.Keys.BigUint(32),
+            participationDictionaryValue,
+            stack.readCellOpt(),
+        )
+        const roundsImbalance = stack.readBigNumber()
+        const stopped = stack.readBoolean()
+        const instantMint = stack.readBoolean()
+        const loanCodes = Dictionary.loadDirect(Dictionary.Keys.BigUint(32), Dictionary.Values.Cell(), stack.readCell())
+        const previousRate = stack.readBigNumber()
+        const currentRate = stack.readBigNumber()
+        const windowDuration = stack.readBigNumber()
+        const lastSettledRound = stack.readBigNumber()
+
+        return {
+            totalCoins,
+            totalTokens,
+            totalStaking,
+            totalUnstaking,
+            totalBorrowersStake,
+            deficit,
+            parent,
+            participations,
+            roundsImbalance,
+            stopped,
+            instantMint,
+            loanCodes,
+            previousRate,
+            currentRate,
+            windowDuration,
+            lastSettledRound,
+            halter: stack.readAddress(),
+            governor: stack.readAddress(),
+            proposedGovernor: stack.readCellOpt(),
+            governanceFee: stack.readBigNumber(),
+            borrowerFee: stack.readBigNumber(),
+            collectionCodes: Dictionary.loadDirect(
+                Dictionary.Keys.BigUint(32),
+                Dictionary.Values.Cell(),
+                stack.readCell(),
+            ),
+            billCodes: Dictionary.loadDirect(Dictionary.Keys.BigUint(32), Dictionary.Values.Cell(), stack.readCell()),
+            oldParents: Dictionary.loadDirect(Dictionary.Keys.BigUint(256), emptyDictionaryValue, stack.readCellOpt()),
+            // Returned last by the getter, whatever their place in storage. Property order is the
+            // read order here, so these stay at the bottom of this object.
+            midRate: stack.readBigNumber(),
+            midRound: stack.readBigNumber(),
+            // Appended by 2026-09-19-protocol-set-reward-share. A treasury that has not been upgraded
+            // yet returns 26 values, and this reads 0 for it -- meaning ABSENT, because such a treasury
+            // has no protocol share at all; every request it holds carries whatever its sender bid.
+            //
+            // 0 rather than the 1799 the migrator seeds, which was the first choice and was wrong: the
+            // migration dry run diffs the before and after states field by field, so a fallback equal to
+            // the seeded value made the one field this release adds read the same on both sides, and the
+            // rehearsal reported that nothing changed. A sentinel that cannot be a real pre-upgrade
+            // value is what lets the diff show the migration. Delete the branch once mainnet is
+            // upgraded; see docs/specs/2026-09-07-two-round-rate-window.md for why reading a shape you
+            // are about to change has to keep working -- showState and the dry run both run against the
+            // OLD contract.
+            rewardShare: stack.readBigNumber(),
+            totalRequestFees: stack.readBigNumber(),
+            // Appended by 2026-09-28-auction-floors-and-forced-accrual. A treasury that has not been
+            // upgraded yet returns 28 values, and these read -1 -- ABSENT, a value no upgraded treasury
+            // can hold. Not 0, although 0 is what such a treasury does (every floor off): the migrator
+            // seeds 0, and a fallback equal to the seed makes the dry run show the migrated fields
+            // unchanged, which is the mistake the reward-share release made first. Delete the branch
+            // once mainnet is upgraded: showState and the dry run both read the OLD contract before it.
+            minEfficiency: stack.remaining > 0 ? stack.readBigNumber() : -1n,
+            minRequestStake: stack.remaining > 0 ? stack.readBigNumber() : -1n,
+            stakeCapFloor: stack.remaining > 0 ? stack.readBigNumber() : -1n,
+        }
+    }
+
+    /**
+     * A borrower's bid for a round, and which stage of the round it is sitting in.
+     *
+     * `found` is separate from `stage` on purpose: `ParticipationState.Open` is 0 and so is "nothing
+     * here", so a request still in the requests dict would otherwise look identical to a borrower who
+     * never bid.
+     */
+    async getLoanRequest(provider: ContractProvider, roundSince: bigint, borrower: Address): Promise<LoanRequest> {
+        const args = new TupleBuilder()
+        args.writeNumber(roundSince)
+        args.writeAddress(borrower)
+        const { stack } = await provider.get('get_loan_request', args.build())
+        const found = stack.readBoolean()
+        return {
+            found,
+            stage: Number(stack.readBigNumber()),
+            minPayment: stack.readBigNumber(),
+            borrowerRewardShare: stack.readBigNumber(),
+            loanAmount: stack.readBigNumber(),
+            accrueAmount: stack.readBigNumber(),
+            stakeAmount: stack.readBigNumber(),
+            requestFee: stack.readBigNumber(),
+            maxStake: stack.readBigNumber(),
+        }
+    }
+
+    async getParticipation(provider: ContractProvider, roundSince: bigint): Promise<Participation> {
+        const tb = new TupleBuilder()
+        tb.writeNumber(roundSince)
+        const { stack } = await provider.get('get_participation', tb.build())
+        return {
+            state: stack.readNumber(),
+            size: stack.readBigNumber(),
+            sorted: Dictionary.loadDirect(Dictionary.Keys.BigUint(120), sortedDictionaryValue, stack.readCellOpt()),
+            requests: Dictionary.loadDirect(Dictionary.Keys.BigUint(256), requestDictionaryValue, stack.readCellOpt()),
+            // internal to the loan decision; returned as the raw cells and never parsed, see Participation
+            rejected: stack.readCellOpt(),
+            accepted: stack.readCellOpt(),
+            accrued: stack.readCellOpt(),
+            staked: Dictionary.loadDirect(Dictionary.Keys.BigUint(256), requestDictionaryValue, stack.readCellOpt()),
+            recovering: Dictionary.loadDirect(
+                Dictionary.Keys.BigUint(256),
+                requestDictionaryValue,
+                stack.readCellOpt(),
+            ),
+            totalStaked: stack.readBigNumber(),
+            totalRecovered: stack.readBigNumber(),
+            currentVsetHash: stack.readBigNumber(),
+            stakeHeldFor: stack.readBigNumber(),
+            stakeHeldUntil: stack.readBigNumber(),
+        }
+    }
+
+    async getCollectionAddress(provider: ContractProvider, roundSince: bigint) {
+        const tb = new TupleBuilder()
+        tb.writeNumber(roundSince)
+        const { stack } = await provider.get('get_collection_address', tb.build())
+        return stack.readAddress()
+    }
+
+    async getBillAddress(provider: ContractProvider, roundSince: bigint, index: bigint) {
+        const tb = new TupleBuilder()
+        tb.writeNumber(roundSince)
+        tb.writeNumber(index)
+        const { stack } = await provider.get('get_bill_address', tb.build())
+        return stack.readAddress()
+    }
+
+    async getLoanAddress(provider: ContractProvider, borrower: Address, roundSince: bigint) {
+        const tb = new TupleBuilder()
+        tb.writeAddress(borrower)
+        tb.writeNumber(roundSince)
+        const { stack } = await provider.get('get_loan_address', tb.build())
+        return stack.readAddress()
+    }
+
+    async getTreasuryFees(provider: ContractProvider, ownershipAssignedAmount: bigint): Promise<TreasuryFees> {
+        const tb = new TupleBuilder()
+        tb.writeNumber(ownershipAssignedAmount)
+        const { stack } = await provider.get('get_treasury_fees', tb.build())
+        return {
+            requestLoanFee: stack.readBigNumber(),
+            depositCoinsFee: stack.readBigNumber(),
+            unstakeAllTokensFee: stack.readBigNumber(),
+        }
+    }
+
+    async getMaxBurnableTokens(provider: ContractProvider): Promise<bigint> {
+        const { stack } = await provider.get('get_max_burnable_tokens', [])
+        return stack.readBigNumber()
+    }
+
+    async getSurplus(provider: ContractProvider): Promise<bigint> {
+        const { stack } = await provider.get('get_surplus', [])
+        return stack.readBigNumber()
+    }
+
+    async getMaxPunishment(provider: ContractProvider, stake: bigint) {
+        const tb = new TupleBuilder()
+        tb.writeNumber(stake)
+        const { stack } = await provider.get('get_max_punishment', tb.build())
+        return stack.readBigNumber()
+    }
+
+    async getBalance(provider: ContractProvider): Promise<bigint> {
+        const state = await provider.getState()
+        return state.balance
+    }
+
+    async getState(provider: ContractProvider): Promise<ContractState> {
+        return await provider.getState()
+    }
+}

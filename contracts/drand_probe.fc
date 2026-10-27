@@ -1,0 +1,47 @@
+;; Test-only contract: runs the drand quicknet check on an internal message and stores the result, so
+;; tests measure the gas the way a real contract pays it. Never deployed.
+;;
+;; Storage: round:uint64 seed:uint256
+;; Messages (body):
+;;   verify#00000001          round:uint64 ^signature ^witness
+;;   verify_with_key#00000002 round:uint64 ^signature ^witness ^public_key
+
+#include "imports/stdlib.fc";
+#include "imports/drand.fc";
+
+const int op::verify = 1;
+const int op::verify_with_key = 2;
+
+() recv_internal(cell in_msg_full, slice in_msg_body) impure {
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if ((flags & 1) | in_msg_body.slice_empty?()) {
+        return ();  ;; bounced or plain transfer
+    }
+
+    int op = in_msg_body~load_uint(32);
+    int round = in_msg_body~load_uint(64);
+    slice signature = in_msg_body~load_ref().begin_parse();
+    slice witness = in_msg_body~load_ref().begin_parse();
+
+    int seed = 0;
+    if (op == op::verify) {
+        seed = quicknet_verify(round, signature, witness);
+    } elseif (op == op::verify_with_key) {
+        slice public_key = in_msg_body~load_ref().begin_parse();
+        seed = drand::verify_with_key(round, signature, witness, public_key);
+    } else {
+        throw(0xffff);
+    }
+
+    set_data(begin_cell().store_uint(round, 64).store_uint(seed, 256).end_cell());
+}
+
+(int, int) get_result() method_id {
+    slice ds = get_data().begin_parse();
+    return (ds~load_uint(64), ds~load_uint(256));
+}
+
+int round_at(int time) method_id {
+    return quicknet_round_at(time);
+}

@@ -1,0 +1,1341 @@
+;; Hipo Jackpot: a no-loss prize draw on hGRAM. The design, and the reason for every rule below, is in
+;; docs/specs/2026-10-27-jackpot-v1.md; the message layouts are in contracts/schema.tlb.
+;;
+;; Units: T, I, O, F and every prize are nano-hGRAM; P, c, x and ticket numbers are nano-GRAM. The latest
+;; quote (TC, TT) converts between them, and every conversion rounds toward the pool.
+
+#include "imports/utils.fc";
+#include "imports/drand.fc";
+
+;; FunC allows 31 globals, so what is read rarely -- the governor's parameters, the last draw start, the
+;; prizes, the Hipo wallet details and the roles -- stays packed in a cell and is unpacked where needed.
+
+;; counters
+global int total_tokens;  ;; T: hGRAM the Jackpot holds, by its own count
+global int in_flight;     ;; I: received but not yet booked
+global int set_aside;     ;; O: running draw's prizes, burn owed, claimable
+global int principal;     ;; P: GRAM owed to players, withdrawals not yet paid included
+global int next_ticket;   ;; N
+global int quote_coins;   ;; TC of the latest quote received, 0 before the first
+global int quote_tokens;  ;; TT
+global int query_counter;
+global int halted?;
+global int falling?;
+global int burn_owed;     ;; part of O
+
+;; settings
+global cell params;       ;; burn_share b (bp), min_pot m, burn_batch, min_deposit
+global cell last_start;   ;; config 34 utime_since, N (the next draw's E) and the rate, at the last start
+
+;; the draw
+global int draw_state;
+global int draw_id;
+global int draw_query_id;
+global int draw_cutoff;   ;; E of the running draw
+global int draw_round;    ;; R
+global int seed;
+global int randomness_time;
+global int slots;         ;; bit i set while slot i is open; attempt of slot i in bits 8 + 8i .. 15 + 8i
+global cell prizes;       ;; p0, p1, p2
+
+;; addresses
+global slice treasury;
+global slice wallet;      ;; the Jackpot's own hGRAM wallet
+global cell range_code;
+global cell hipo;         ;; parent, and ^wallet_code: the cell Hipo's parent stores, a library on mainnet
+global cell roles;        ;; burner, governor, halter
+
+;; books
+global cell pending;      ;; query_id -> owner, created_at: GRAM deposits sent to the treasury, not yet minted
+global cell quotes;       ;; query_id -> created_at, kind, data: quote requests waiting for their reply
+global cell payouts;      ;; query_id -> kind, recipient, amount: hGRAM transfers not yet confirmed
+global cell claimable;    ;; hash(owner) -> owner, amount: failed payouts and held prizes, part of O
+
+;; Design decision: everything that ties the Jackpot to one deployment of Hipo -- the treasury, the
+;; parent, Hipo's wallet code, the Jackpot's own hGRAM wallet, the burner, the governor and the halter --
+;; is data, not a constant (the own wallet starts as addr_none, see load_data). The tests then run against
+;; the sandbox Hipo, and the governor can follow a wallet migration (set_hipo_wallet) without a code
+;; upgrade. The range code is in the data too, so that the Jackpot can compute range addresses; nothing
+;; ever changes it, because ranges cannot be upgraded.
+
+() load_data() impure inline_ref {
+    slice ds = get_data().begin_parse();
+    total_tokens = ds~load_coins();
+    in_flight = ds~load_coins();
+    set_aside = ds~load_coins();
+    principal = ds~load_coins();
+    next_ticket = ds~load_coins();
+    quote_coins = ds~load_uint(128);
+    quote_tokens = ds~load_uint(128);
+    query_counter = ds~load_uint(32);
+    halted? = ds~load_int(1);
+    falling? = ds~load_int(1);
+
+    slice extra = ds~load_ref().begin_parse();
+    burn_owed = extra~load_coins();
+    params = extra~load_ref();
+    last_start = extra~load_ref();
+    extra.end_parse();
+
+    slice draw = ds~load_ref().begin_parse();
+    draw_state = draw~load_uint(2);
+    draw_id = draw~load_uint(32);
+    draw_query_id = draw~load_uint(64);
+    draw_cutoff = draw~load_coins();
+    draw_round = draw~load_uint(64);
+    seed = draw~load_uint(256);
+    randomness_time = draw~load_uint(32);
+    slots = draw~load_uint(32);
+    prizes = draw~load_ref();
+    draw.end_parse();
+
+    slice addresses = ds~load_ref().begin_parse();
+    treasury = addresses~load_msg_addr();
+    wallet = addresses~load_msg_addr();
+    range_code = addresses~load_ref();
+    hipo = addresses~load_ref();
+    roles = addresses~load_ref();
+    addresses.end_parse();
+    if wallet.addr_none?() {
+        ;; The Jackpot's own wallet address follows from its address, so it cannot be in the init data
+        ;; that fixes that address. It is derived here, as Hipo's parent would, and saved with the first
+        ;; message; the governor can still replace it with set_hipo_wallet after a wallet migration.
+        slice hs = hipo.begin_parse();
+        slice parent = hs~load_msg_addr();
+        ( builder own, _, _ ) = create_wallet_address(my_address().to_builder(), parent, hs~load_ref());
+        wallet = own.end_cell().begin_parse();
+    }
+
+    slice books = ds~load_ref().begin_parse();
+    pending = books~load_dict();
+    quotes = books~load_dict();
+    payouts = books~load_dict();
+    claimable = books~load_dict();
+    books.end_parse();
+
+    ds.end_parse();
+}
+
+() save_data() impure inline_ref {
+    cell extra = begin_cell()
+        .store_coins(burn_owed)
+        .store_ref(params)
+        .store_ref(last_start)
+        .end_cell();
+
+    cell draw = begin_cell()
+        .store_uint(draw_state, 2)
+        .store_uint(draw_id, 32)
+        .store_uint(draw_query_id, 64)
+        .store_coins(draw_cutoff)
+        .store_uint(draw_round, 64)
+        .store_uint(seed, 256)
+        .store_uint(randomness_time, 32)
+        .store_uint(slots, 32)
+        .store_ref(prizes)
+        .end_cell();
+
+    cell addresses = begin_cell()
+        .store_slice(treasury)
+        .store_slice(wallet)
+        .store_ref(range_code)
+        .store_ref(hipo)
+        .store_ref(roles)
+        .end_cell();
+
+    cell books = begin_cell()
+        .store_dict(pending)
+        .store_dict(quotes)
+        .store_dict(payouts)
+        .store_dict(claimable)
+        .end_cell();
+
+    begin_cell()
+        .store_coins(total_tokens)
+        .store_coins(in_flight)
+        .store_coins(set_aside)
+        .store_coins(principal)
+        .store_coins(next_ticket)
+        .store_uint(quote_coins, 128)
+        .store_uint(quote_tokens, 128)
+        .store_uint(query_counter, 32)
+        .store_int(halted?, 1)
+        .store_int(falling?, 1)
+        .store_ref(extra)
+        .store_ref(draw)
+        .store_ref(addresses)
+        .store_ref(books)
+        .end_cell()
+        .set_data();
+}
+
+;; ( burn_share, min_pot, burn_batch, min_deposit )
+(int, int, int, int) unpack_params() inline {
+    slice cs = params.begin_parse();
+    return ( cs~load_uint(16), cs~load_coins(), cs~load_coins(), cs~load_coins() );
+}
+
+() pack_params(int burn_share, int min_pot, int burn_batch, int min_deposit) impure inline {
+    params = begin_cell()
+        .store_uint(burn_share, 16)
+        .store_coins(min_pot)
+        .store_coins(burn_batch)
+        .store_coins(min_deposit)
+        .end_cell();
+}
+
+;; ( round_since, cutoff, rate_coins, rate_tokens ): the cutoff is N at the last start, the next draw's E
+(int, int, int, int) unpack_last_start() inline {
+    slice cs = last_start.begin_parse();
+    return ( cs~load_uint(32), cs~load_coins(), cs~load_uint(128), cs~load_uint(128) );
+}
+
+() pack_last_start(int round_since, int cutoff, int rate_coins, int rate_tokens) impure inline {
+    last_start = begin_cell()
+        .store_uint(round_since, 32)
+        .store_coins(cutoff)
+        .store_uint(rate_coins, 128)
+        .store_uint(rate_tokens, 128)
+        .end_cell();
+}
+
+(int, int, int) unpack_prizes() inline {
+    slice cs = prizes.begin_parse();
+    return ( cs~load_coins(), cs~load_coins(), cs~load_coins() );
+}
+
+() pack_prizes(int p0, int p1, int p2) impure inline {
+    prizes = begin_cell().store_coins(p0).store_coins(p1).store_coins(p2).end_cell();
+}
+
+;; ( parent, wallet_code )
+(slice, cell) unpack_hipo() inline {
+    slice cs = hipo.begin_parse();
+    return ( cs~load_msg_addr(), cs~load_ref() );
+}
+
+;; ( burner, governor, halter )
+(slice, slice, slice) unpack_roles() inline {
+    slice cs = roles.begin_parse();
+    return ( cs~load_msg_addr(), cs~load_msg_addr(), cs~load_msg_addr() );
+}
+
+slice governor() inline {
+    ( _, slice governor, _ ) = unpack_roles();
+    return governor;
+}
+
+;;
+;; helpers
+;;
+
+;; A fresh query_id: a counter in the high 32 bits keeps it unique, and 32 random bits in the low half
+;; keep it unpredictable. The second half matters for the mint notification: anyone can mint hGRAM to
+;; the Jackpot with deposit_coins(owner = Jackpot) and pick the query_id, and that notification looks
+;; exactly like one of our own mints. With a predictable query_id, an attacker could mint dust under the
+;; id of a player's pending deposit ahead of the real mint (easy with instant_mint off, where both mint
+;; at the end of the round in deposit order), consume the pending record, and strand the player's real
+;; tokens outside T until the governor returned them.
+int new_query_id() impure inline {
+    query_counter += 1;
+    randomize_lt();
+    return (query_counter << 32) | (random() & 0xffffffff);
+}
+
+slice addr_none() asm "b{00} PUSHSLICE";
+
+int incoming_value() inline {
+    return get_incoming_value().pair_first();
+}
+
+int free_tokens() inline {
+    return total_tokens - in_flight - set_aside;
+}
+
+(builder, builder, int) range_address(int start) inline {
+    return create_range_address(my_address(), 0, start, range_code);
+}
+
+int is_range?(slice src, int start) inline {
+    ( _, _, int addr ) = range_address(start);
+    return is_base_addr?(src, addr);
+}
+
+int is_wallet_of?(slice src, slice owner) inline {
+    ( slice parent, cell wallet_code ) = unpack_hipo();
+    ( _, _, int addr ) = create_wallet_address(owner.to_builder(), parent, wallet_code);
+    return is_base_addr?(src, addr);
+}
+
+int prize(int slot) inline {
+    ( int p0, int p1, int p2 ) = unpack_prizes();
+    return slot == 0 ? p0 : (slot == 1 ? p1 : p2);
+}
+
+int attempt(int slot) inline {
+    return (slots >> (8 + 8 * slot)) & 0xff;
+}
+
+int slot_open?(int slot) inline {
+    return (slots >> slot) & 1;
+}
+
+;; r(i, j) = uint256(sha256(seed ‖ uint8 i ‖ uint8 j)) mod E, hashing exactly 272 bits.
+int ticket(int slot, int j) inline {
+    slice data = begin_cell()
+        .store_uint(seed, 256)
+        .store_uint(slot, 8)
+        .store_uint(j, 8)
+        .end_cell()
+        .begin_parse();
+    return string_hash(data) % draw_cutoff;
+}
+
+() request_quote(int query_id, builder record) impure inline_ref {
+    quotes~udict_set_builder(64, query_id, record);
+
+    builder body = begin_cell()
+        .store_uint(op::provide_current_quote, 32)
+        .store_uint(query_id, 64)
+        .store_uint(0, 1); ;; no custom_payload: the reply is matched by query_id alone
+    send_msg(true, treasury.to_builder(), null(), body, fee::quote, send::regular);
+}
+
+;; Every hGRAM transfer out goes through here. It leaves T at once and stays recorded until the
+;; recipient's wallet confirms it with gas_excess, or the Jackpot's wallet bounces it.
+() pay(slice recipient, int amount, int kind, int forward_ton_amount) impure inline_ref {
+    int query_id = new_query_id();
+    payouts~udict_set_builder(64, query_id, begin_cell()
+        .store_uint(kind, 1)
+        .store_slice(recipient)
+        .store_coins(amount));
+    total_tokens -= amount;
+
+    builder body = begin_cell()
+        .store_uint(op::send_tokens, 32)
+        .store_uint(query_id, 64)
+        .store_coins(amount)
+        .store_slice(recipient)
+        .store_slice(my_address()) ;; return_excess: the recipient's wallet confirms to us
+        .store_uint(0, 1) ;; no custom_payload
+        .store_coins(forward_ton_amount)
+        .store_uint(0, 1); ;; forward_payload, inline and empty
+    send_msg(true, wallet.to_builder(), null(), body, fee::payout + forward_ton_amount, send::regular);
+}
+
+;; Adds to an owner's claimable amount. The caller has already put the amount into O.
+() credit_claimable(slice owner, int amount) impure inline {
+    int key = slice_hash(owner);
+    ( slice v, int found? ) = claimable.udict_get?(256, key);
+    if found? {
+        v~load_msg_addr();
+        amount += v~load_coins();
+    }
+    claimable~udict_set_builder(256, key, begin_cell().store_slice(owner).store_coins(amount));
+}
+
+;; Takes back a payout whose tokens never left the Jackpot's wallet: they return to T and O, and become
+;; claimable, or burn owed again.
+() restore_payout(slice record) impure inline {
+    int kind = record~load_uint(1);
+    slice recipient = record~load_msg_addr();
+    int amount = record~load_coins();
+
+    total_tokens += amount;
+    set_aside += amount;
+    if kind == payout::burn {
+        burn_owed += amount;
+    } else {
+        credit_claimable(recipient, amount);
+    }
+}
+
+;; Tokens that are now the Jackpot's, from a mint or a player's transfer, and still to be booked.
+() tokens_arrived(slice owner, int tokens) impure inline {
+    total_tokens += tokens;
+    in_flight += tokens;
+
+    int query_id = new_query_id();
+    request_quote(query_id, begin_cell()
+        .store_uint(now(), 32)
+        .store_uint(quote::booking, 2)
+        .store_slice(owner)
+        .store_coins(tokens));
+}
+
+() log_slot(int slot, int j, int result, int r, int start, int amount, slice owner) impure inline {
+    builder log = begin_cell()
+        .store_uint(draw_id, 32)
+        .store_uint(slot, 8)
+        .store_uint(j, 8)
+        .store_uint(result, 8)
+        .store_uint(r, 128)
+        .store_uint(start, 128)
+        .store_coins(amount)
+        .store_slice(owner);
+    emit_log(log::slot, log);
+}
+
+;; Closes a slot. When it was the last one, the draw is over, and the burn owed goes out once it reaches
+;; the batch size. Its GRAM was prepaid by start_draw, so a keeper's locate or expire never pays it.
+() close_slot(int slot) impure inline {
+    slots &= ~ (1 << slot);
+    if slots & 7 {
+        return ();
+    }
+
+    draw_state = draw::idle;
+    ;; a burn is part of the pot priced at the old rate, and is held back with the prizes while the rate
+    ;; has fallen
+    ( _, _, int burn_batch, _ ) = unpack_params();
+    if (burn_owed > 0) & (burn_owed >= burn_batch) & (~ falling?) {
+        int amount = burn_owed;
+        burn_owed = 0;
+        set_aside -= amount;
+        ( slice burner, _, _ ) = unpack_roles();
+        pay(burner, amount, payout::burn, fee::burn_forward);
+    }
+}
+
+;;
+;; deposits
+;;
+
+() deposit(slice src, slice s) impure inline {
+    int query_id = s~load_uint(64);
+    s.end_parse();
+
+    int value = incoming_value();
+    int coins = value - fee::deposit;
+    ( int src_wc, _ ) = parse_std_addr(src);
+
+    throw_unless(err::insufficient_fee, value >= fee::deposit);
+    ( _, _, _, int min_deposit ) = unpack_params();
+    throw_unless(err::deposit_too_small, coins >= min_deposit);
+    throw_if(err::halted, halted?);
+
+    ;; Hipo's wallet pays only to basechain, so a depositor anywhere else could never be paid back
+    if src_wc != chain::base {
+        builder refund = begin_cell()
+            .store_uint(op::gas_excess, 32)
+            .store_uint(query_id, 64);
+        send_msg(false, src.to_builder(), null(), refund, 0, send::remaining_value);
+        return ();
+    }
+
+    int deposit_id = new_query_id();
+    pending~udict_set_builder(64, deposit_id, begin_cell().store_slice(src).store_uint(now(), 32));
+
+    ;; An explicit `coins` makes the rest of the message ride on to the mint notification, which pays the
+    ;; booking: the burner's pattern.
+    builder body = begin_cell()
+        .store_uint(op::deposit_coins, 32)
+        .store_uint(deposit_id, 64)
+        .store_uint(0, 2) ;; owner: addr_none, which Hipo reads as the sender, us
+        .store_coins(coins)
+        .store_coins(0) ;; ownership_assigned_amount
+        .store_uint(0, 2); ;; referrer: addr_none
+    send_msg(true, treasury.to_builder(), null(), body, coins + fee::deposit_forward, send::regular);
+}
+
+;; Both kinds of arrival come as transfer_notification from the Jackpot's own wallet. A mint names the
+;; Jackpot itself as the sender (wallet.fc tokens_minted); a player's transfer names the player.
+() transfer_notification(slice src, slice s) impure inline {
+    ifnot equal_slice_bits(src, wallet) {
+        return (); ;; not ours: nothing here is credited from a notification we cannot trust
+    }
+
+    int query_id = s~load_uint(64);
+    int amount = s~load_coins();
+    slice sender = s~load_msg_addr();
+
+    if equal_slice_bits(sender, my_address()) {
+        ;; a mint: only one of ours, with a live pending record, is booked. Others stay in the wallet
+        ;; outside T, for the governor.
+        ( slice v, int found? ) = pending~udict_delete_get?(64, query_id);
+        if found? {
+            slice owner = v~load_msg_addr();
+            tokens_arrived(owner, amount);
+        }
+        return ();
+    }
+
+    ifnot amount {
+        return ();
+    }
+
+    ( int sender_wc, _ ) = parse_std_addr(sender);
+    int value = incoming_value();
+    if (sender_wc != chain::base) {
+        return (); ;; cannot be paid back: held outside T for the governor
+    }
+
+    if (~ halted?) & (value >= fee::hgram_deposit) {
+        tokens_arrived(sender, amount);
+        return ();
+    }
+
+    ;; too little GRAM, or halted: back to the player when the return can be paid for
+    if value >= fee::handler + fee::payout {
+        total_tokens += amount;
+        pay(sender, amount, payout::player, 0);
+    }
+}
+
+;;
+;; quote replies
+;;
+
+() book(slice record, int tc, int tt) impure inline {
+    slice owner = record~load_msg_addr();
+    int tokens = record~load_coins();
+
+    int c = muldiv(tokens, tc, tt);
+    in_flight -= tokens;
+
+    ;; returning rather than booking an empty or tiny range keeps the next booking's address free
+    ( _, _, _, int min_deposit ) = unpack_params();
+    if (c < min_deposit) | halted? | falling? {
+        pay(owner, tokens, payout::player, 0);
+        return ();
+    }
+
+    int start = next_ticket;
+    principal += c;
+    next_ticket += c;
+
+    ( builder range, builder state_init, _ ) = range_address(start);
+    builder setup = begin_cell()
+        .store_uint(op::range_setup, 32)
+        .store_uint(0, 64)
+        .store_slice(owner)
+        .store_coins(c);
+    ;; Not bounceable: setup cannot fail at a fresh address with the gas pinned in tests, and a bounce
+    ;; would carry back too little of the body to undo the booking.
+    send_msg(false, range, state_init, setup, fee::range_setup, send::regular);
+
+    builder log = begin_cell()
+        .store_slice(owner)
+        .store_uint(start, 128)
+        .store_coins(c)
+        .store_coins(tokens);
+    emit_log(log::booking, log);
+}
+
+() pay_withdrawal(slice record, int tc, int tt) impure inline {
+    slice owner = record~load_msg_addr();
+    int start = record~load_uint(128);
+    int x = record~load_coins();
+
+    ;; the min shares the loss pro-rata when the rate has fallen; otherwise the first term is the smaller
+    int w = min(muldiv(x, tt, tc), muldiv(max(free_tokens(), 0), x, principal));
+    w = max(w, 0);
+    principal -= x;
+    if w {
+        pay(owner, w, payout::player, 0);
+    }
+
+    builder log = begin_cell()
+        .store_slice(owner)
+        .store_uint(start, 128)
+        .store_coins(x)
+        .store_coins(w);
+    emit_log(log::withdrawal, log);
+}
+
+() log_draw_start(int round_since, int next_cutoff, int pot, int burn) impure inline {
+    ( int p0, int p1, int p2 ) = unpack_prizes();
+    builder log = begin_cell()
+        .store_uint(draw_id, 32)
+        .store_uint(round_since, 32)
+        .store_coins(draw_cutoff)
+        .store_coins(next_cutoff)
+        .store_coins(pot)
+        .store_coins(burn)
+        .store_coins(p0)
+        .store_coins(p1)
+        .store_coins(p2)
+        .store_uint(draw_round, 64);
+    emit_log(log::draw_start, log);
+}
+
+() begin_draw(int query_id, slice record, int tc, int tt) impure inline {
+    int round_since = record~load_uint(32);
+
+    if (draw_state != draw::quoting) | (draw_query_id != query_id) {
+        return ();
+    }
+    draw_state = draw::idle;
+    draw_query_id = 0;
+
+    ( _, int cutoff, int last_coins, int last_tokens ) = unpack_last_start();
+    ( int burn_share, int min_pot, _, _ ) = unpack_params();
+
+    int rate_up? = (last_tokens == 0) | (tc * last_tokens > last_coins * tt);
+    int pot = free_tokens() - muldivc(principal, tt, tc);
+    if (~ rate_up?) | (pot < min_pot) | falling? | halted? {
+        return (); ;; the keeper tries again once Hipo books the round's reward
+    }
+
+    pack_last_start(round_since, next_ticket, tc, tt);
+
+    if cutoff == 0 {
+        ;; nobody eligible yet: open the first period and let the pot roll over
+        draw_cutoff = 0;
+        draw_round = 0;
+        pack_prizes(0, 0, 0);
+        log_draw_start(round_since, next_ticket, 0, 0);
+        return ();
+    }
+
+    int burn = muldiv(pot, burn_share, basis_points);
+    int rest = pot - burn;
+    int p0 = muldiv(rest, share::first, basis_points);
+    int p1 = muldiv(rest, share::second, basis_points);
+    pack_prizes(p0, p1, rest - p0 - p1);
+    set_aside += pot;
+    burn_owed += burn;
+
+    draw_id += 1;
+    draw_round = quicknet_round_at(now() + drand_delay);
+    draw_cutoff = cutoff;
+    seed = 0;
+    randomness_time = 0;
+    slots = 7; ;; all open, every attempt 0
+    draw_state = draw::waiting;
+
+    log_draw_start(round_since, next_ticket, pot, burn);
+}
+
+;; Never throws: the treasury's reply is not bounceable, so a throw would lose it.
+() take_current_quote(slice src, slice s) impure inline {
+    ifnot equal_slice_bits(src, treasury) {
+        return ();
+    }
+
+    int query_id = s~load_uint(64);
+    int tc = s~load_uint(128);
+    int tt = s~load_uint(128);
+
+    if (tc == 0) | (tt == 0) {
+        return (); ;; not a rate; the record stays for requote
+    }
+
+    ;; a record is used once
+    ( slice record, int found? ) = quotes~udict_delete_get?(64, query_id);
+    ifnot found? {
+        return ();
+    }
+
+    ;; a lower rate is the truth, and is stored; the flag holds back what the old rate promised
+    if (quote_tokens > 0) & (tc * quote_tokens < quote_coins * tt) {
+        falling? = true;
+    }
+    quote_coins = tc;
+    quote_tokens = tt;
+
+    record~skip_bits(32); ;; created_at
+    int kind = record~load_uint(2);
+
+    if kind == quote::booking {
+        return book(record, tc, tt);
+    }
+    if kind == quote::withdrawal {
+        return pay_withdrawal(record, tc, tt);
+    }
+    if kind == quote::draw {
+        return begin_draw(query_id, record, tc, tt);
+    }
+}
+
+;; Anyone may resend a quote request that has had no reply for 10 minutes. The record moves to a fresh
+;; query_id, so a late reply to the old one finds nothing.
+() requote(slice src, slice s) impure inline {
+    s~load_uint(64);
+    int target = s~load_uint(64);
+    s.end_parse();
+
+    throw_unless(err::insufficient_fee, incoming_value() >= fee::requote);
+
+    ( slice record, int found? ) = quotes.udict_get?(64, target);
+    throw_unless(err::unknown_query, found?);
+    int created_at = record~load_uint(32);
+    throw_unless(err::too_soon, now() >= created_at + requote_after);
+
+    quotes~udict_delete?(64, target);
+    int query_id = new_query_id();
+    if (record.preload_uint(2) == quote::draw) {
+        draw_query_id = query_id;
+    }
+    request_quote(query_id, begin_cell().store_uint(now(), 32).store_slice(record));
+}
+
+;;
+;; withdrawal
+;;
+
+() withdrawn(slice src, slice s) impure inline {
+    int query_id = s~load_uint(64);
+    int x = s~load_coins();
+    int start = s~load_uint(128);
+    slice owner = s~load_msg_addr();
+    s.end_parse();
+
+    ;; a throw bounces this back to the range, which restores its live part
+    throw_unless(err::access_denied, is_range?(src, start));
+    throw_unless(err::invalid_parameters, x > 0);
+
+    ;; x stays in P until the reply pays it, so a draw in between cannot pay out tokens that are owed
+    int id = new_query_id();
+    request_quote(id, begin_cell()
+        .store_uint(now(), 32)
+        .store_uint(quote::withdrawal, 2)
+        .store_slice(owner)
+        .store_uint(start, 128)
+        .store_coins(x));
+}
+
+;;
+;; the draw
+;;
+
+() start_draw(slice src, slice s) impure inline {
+    s~load_uint(64);
+    s.end_parse();
+
+    ( int round_since, _ ) = get_vset_times(config::current_validators);
+
+    throw_unless(err::insufficient_fee, incoming_value() >= fee::start_draw);
+    throw_unless(err::not_idle, draw_state == draw::idle);
+    throw_if(err::halted, halted?);
+    throw_if(err::rate_falling, falling?);
+    ( int last_round_since, _, _, _ ) = unpack_last_start();
+    throw_unless(err::round_not_changed, round_since > last_round_since);
+
+    int query_id = new_query_id();
+    draw_state = draw::quoting;
+    draw_query_id = query_id;
+    request_quote(query_id, begin_cell()
+        .store_uint(now(), 32)
+        .store_uint(quote::draw, 2)
+        .store_uint(round_since, 32));
+}
+
+() submit_randomness(slice src, slice s) impure inline {
+    s~load_uint(64);
+    slice signature = s~load_ref().begin_parse();
+    slice witness = s~load_ref().begin_parse();
+    s.end_parse();
+
+    throw_unless(err::insufficient_fee, incoming_value() >= fee::submit_randomness);
+    throw_unless(err::not_waiting_for_randomness, draw_state == draw::waiting);
+
+    ;; throws unless drand quicknet signed draw_round, so a bad submission is paid by its sender
+    seed = quicknet_verify(draw_round, signature, witness);
+    randomness_time = now();
+    draw_state = draw::resolving;
+
+    builder log = begin_cell()
+        .store_uint(draw_id, 32)
+        .store_uint(draw_round, 64)
+        .store_uint(seed, 256);
+    emit_log(log::randomness, log);
+}
+
+;; The keeper names the range it read from the logs; the Jackpot computes the ticket itself, so nobody
+;; can make a range answer about a ticket of their choosing.
+() locate(slice src, slice s) impure inline {
+    int query_id = s~load_uint(64);
+    int slot = s~load_uint(8);
+    int start = s~load_uint(128);
+    s.end_parse();
+
+    throw_unless(err::insufficient_fee, incoming_value() >= fee::locate);
+    throw_unless(err::not_resolving, draw_state == draw::resolving);
+    throw_unless(err::invalid_parameters, slot < 3);
+    throw_unless(err::slot_closed, slot_open?(slot));
+
+    int j = attempt(slot);
+    int r = ticket(slot, j);
+    throw_unless(err::ticket_out_of_range, start <= r);
+
+    ( builder range, _, _ ) = range_address(start);
+    builder check = begin_cell()
+        .store_uint(op::check, 32)
+        .store_uint(query_id, 64)
+        .store_uint(draw_id, 32)
+        .store_uint(slot, 8)
+        .store_uint(j, 8)
+        .store_uint(r, 128)
+        .store_uint(start, 128);
+    ;; bounceable: a wrong start throws at the range, and the value comes back here
+    send_msg(true, range, null(), check, fee::check, send::regular);
+}
+
+;; Shared by hit and miss. A reply counts only if it comes from the range at `start` and answers the
+;; current attempt of an open slot of this draw, about the ticket the Jackpot itself asked for.
+int current_reply?(slice src, int draw, int slot, int j, int r, int start) inline {
+    if (draw_state != draw::resolving) | (draw != draw_id) | (slot >= 3) {
+        return false;
+    }
+    ifnot slot_open?(slot) {
+        return false;
+    }
+    if (j != attempt(slot)) | (r != ticket(slot, j)) {
+        return false;
+    }
+    return is_range?(src, start);
+}
+
+;; Never throws.
+() hit(slice src, slice s) impure inline {
+    s~load_uint(64);
+    int draw = s~load_uint(32);
+    int slot = s~load_uint(8);
+    int j = s~load_uint(8);
+    int r = s~load_uint(128);
+    int start = s~load_uint(128);
+    slice owner = s~load_msg_addr();
+
+    ifnot current_reply?(src, draw, slot, j, r, start) {
+        return ();
+    }
+
+    int amount = prize(slot);
+    if falling? {
+        ;; held back: it stays in O as the winner's claim, payable once the governor clears the flag
+        credit_claimable(owner, amount);
+        log_slot(slot, j, slot::held, r, start, amount, owner);
+    } else {
+        set_aside -= amount;
+        pay(owner, amount, payout::player, 0);
+        log_slot(slot, j, slot::hit, r, start, amount, owner);
+    }
+    close_slot(slot);
+}
+
+;; Never throws.
+() miss(slice src, slice s) impure inline {
+    s~load_uint(64);
+    int draw = s~load_uint(32);
+    int slot = s~load_uint(8);
+    int j = s~load_uint(8);
+    int r = s~load_uint(128);
+    int start = s~load_uint(128);
+
+    ifnot current_reply?(src, draw, slot, j, r, start) {
+        return ();
+    }
+
+    slots += 1 << (8 + 8 * slot);
+    if j + 1 < attempts_per_slot {
+        log_slot(slot, j, slot::miss, r, start, 0, addr_none());
+        return ();
+    }
+
+    int amount = prize(slot);
+    set_aside -= amount;
+    log_slot(slot, j, slot::rolled_over, r, start, amount, addr_none());
+    close_slot(slot);
+}
+
+;; A slot nobody settled within one validation round of the randomness rolls over. This covers a range
+;; that ran out of storage; it never fires while the keeper is locating.
+() expire(slice src, slice s) impure inline {
+    s~load_uint(64);
+    int slot = s~load_uint(8);
+    s.end_parse();
+
+    ( int validators_elected_for, _, _, _ ) = get_election_config();
+
+    throw_unless(err::insufficient_fee, incoming_value() >= fee::expire);
+    throw_unless(err::not_resolving, draw_state == draw::resolving);
+    throw_unless(err::invalid_parameters, slot < 3);
+    throw_unless(err::slot_closed, slot_open?(slot));
+    throw_unless(err::too_soon, now() >= randomness_time + validators_elected_for);
+
+    int amount = prize(slot);
+    set_aside -= amount;
+    log_slot(slot, attempt(slot), slot::expired, 0, 0, amount, addr_none());
+    close_slot(slot);
+}
+
+;;
+;; payouts
+;;
+
+;; The amount is cleared before it is sent, and sent as a new recorded payout, so two claims pay once.
+() claim(slice src, slice s) impure inline {
+    s~load_uint(64);
+    s.end_parse();
+
+    throw_unless(err::insufficient_fee, incoming_value() >= fee::claim);
+    throw_if(err::rate_falling, falling?);
+
+    ( slice v, int found? ) = claimable~udict_delete_get?(256, slice_hash(src));
+    throw_unless(err::nothing_to_claim, found?);
+    v~load_msg_addr();
+    int amount = v~load_coins();
+
+    set_aside -= amount;
+    pay(src, amount, payout::player, 0);
+}
+
+;; Never throws. Only the recipient's own hGRAM wallet confirms a payout. A gas_excess from the
+;; Jackpot's own wallet proves nothing: Hipo sends one after a second-hop bounce, and anyone can make it
+;; send one with any query_id.
+() gas_excess(slice src, slice s) impure inline {
+    int query_id = s~load_uint(64);
+
+    ( slice record, int found? ) = payouts.udict_get?(64, query_id);
+    ifnot found? {
+        return ();
+    }
+    record~skip_bits(1);
+    slice recipient = record~load_msg_addr();
+    if is_wallet_of?(src, recipient) {
+        payouts~udict_delete?(64, query_id);
+    }
+}
+
+;; Never throws.
+() on_bounce(slice src, slice s) impure inline {
+    s~skip_bits(32); ;; 0xffffffff
+    int op = s~load_uint(32);
+    int query_id = s~load_uint(64);
+
+    if (op == op::send_tokens) & equal_slice_bits(src, wallet) {
+        ;; the first hop failed, so the tokens never left our wallet
+        ( slice record, int found? ) = payouts~udict_delete_get?(64, query_id);
+        if found? {
+            restore_payout(record);
+        }
+        return ();
+    }
+
+    if (op == op::deposit_coins) & equal_slice_bits(src, treasury) {
+        ;; Hipo refused the deposit (halted, too small): the GRAM goes back to the player
+        ( slice record, int found? ) = pending~udict_delete_get?(64, query_id);
+        if found? {
+            slice owner = record~load_msg_addr();
+            builder refund = begin_cell()
+                .store_uint(op::gas_excess, 32)
+                .store_uint(query_id, 64);
+            send_msg(false, owner.to_builder(), null(), refund, 0, send::remaining_value + send::ignore_errors);
+        }
+        return ();
+    }
+
+    if (op == op::provide_current_quote) & equal_slice_bits(src, treasury) {
+        ;; a draw goes back to idle; a booking or a withdrawal keeps its record, for requote
+        if (draw_state == draw::quoting) & (draw_query_id == query_id) {
+            quotes~udict_delete?(64, query_id);
+            draw_state = draw::idle;
+            draw_query_id = 0;
+        }
+        return ();
+    }
+
+    ;; anything else, a check sent to a wrong range among them, is only GRAM coming back
+}
+
+;;
+;; governance
+;;
+
+() upgrade_code(slice src, slice s) impure inline {
+    s~load_uint(64);
+    cell new_code = s~load_ref();
+    s.end_parse();
+
+    throw_unless(err::access_denied, equal_slice_bits(src, governor()));
+
+    ;; the new code takes over from the next message; a layout change migrates there
+    set_code(new_code);
+}
+
+;; Follows a Hipo wallet migration: the parent, the wallet code and the Jackpot's own wallet change
+;; together.
+() set_hipo_wallet(slice src, slice s) impure inline {
+    s~load_uint(64);
+    slice new_parent = s~load_msg_addr();
+    slice new_wallet = s~load_msg_addr();
+    cell new_wallet_code = s~load_ref();
+    s.end_parse();
+
+    throw_unless(err::access_denied, equal_slice_bits(src, governor()));
+
+    hipo = begin_cell().store_slice(new_parent).store_ref(new_wallet_code).end_cell();
+    wallet = new_wallet;
+}
+
+;; Books a deposit whose mint notification never came (Hipo sends it with ignore_errors), after the
+;; governor has checked the wallet off chain. Deleting the pending entry voids a late notification.
+() resolve_pending(slice src, slice s) impure inline {
+    s~load_uint(64);
+    int target = s~load_uint(64);
+    int tokens = s~load_coins();
+    s.end_parse();
+
+    ( int validators_elected_for, _, _, _ ) = get_election_config();
+
+    throw_unless(err::access_denied, equal_slice_bits(src, governor()));
+    throw_unless(err::insufficient_fee, incoming_value() >= fee::booking);
+    throw_unless(err::invalid_parameters, tokens > 0);
+
+    ( slice record, int found? ) = pending~udict_delete_get?(64, target);
+    throw_unless(err::unknown_query, found?);
+    slice owner = record~load_msg_addr();
+    int created_at = record~load_uint(32);
+    ;; with instant_mint off, a mint legitimately comes a round later
+    throw_unless(err::too_soon, now() >= created_at + 2 * validators_elected_for);
+
+    tokens_arrived(owner, tokens);
+}
+
+;; Returns hGRAM that reached the wallet without a notification, or was held there. The tokens are
+;; outside T, so they enter T and leave it as a recorded payout.
+() return_tokens(slice src, slice s) impure inline {
+    s~load_uint(64);
+    slice owner = s~load_msg_addr();
+    int amount = s~load_coins();
+    s.end_parse();
+
+    throw_unless(err::access_denied, equal_slice_bits(src, governor()));
+    throw_unless(err::insufficient_fee, incoming_value() >= fee::handler + fee::payout);
+    throw_unless(err::invalid_parameters, amount > 0);
+
+    total_tokens += amount;
+    pay(owner, amount, payout::player, 0);
+}
+
+;; Closes a payout whose second hop failed. The governor must first find, on chain, the bounced
+;; receive_tokens at the recipient's wallet and our wallet's on_bounce after it: settling a payout that
+;; arrived but whose confirmation was dropped would pay twice.
+() settle_failed_payout(slice src, slice s) impure inline {
+    s~load_uint(64);
+    int target = s~load_uint(64);
+    s.end_parse();
+
+    throw_unless(err::access_denied, equal_slice_bits(src, governor()));
+
+    ( slice record, int found? ) = payouts~udict_delete_get?(64, target);
+    throw_unless(err::unknown_query, found?);
+    restore_payout(record);
+}
+
+() set_burn_share(slice src, slice s) impure inline {
+    s~load_uint(64);
+    int new_burn_share = s~load_uint(16);
+    s.end_parse();
+
+    throw_unless(err::access_denied, equal_slice_bits(src, governor()));
+    throw_unless(err::invalid_parameters, new_burn_share <= max_burn_share);
+
+    ( _, int min_pot, int burn_batch, int min_deposit ) = unpack_params();
+    pack_params(new_burn_share, min_pot, burn_batch, min_deposit);
+}
+
+() set_min_pot(slice src, slice s) impure inline {
+    s~load_uint(64);
+    int new_min_pot = s~load_coins();
+    s.end_parse();
+
+    throw_unless(err::access_denied, equal_slice_bits(src, governor()));
+
+    ( int burn_share, _, int burn_batch, int min_deposit ) = unpack_params();
+    pack_params(burn_share, new_min_pot, burn_batch, min_deposit);
+}
+
+() set_burn_batch(slice src, slice s) impure inline {
+    s~load_uint(64);
+    int new_burn_batch = s~load_coins();
+    s.end_parse();
+
+    throw_unless(err::access_denied, equal_slice_bits(src, governor()));
+
+    ( int burn_share, int min_pot, _, int min_deposit ) = unpack_params();
+    pack_params(burn_share, min_pot, new_burn_batch, min_deposit);
+}
+
+() set_min_deposit(slice src, slice s) impure inline {
+    s~load_uint(64);
+    int new_min_deposit = s~load_coins();
+    s.end_parse();
+
+    throw_unless(err::access_denied, equal_slice_bits(src, governor()));
+    ;; at least 1, so that no booking ever deploys an empty range
+    throw_unless(err::invalid_parameters, new_min_deposit >= 1);
+
+    ( int burn_share, int min_pot, int burn_batch, _ ) = unpack_params();
+    pack_params(burn_share, min_pot, burn_batch, new_min_deposit);
+}
+
+() set_halter(slice src, slice s) impure inline {
+    s~load_uint(64);
+    slice new_halter = s~load_msg_addr();
+    s.end_parse();
+
+    throw_unless(err::access_denied, equal_slice_bits(src, governor()));
+
+    ( slice burner, slice governor, _ ) = unpack_roles();
+    roles = begin_cell().store_slice(burner).store_slice(governor).store_slice(new_halter).end_cell();
+}
+
+;; The halter can only stop; resuming is the governor's.
+() set_halted(slice src, slice s) impure inline {
+    s~load_uint(64);
+    int new_halted? = s~load_int(1);
+    s.end_parse();
+
+    ( _, slice governor, slice halter ) = unpack_roles();
+    int governor? = equal_slice_bits(src, governor);
+    int halter? = equal_slice_bits(src, halter);
+    throw_unless(err::access_denied, governor? | (halter? & new_halted?));
+
+    halted? = new_halted?;
+}
+
+() clear_falling(slice src, slice s) impure inline {
+    s~load_uint(64);
+    s.end_parse();
+
+    throw_unless(err::access_denied, equal_slice_bits(src, governor()));
+
+    falling? = false;
+}
+
+;; Everything above the storage float. GRAM some chain in flight still needs then comes out of the
+;; float, which is sized for it.
+() withdraw_surplus(slice src, slice s) impure inline {
+    int query_id = s~load_uint(64);
+    s.end_parse();
+
+    throw_unless(err::access_denied, equal_slice_bits(src, governor()));
+
+    raw_reserve(fee::jackpot_storage, reserve::at_most);
+    builder excess = begin_cell()
+        .store_uint(op::gas_excess, 32)
+        .store_uint(query_id, 64);
+    send_msg(false, governor().to_builder(), null(), excess, 0, send::unreserved_balance + send::ignore_errors);
+}
+
+;;
+;; routing
+;;
+
+() route_internal_message(int flags, slice src, slice s) impure inline {
+    if flags & 1 {
+        return on_bounce(src, s);
+    }
+
+    if s.slice_bits() < 32 {
+        return (); ;; plain GRAM: a top-up
+    }
+
+    int op = s~load_uint(32);
+
+    if op == op::transfer_notification {
+        return transfer_notification(src, s);
+    }
+    if op == op::take_current_quote {
+        return take_current_quote(src, s);
+    }
+    if op == op::gas_excess {
+        return gas_excess(src, s);
+    }
+    if op == op::hit {
+        return hit(src, s);
+    }
+    if op == op::miss {
+        return miss(src, s);
+    }
+    if op == op::deposit {
+        return deposit(src, s);
+    }
+    if op == op::withdrawn {
+        return withdrawn(src, s);
+    }
+    if op == op::start_draw {
+        return start_draw(src, s);
+    }
+    if op == op::submit_randomness {
+        return submit_randomness(src, s);
+    }
+    if op == op::locate {
+        return locate(src, s);
+    }
+    if op == op::requote {
+        return requote(src, s);
+    }
+    if op == op::expire {
+        return expire(src, s);
+    }
+    if op == op::claim {
+        return claim(src, s);
+    }
+    if op == op::top_up {
+        return ();
+    }
+    if op == op::upgrade_code {
+        return upgrade_code(src, s);
+    }
+    if op == op::set_hipo_wallet {
+        return set_hipo_wallet(src, s);
+    }
+    if op == op::resolve_pending {
+        return resolve_pending(src, s);
+    }
+    if op == op::return_tokens {
+        return return_tokens(src, s);
+    }
+    if op == op::settle_failed_payout {
+        return settle_failed_payout(src, s);
+    }
+    if op == op::set_burn_share {
+        return set_burn_share(src, s);
+    }
+    if op == op::set_min_pot {
+        return set_min_pot(src, s);
+    }
+    if op == op::set_burn_batch {
+        return set_burn_batch(src, s);
+    }
+    if op == op::set_min_deposit {
+        return set_min_deposit(src, s);
+    }
+    if op == op::set_halter {
+        return set_halter(src, s);
+    }
+    if op == op::set_halted {
+        return set_halted(src, s);
+    }
+    if op == op::clear_falling {
+        return clear_falling(src, s);
+    }
+    if op == op::withdraw_surplus {
+        return withdraw_surplus(src, s);
+    }
+
+    throw(err::invalid_op);
+}
+
+() recv_internal(cell in_msg_full, slice s) impure {
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    slice src = cs~load_msg_addr();
+
+    load_data();
+    route_internal_message(flags, src, s);
+    save_data();
+}
+
+;;
+;; get methods
+;;
+
+var get_jackpot_state() method_id {
+    load_data();
+    ( int burn_share, int min_pot, int burn_batch, int min_deposit ) = unpack_params();
+    ( int last_round_since, int cutoff, int last_coins, int last_tokens ) = unpack_last_start();
+    return
+        ( total_tokens
+        , in_flight
+        , set_aside
+        , principal
+        , next_ticket
+        , quote_coins
+        , quote_tokens
+        , halted?
+        , falling?
+        , burn_share
+        , min_pot
+        , burn_batch
+        , burn_owed
+        , min_deposit
+        , last_round_since
+        , cutoff
+        , last_coins
+        , last_tokens
+        );
+}
+
+var get_draw_state() method_id {
+    load_data();
+    ( int p0, int p1, int p2 ) = unpack_prizes();
+    return
+        ( draw_state
+        , draw_id
+        , draw_query_id
+        , draw_cutoff
+        , draw_round
+        , seed
+        , randomness_time
+        , p0
+        , p1
+        , p2
+        , slots & 7
+        , attempt(0)
+        , attempt(1)
+        , attempt(2)
+        );
+}
+
+;; The ticket the open slot `slot` tries next, or -1 when there is none: what the keeper locates.
+int get_ticket(int slot) method_id {
+    load_data();
+    if (draw_state != draw::resolving) | (slot >= 3) {
+        return -1;
+    }
+    ifnot slot_open?(slot) {
+        return -1;
+    }
+    return ticket(slot, attempt(slot));
+}
+
+(int, int) get_quote() method_id {
+    load_data();
+    return ( quote_coins, quote_tokens );
+}
+
+slice get_range_address(int start) method_id {
+    load_data();
+    ( builder range, _, _ ) = range_address(start);
+    return range.end_cell().begin_parse();
+}
+
+var get_addresses() method_id {
+    load_data();
+    ( slice parent, cell wallet_code ) = unpack_hipo();
+    ( slice burner, slice governor, slice halter ) = unpack_roles();
+    return ( treasury, parent, wallet, burner, governor, halter, wallet_code, range_code );
+}
+
+var get_books() method_id {
+    load_data();
+    return ( pending, quotes, payouts, claimable );
+}
+
+int get_claimable(slice owner) method_id {
+    load_data();
+    ( slice v, int found? ) = claimable.udict_get?(256, slice_hash(owner));
+    ifnot found? {
+        return 0;
+    }
+    v~load_msg_addr();
+    return v~load_coins();
+}
+
+var get_jackpot_fees() method_id {
+    return
+        ( fee::deposit
+        , fee::hgram_deposit
+        , fee::withdraw
+        , fee::start_draw
+        , fee::submit_randomness
+        , fee::locate
+        , fee::requote
+        , fee::expire
+        , fee::claim
+        );
+}

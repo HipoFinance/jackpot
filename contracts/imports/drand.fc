@@ -1,0 +1,193 @@
+;; The on-chain check of a drand quicknet beacon.
+;;
+;; drand quicknet signs each round with BLS over BLS12-381, scheme `bls-unchained-g1-rfc9380`: signatures
+;; in G1 (48 bytes compressed), the public key in G2 (96 bytes compressed). For round n:
+;;
+;;     m         = sha256(n as 8 bytes, big-endian)
+;;     H         = hash_to_curve(m) into G1, RFC 9380, suite BLS12381G1_XMD:SHA-256_SSWU_RO_
+;;     valid iff   e(signature, g2) = e(H, public_key)
+;;     randomness = sha256(signature)
+;;
+;; The TVM's BLS_VERIFY cannot check this: it hashes to G2 with another tag and takes keys in G1. So the
+;; check is built from the low-level BLS instructions, which do no subgroup checks of their own.
+;;
+;; hash_to_curve needs two 512-bit numbers reduced mod p (381 bits). TVM integers have 257 bits, so the
+;; sender supplies each quotient q and remainder r (the witness), and we only check x = q·p + r and r < p.
+;; A wrong witness makes that check fail; it cannot change what is hashed.
+;;
+;; Needs TVM global version 4 or later (BLS_* and HASHEXT).
+;; Off-chain side: wrappers/drand.ts builds the witness exactly as this file reads it.
+
+;; ---- Quicknet constants -------------------------------------------------------------------------------
+;; From https://api.drand.sh/v2/beacons/quicknet/info, checked 2026-10-27:
+;;   chain hash 52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971
+;;   scheme bls-unchained-g1-rfc9380, period 3 s, genesis 1692803367
+
+const int drand::genesis_time = 1692803367;
+const int drand::period = 3;
+
+;; Quicknet's public key, a compressed G2 point (96 bytes).
+const slice drand::public_key = "83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a"s;
+
+;; The standard generator of G2, compressed (96 bytes).
+const slice drand::g2_generator = "93e02b6052719f607dacd3a088274f65596bd0d09920b61ab5da61bbdc7f5049334cf11213945d57e5ac7d055d042b7e024aa2b2f08f0a91260805272dc51051c6e47ad4fa403b02b4510b647ae3d1770bac0326a805bbefd48056c8c121bdb8"s;
+
+;; DST_prime = DST || I2OSP(len(DST), 1), with DST = "BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_" (43 bytes,
+;; so the last byte is 0x2b).
+const slice drand::dst_prime = "424c535f5349475f424c53313233383147315f584d443a5348412d3235365f535357555f524f5f4e554c5f2b"s;
+
+;; Z_pad of expand_message_xmd: one SHA-256 block (64 bytes) of zeros.
+const slice drand::z_pad = "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"s;
+
+;; The base field prime of BLS12-381 in three 128-bit limbs: p = p2·2^256 + p1·2^128 + p0 (p2 < 2^125).
+const int bls::p2 = 0x1a0111ea397fe69a4b1ba7b6434bacd7;
+const int bls::p1 = 0x64774b84f38512bf6730d2a0f6b0f624;
+const int bls::p0 = 0x1eabfffeb153ffffb9feffffffffaaab;
+
+;; Witness layout: q0:uint132 r0:uint384 ^[ q1:uint132 r1:uint384 ]. q ≤ floor((2^512 − 1) / p) < 2^132.
+const int drand::q_bits = 132;
+const int drand::r_bits = 384;
+
+;; ---- Errors -------------------------------------------------------------------------------------------
+
+const int err::drand_bad_round = 501;            ;; round is not in [1, 2^64)
+const int err::drand_bad_signature = 502;        ;; signature is not exactly 48 bytes and no refs
+const int err::drand_bad_witness = 503;          ;; the witness layout, or x ≠ q·p + r, or r ≥ p
+const int err::drand_signature_not_in_g1 = 504;  ;; not a valid encoding of a point in G1
+const int err::drand_signature_is_zero = 505;    ;; the point at infinity
+const int err::drand_wrong_signature = 506;      ;; the pairing check failed
+
+;; ---- TVM instructions FunC's stdlib lacks -------------------------------------------------------------
+;; Stack signatures checked against ton-blockchain/ton crypto/vm/tonops.cpp (exec_bls_*, exec_hash_ext).
+
+;; BLS_MAP_TO_G1: field element (48 bytes, big-endian, < p) -> G1 point. blst's map_to_g1 with one input:
+;; the SSWU map, the isogeny and cofactor clearing, so the result is in G1.
+slice bls::map_to_g1(slice fp) asm "BLS_MAP_TO_G1";
+
+;; BLS_G1_ADD: a b -> a + b.
+slice bls::g1_add(slice a, slice b) asm "BLS_G1_ADD";
+
+;; BLS_G1_NEG: a -> −a.
+slice bls::g1_neg(slice a) asm "BLS_G1_NEG";
+
+;; BLS_G1_INGROUP: a -> -1 if a decodes to a point of G1, else 0 (a bad encoding gives 0, not an error).
+int bls::g1_in_group(slice a) asm "BLS_G1_INGROUP";
+
+;; BLS_G1_ISZERO: a -> -1 if a is the canonical encoding of the point at infinity.
+int bls::g1_is_zero(slice a) asm "BLS_G1_ISZERO";
+
+;; BLS_PAIRING with n = 2: (a1 b1 a2 b2 2) -> -1 if e(a1, b1) · e(a2, b2) = 1.
+int bls::pairing_check_2(slice g1_a, slice g2_a, slice g1_b, slice g2_b) asm "2 PUSHINT" "BLS_PAIRING";
+
+;; HASHEXT_SHA256 over 1, 2 or 3 parts, hashed in argument order, as a 256-bit unsigned integer.
+int drand::sha256_b(builder a) asm "1 PUSHINT" "HASHEXT_SHA256";
+int drand::sha256_bs(builder a, slice b) asm "2 PUSHINT" "HASHEXT_SHA256";
+int drand::sha256_sbs(slice a, builder b, slice c) asm "3 PUSHINT" "HASHEXT_SHA256";
+
+;; MULRSHIFTMOD: a b z -> floor(a·b / 2^z), a·b mod 2^z, with a 513-bit intermediate product.
+(int, int) drand::mul_rshift_mod(int a, int b, int z) asm "MULRSHIFTMOD";
+
+;; ---- Hash to G1 ---------------------------------------------------------------------------------------
+
+;; expand_message_xmd(m, DST, 128) of RFC 9380 section 5.3.1, for a 32-byte message m. Returns the four
+;; 32-byte blocks b1..b4 as integers; the two field inputs are b1·2^256 + b2 and b3·2^256 + b4.
+(int, int, int, int) drand::expand_message(int m) inline {
+    ;; b0 = H(Z_pad || m || I2OSP(128, 2) || I2OSP(0, 1) || DST_prime)
+    int b0 = drand::sha256_sbs(drand::z_pad, begin_cell().store_uint(m, 256).store_uint(128, 16).store_uint(0, 8), drand::dst_prime);
+    ;; b1 = H(b0 || I2OSP(1, 1) || DST_prime), and bi = H((b0 xor b(i−1)) || I2OSP(i, 1) || DST_prime)
+    int b1 = drand::sha256_bs(begin_cell().store_uint(b0, 256).store_uint(1, 8), drand::dst_prime);
+    int b2 = drand::sha256_bs(begin_cell().store_uint(b0 ^ b1, 256).store_uint(2, 8), drand::dst_prime);
+    int b3 = drand::sha256_bs(begin_cell().store_uint(b0 ^ b2, 256).store_uint(3, 8), drand::dst_prime);
+    int b4 = drand::sha256_bs(begin_cell().store_uint(b0 ^ b3, 256).store_uint(4, 8), drand::dst_prime);
+    return (b1, b2, b3, b4);
+}
+
+;; Throws unless r = x mod p, where x = x_hi·2^256 + x_lo (x < 2^512) and r is 384 bits big-endian.
+;; It checks x = q·p + r and r < p, limb by limb in base 2^128: every value stays below 2^134, far inside
+;; the 257-bit range, so no input can overflow, and every failure is err::drand_bad_witness.
+() drand::check_reduction(int x_hi, int x_lo, int q, slice r) impure inline {
+    int r2 = r~load_uint(128);
+    int r1 = r~load_uint(128);
+    int r0 = r~load_uint(128);
+
+    ;; r < p, compared limb by limb from the top
+    throw_unless(err::drand_bad_witness,
+        (r2 < bls::p2) | ((r2 == bls::p2) & ((r1 < bls::p1) | ((r1 == bls::p1) & (r0 < bls::p0)))));
+
+    ;; q·p + r, one 128-bit column at a time, against x's limbs. q < 2^132, so each q·p_i < 2^260 is
+    ;; split into hi < 2^132 and lo < 2^128, and the carry stays below 2^133.
+    int mask = (1 << 128) - 1;
+
+    (int hi, int lo) = drand::mul_rshift_mod(q, bls::p0, 128);
+    int t = lo + r0;
+    throw_unless(err::drand_bad_witness, (t & mask) == (x_lo & mask));
+    int carry = hi + (t >> 128);
+
+    (hi, lo) = drand::mul_rshift_mod(q, bls::p1, 128);
+    t = lo + r1 + carry;
+    throw_unless(err::drand_bad_witness, (t & mask) == (x_lo >> 128));
+    carry = hi + (t >> 128);
+
+    (hi, lo) = drand::mul_rshift_mod(q, bls::p2, 128);
+    t = lo + r2 + carry;
+    throw_unless(err::drand_bad_witness, (t & mask) == (x_hi & mask));
+    carry = hi + (t >> 128);
+
+    ;; what is left over must be x's top limb exactly
+    throw_unless(err::drand_bad_witness, carry == (x_hi >> 128));
+}
+
+;; ---- Verification -------------------------------------------------------------------------------------
+
+;; Throws unless `signature` is the BLS signature of drand round `round` under `public_key` in the
+;; bls-unchained-g1-rfc9380 scheme. Returns the round's randomness, sha256(signature), as uint256.
+;; `public_key` must be a trusted compressed G2 point: it is not checked here.
+int drand::verify_with_key(int round, slice signature, slice witness, slice public_key) impure inline {
+    throw_unless(err::drand_bad_round, (round > 0) & (round < (1 << 64)));
+    throw_unless(err::drand_bad_signature, (signature.slice_bits() == 384) & (signature.slice_refs() == 0));
+
+    ;; 1. The witness: two reductions mod p.
+    throw_unless(err::drand_bad_witness,
+        (witness.slice_bits() == drand::q_bits + drand::r_bits) & (witness.slice_refs() == 1));
+    int q0 = witness~load_uint(drand::q_bits);
+    slice r0 = witness~load_bits(drand::r_bits);
+    slice second = witness~load_ref().begin_parse();
+    throw_unless(err::drand_bad_witness,
+        (second.slice_bits() == drand::q_bits + drand::r_bits) & (second.slice_refs() == 0));
+    int q1 = second~load_uint(drand::q_bits);
+    slice r1 = second~load_bits(drand::r_bits);
+
+    int m = drand::sha256_b(begin_cell().store_uint(round, 64));
+    (int b1, int b2, int b3, int b4) = drand::expand_message(m);
+    drand::check_reduction(b1, b2, q0, r0);
+    drand::check_reduction(b3, b4, q1, r1);
+
+    ;; 2. Hash to G1. Mapping is linear after cofactor clearing, so
+    ;;    clear_cofactor(map(u0) + map(u1)) = map_to_g1(u0) + map_to_g1(u1).
+    slice h = bls::g1_add(bls::map_to_g1(r0), bls::map_to_g1(r1));
+
+    ;; 3. The signature comes from outside: it must decode to a point of G1 and not be zero.
+    throw_unless(err::drand_signature_not_in_g1, bls::g1_in_group(signature));
+    throw_if(err::drand_signature_is_zero, bls::g1_is_zero(signature));
+
+    ;; 4. e(signature, g2) · e(−H, public_key) = 1, that is e(signature, g2) = e(H, public_key).
+    throw_unless(err::drand_wrong_signature,
+        bls::pairing_check_2(signature, drand::g2_generator, bls::g1_neg(h), public_key));
+
+    return string_hash(signature);
+}
+
+;; Throws unless `signature` (48-byte compressed G1) is drand quicknet's signature for `round`, given the
+;; reduction witness built by wrappers/drand.ts. Returns the seed: sha256(signature) as uint256, which is
+;; drand's published `randomness` for the round.
+int quicknet_verify(int round, slice signature, slice witness) impure inline {
+    return drand::verify_with_key(round, signature, witness, drand::public_key);
+}
+
+;; The smallest quicknet round n whose publish time G + (n − 1)·3 is at or after `time`. Never below 1.
+int quicknet_round_at(int time) inline {
+    if (time <= drand::genesis_time) {
+        return 1;
+    }
+    return ((time - drand::genesis_time) ^/ drand::period) + 1;
+}

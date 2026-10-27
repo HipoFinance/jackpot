@@ -1,0 +1,143 @@
+#include "stdlib.fc";
+#include "constants.fc";
+
+builder to_builder(slice s) inline {
+    return begin_cell().store_slice(s);
+}
+
+builder store_state_init(builder b, builder state_init) inline {
+    return state_init.null?()
+        ? b.store_uint(0, 1)
+        : b.store_uint(2 + 0, 1 + 1).store_builder(state_init);
+}
+
+builder store_body(builder b, builder body) inline {
+    return body.builder_bits() <= 513
+        ? b.store_uint(0, 1).store_builder(body)
+        : b.store_maybe_ref(body.end_cell());
+}
+
+builder store_log(builder b, builder log) inline {
+    return log.builder_bits() <= 654
+        ? b.store_uint(0, 1).store_builder(log)
+        : b.store_maybe_ref(log.end_cell());
+}
+
+() send_msg(int bounceable?, builder dst, builder state_init, builder body, int coins, int mode) impure inline_ref {
+    ;; int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool
+    ;;   src:MsgAddress dest:MsgAddressInt
+    ;;   value:CurrencyCollection ihr_fee:Grams fwd_fee:Grams
+    ;;   created_lt:uint64 created_at:uint32 = CommonMsgInfoRelaxed;
+    ;; message$_ {X:Type} info:CommonMsgInfoRelaxed
+    ;;   init:(Maybe (Either StateInit ^StateInit))
+    ;;   body:(Either X ^X) = MessageRelaxed X;
+    cell msg = begin_cell()
+        .store_uint(bounceable? ? 0x18 : 0x10, 6) ;; 011000 or 010000
+        .store_builder(dst)
+        .store_coins(coins)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32)
+        .store_state_init(state_init)
+        .store_body(body)
+        .end_cell();
+    send_raw_message(msg, mode);
+}
+
+() emit_log(int topic, builder log) impure inline_ref {
+    ;; addr_extern$01 len:(## 9) external_address:(bits len) = MsgAddressExt;
+    ;; ext_out_msg_info$11 src:MsgAddress dest:MsgAddressExt
+    ;;   created_lt:uint64 created_at:uint32 = CommonMsgInfoRelaxed;
+    ;; message$_ {X:Type} info:CommonMsgInfoRelaxed
+    ;;   init:(Maybe (Either StateInit ^StateInit))
+    ;;   body:(Either X ^X) = MessageRelaxed X;
+    cell msg = begin_cell()
+        .store_uint(0x31, 2 + 2 + 2) ;; 110001
+        .store_uint(256, 9)
+        .store_uint(topic, 256)
+        .store_uint(0, 64 + 32 + 1)
+        .store_log(log)
+        .end_cell();
+    send_raw_message(msg, send::regular);
+}
+
+(int, int, int, int) get_election_config() inline {
+    ;; _ validators_elected_for:uint32 elections_start_before:uint32
+    ;;   elections_end_before:uint32 stake_held_for:uint32
+    ;;   = ConfigParam 15;
+    slice cs = config_param(config::election).begin_parse();
+    return ( cs~load_uint(32), cs~load_uint(32), cs~load_uint(32), cs~load_uint(32) );
+}
+
+(int, int) get_vset_times(int i) inline_ref {
+    ;; validators_ext#12 utime_since:uint32 utime_until:uint32
+    ;;   total:(## 16) main:(## 16) { main <= total } { main >= 1 }
+    ;;   total_weight:uint64 list:(HashmapE 16 ValidatorDescr) = ValidatorSet;
+    slice cs = config_param(i).begin_parse();
+    throw_unless(err::unexpected_validator_set_format, cs~load_uint(8) == 0x12);
+    return ( cs~load_uint(32), cs~load_uint(32) );
+}
+
+builder create_state_init(cell code, cell data) inline {
+    ;; _ split_depth:(Maybe (## 5)) special:(Maybe TickTock)
+    ;;   code:(Maybe ^Cell) data:(Maybe ^Cell)
+    ;;   library:(HashmapE 256 SimpleLib) = StateInit;
+    return begin_cell()
+        .store_uint(6, 5) ;; 00110
+        .store_ref(code)
+        .store_ref(data);
+}
+
+builder create_address(int wc, int addr) inline_ref {
+    ;; addr_std$10 anycast:(Maybe Anycast)
+    ;;   workchain_id:int8 address:bits256  = MsgAddressInt;
+    return begin_cell()
+        .store_uint(4, 3) ;; 100
+        .store_int(wc, 8)
+        .store_uint(addr, 256);
+}
+
+;; Exactly Hipo's create_wallet_data and create_wallet_address (contract/contracts/imports/utils.fc), so
+;; that the address computed here is the one Hipo's parent deploys. wallet_code is the cell the parent
+;; stores, which on mainnet is a library cell; it is hashed as it is, never parsed.
+cell create_wallet_data(builder owner, slice parent) inline {
+    return begin_cell()
+        .store_builder(owner)
+        .store_slice(parent)
+        .store_coins(0) ;; tokens
+        .store_dict(null()) ;; staking
+        .store_coins(0) ;; unstaking
+        .end_cell();
+}
+
+(builder, builder, int) create_wallet_address(builder owner, slice parent, cell wallet_code) inline_ref {
+    cell wallet_data = create_wallet_data(owner, parent);
+    builder state_init = create_state_init(wallet_code, wallet_data);
+    int addr = state_init.end_cell().cell_hash();
+    builder wallet = create_address(chain::base, addr);
+    return (wallet, state_init, addr);
+}
+
+;; A range's initial data, which with the range code fixes its address: (jackpot, epoch, start). The owner
+;; and length are not part of it, so that nobody can deploy a range at a booking's address ahead of the
+;; Jackpot with different contents; the one-time setup that carries them is accepted only from the
+;; Jackpot.
+cell create_range_data(slice jackpot, int epoch, int start) inline {
+    return begin_cell()
+        .store_slice(jackpot)
+        .store_uint(epoch, 32)
+        .store_uint(start, 128)
+        .end_cell();
+}
+
+(builder, builder, int) create_range_address(slice jackpot, int epoch, int start, cell range_code) inline_ref {
+    cell range_data = create_range_data(jackpot, epoch, start);
+    builder state_init = create_state_init(range_code, range_data);
+    int addr = state_init.end_cell().cell_hash();
+    builder range = create_address(chain::base, addr);
+    return (range, state_init, addr);
+}
+
+;; True when `src` is the standard basechain address whose hash part is `addr`.
+int is_base_addr?(slice src, int addr) inline {
+    ( int wc, int hash ) = parse_std_addr(src);
+    return (wc == chain::base) & (hash == addr);
+}
