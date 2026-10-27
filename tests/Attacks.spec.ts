@@ -1,17 +1,16 @@
 /* eslint-disable @typescript-eslint/no-non-null-assertion -- tests read state they just made */
 // The attacks the spec's rules exist to stop ("Rules every message follows" and its audit history), each
-// run the way an attacker would run it, against the real Hipo contracts. A test marked `it.failing` shows
-// a bug that is still open: it asserts the safe outcome, and fails today. See the report that came with
-// this file for the loss scenario of each.
-import { Message } from '@ton/core'
+// run the way an attacker would run it, against the real Hipo contracts.
+import { Message, beginCell, toNano } from '@ton/core'
+import { createShardAccount } from '@ton/sandbox'
 import '@ton/test-utils'
-import { toNano } from '@ton/core'
 import {
     BookingLog,
     DrawState,
     JackpotError,
     JackpotOp,
     LogTopic,
+    SetupFailedLog,
     SlotLog,
     SlotResult,
     logsOf,
@@ -29,6 +28,7 @@ import {
     jackpotState,
     mintHgram,
     nextRound,
+    nodeAt,
     rangeAt,
     resolveDraw,
     setupJackpot,
@@ -50,6 +50,7 @@ import {
     isFrom,
     isTo,
     jackpotWallet,
+    lostBody,
     missBody,
     msg,
     notificationBody,
@@ -63,10 +64,6 @@ import {
     walletTokens,
     withdrawnBody,
 } from './jackpot/adversary'
-
-// An open bug: the test asserts the safe outcome and fails today. SHOW_BUGS=1 runs these as plain tests,
-// so that their failures print.
-const openBug = process.env.SHOW_BUGS != null ? it : it.failing
 
 let env: Env
 let alice: Player
@@ -82,6 +79,14 @@ async function setup(opts: Parameters<typeof setupJackpot>[0] = {}) {
 
 const jackpotHash = () => dataHash(env.blockchain, env.jackpot.address)
 
+// The current attempt of a slot: its position, and the range and offset the tree puts it at.
+async function current(slot: number) {
+    const draw = await env.jackpot.getDrawState()
+    const k = await env.jackpot.getPosition(slot)
+    const range = (await rangeOf(env, k))!
+    return { draw: draw.drawId, slot, j: draw.attempts[slot], k, range }
+}
+
 describe('Attacks on the draw', () => {
     beforeEach(async () => {
         await setup()
@@ -93,51 +98,45 @@ describe('Attacks on the draw', () => {
     })
 
     it('a player who sends check to their own range gets no answer and changes nothing', async () => {
-        const r = await env.jackpot.getTicket(0)
-        const winner = rangeOf(env, r)!
-        const owner = winner.owner.equals(alice.address) ? alice : bob
+        const a = await current(0)
+        const owner = a.range.owner.equals(alice.address) ? alice : bob
         const before = {
             jackpot: await jackpotHash(),
-            range: await dataHash(env.blockchain, rangeAt(env, winner.start).address),
+            range: await dataHash(env.blockchain, rangeAt(env, a.range.b).address),
         }
         const balance = await hgramOf(env, owner.address)
 
         const result = await owner.send({
-            to: rangeAt(env, winner.start).address,
+            to: rangeAt(env, a.range.b).address,
             value: toNano('1'),
-            body: checkBody({ draw: 1n, slot: 0, j: 0, r, start: winner.start }),
+            body: checkBody({ ...a, offset: 0n }),
         })
         expect(result.transactions).toHaveTransaction({
-            to: rangeAt(env, winner.start).address,
+            to: rangeAt(env, a.range.b).address,
             success: false,
             exitCode: JackpotError.accessDenied,
         })
         expect(result.transactions).not.toHaveTransaction({ to: env.jackpot.address, op: JackpotOp.hit })
         expect(await jackpotHash()).toBe(before.jackpot)
-        expect(await dataHash(env.blockchain, rangeAt(env, winner.start).address)).toBe(before.range)
+        expect(await dataHash(env.blockchain, rangeAt(env, a.range.b).address)).toBe(before.range)
         expect(await hgramOf(env, owner.address)).toBe(balance)
     })
 
-    it('a forged hit or miss sent straight to the Jackpot pays nothing and advances no attempt', async () => {
+    it('a forged hit, miss or lost sent straight to the Jackpot pays nothing and advances no attempt', async () => {
         const before = await jackpotHash()
         const draw = await env.jackpot.getDrawState()
         for (const slot of [0, 1, 2]) {
-            const r = await env.jackpot.getTicket(slot)
-            const range = rangeOf(env, r)!
-            // the exact reply the range would send, but from the player
-            const hit = await mallory.send({
-                to: env.jackpot.address,
-                value: toNano('1'),
-                body: hitBody({ draw: 1n, slot, j: 0, r, start: range.start, owner: mallory.address }),
-            })
-            expectChainSucceeded(hit) // never throws, ignores
-            expect(hit.transactions).not.toHaveTransaction({ from: env.jackpot.address, op: JackpotOp.sendTokens })
-            const miss = await mallory.send({
-                to: env.jackpot.address,
-                value: toNano('1'),
-                body: missBody({ draw: 1n, slot, j: 0, r, start: range.start }),
-            })
-            expectChainSucceeded(miss)
+            const a = await current(slot)
+            // the exact replies a range or a node would send, but from the player
+            for (const body of [
+                hitBody({ ...a, b: a.range.b, owner: mallory.address }),
+                missBody({ ...a, b: a.range.b }),
+                lostBody({ ...a, level: 1, index: 0n }),
+            ]) {
+                const r = await mallory.send({ to: env.jackpot.address, value: toNano('1'), body })
+                expectChainSucceeded(r) // never throws, ignores
+                expect(r.transactions).not.toHaveTransaction({ from: env.jackpot.address, op: JackpotOp.sendTokens })
+            }
         }
         expect(await jackpotHash()).toBe(before)
         expect(await env.jackpot.getDrawState()).toEqual(draw)
@@ -145,18 +144,12 @@ describe('Attacks on the draw', () => {
     })
 
     it('a duplicate hit for a slot already closed pays nothing', async () => {
-        const r = await env.jackpot.getTicket(0)
-        const range = rangeOf(env, r)!
-        const winner = range.owner
+        const a = await current(0)
+        const winner = a.range.owner
         const [p0] = (await env.jackpot.getDrawState()).prizes
         const before = await hgramOf(env, winner)
         const locate = () =>
-            msg(
-                env.keeper.address,
-                env.jackpot.address,
-                env.fees.locate,
-                opBody(JackpotOp.locate, [0, 8], [range.start, 128]),
-            )
+            msg(env.keeper.address, env.jackpot.address, env.fees.locate, opBody(JackpotOp.locate, [0, 8]))
         // two locates for the same attempt: both checks are in flight before either answer comes back
         const holdChecks = (m: Message) => opBodyOf(m) === JackpotOp.check
         const first = await deliver(env.blockchain, locate(), { hold: holdChecks })
@@ -166,7 +159,7 @@ describe('Attacks on the draw', () => {
         const hits = replies.transactions.filter(
             (tx) => tx.inMessage != null && isTo(tx.inMessage, env.jackpot.address, JackpotOp.hit),
         )
-        expect(hits.length).toBe(2) // both ranges answered
+        expect(hits.length).toBe(2) // both checks answered
         const slotLogs = logsOf<SlotLog>(replies.externals, LogTopic.slot)
         expect(slotLogs.map((l) => l.result)).toEqual([SlotResult.hit])
         expect(await hgramOf(env, winner)).toBe(before + p0)
@@ -174,25 +167,30 @@ describe('Attacks on the draw', () => {
         expect((await env.jackpot.getDrawState()).openSlots & 1).toBe(0)
     })
 
-    it('a late joiner who names their own range in locate is refused, and wins nothing', async () => {
+    it("a late joiner's range, even answering as itself about the current attempt, is ignored and wins nothing", async () => {
         const late = await env.blockchain.treasury('late')
         const { booking } = await depositGram(env, late, toNano('100000'))
         const draw = await env.jackpot.getDrawState()
-        expect(booking!.start).toBeGreaterThanOrEqual(draw.cutoff)
+        expect(booking!.b).toBeGreaterThanOrEqual(draw.cutoff)
         const before = await jackpotHash()
         for (const slot of [0, 1, 2]) {
-            const result = await env.jackpot.sendLocate(late.getSender(), {
-                value: env.fees.locate,
-                slot,
-                start: booking!.start,
-            })
-            expect(result.transactions).toHaveTransaction({
-                to: env.jackpot.address,
-                success: false,
-                exitCode: JackpotError.ticketOutOfRange,
-            })
+            const a = await current(slot)
+            const forged = await deliver(
+                env.blockchain,
+                msg(
+                    rangeAt(env, booking!.b).address,
+                    env.jackpot.address,
+                    toNano('0.1'),
+                    hitBody({ ...a, b: booking!.b, owner: late.address }),
+                ),
+            )
+            expect(failed(forged.transactions)).toEqual([])
         }
         expect(await jackpotHash()).toBe(before)
+        const logs = (await resolveDraw(env)).flatMap((r) => logsOf<SlotLog>(r.externals, LogTopic.slot))
+        expect(logs.filter((l) => l.result === SlotResult.hit).length).toBe(3)
+        for (const l of logs) expect(l.owner?.equals(late.address) ?? false).toBe(false)
+        expect(await hgramOf(env, late.address)).toBe(0n)
     })
 })
 
@@ -215,10 +213,17 @@ describe('Attacks on the ranges and the replies', () => {
             success: false,
             exitCode: JackpotError.accessDenied,
         })
-        // the same message as the Jackpot would send it
+        // the same message as the Jackpot would send it (not bounceable: a bounce would reach the real
+        // Jackpot as the failure of its own setup, which only the Jackpot's own message can cause)
         const second = await deliver(
             env.blockchain,
-            msg(env.jackpot.address, range.address, toNano('0.2'), rangeSetupBody(mallory.address, toNano('1000000'))),
+            msg(
+                env.jackpot.address,
+                range.address,
+                toNano('0.2'),
+                rangeSetupBody(mallory.address, toNano('1000000')),
+                false,
+            ),
         )
         expect(second.transactions).toHaveTransaction({
             to: range.address,
@@ -228,7 +233,7 @@ describe('Attacks on the ranges and the replies', () => {
         expect(await dataHash(env.blockchain, range.address)).toBe(before)
 
         // a squatter at the next booking's address cannot set it up either
-        const next = rangeAt(env, (await jackpotState(env)).nextTicket)
+        const next = rangeAt(env, (await jackpotState(env)).nextBooking)
         const squat = await mallory.send({
             to: next.address,
             value: toNano('0.2'),
@@ -241,7 +246,7 @@ describe('Attacks on the ranges and the replies', () => {
             exitCode: JackpotError.accessDenied,
         })
         const { booking } = await depositGram(env, bob, toNano('50'))
-        expect((await rangeAt(env, booking!.start).getRangeData()).owner!.equals(bob.address)).toBe(true)
+        expect((await rangeAt(env, booking!.b).getRangeData()).owner!.equals(bob.address)).toBe(true)
     })
 
     it('a forged withdrawn, quote or mint notification from a stranger changes nothing', async () => {
@@ -325,7 +330,7 @@ describe('Attacks on deposits', () => {
         })
 
         const ok = await depositHgram(env, alice, tokens)
-        expect(ok.booking!.start).toBe(0n)
+        expect(ok.booking!.b).toBe(0n)
         const w = await rangeAt(env, 0n).sendWithdraw(alice.getSender(), { value: env.fees.withdraw, amount: 0n })
         expectChainSucceeded(w)
         expect(await hgramOf(env, alice.address)).toBe(tokens)
@@ -344,43 +349,39 @@ describe('Attacks on deposits', () => {
         expect(balance - (await mc.getBalance())).toBeLessThan(toNano('0.1'))
     })
 
-    // The implementer's own concern. Anyone can mint hGRAM to the Jackpot with deposit_coins(owner =
-    // Jackpot, query_id = X), and the notification looks exactly like the Jackpot's own mint. X is public
-    // once the Jackpot sends its deposit_coins. With instant_mint on, an attacker's mint reaches the
-    // Jackpot first only if the attacker's deposit_coins reaches the treasury before the Jackpot's own,
-    // which the attacker can learn of only after it was sent: the test holds the Jackpot's message back
-    // to stand for a delay between shards. The safe outcome is that the player is still booked in full.
-    openBug(
-        "a dust mint under a pending deposit's public query_id strands the player's real mint (instant mint on)",
-        async () => {
-            const run = await deliver(
-                env.blockchain,
-                msg(alice.address, env.jackpot.address, toNano('100') + env.fees.deposit, opBody(JackpotOp.deposit)),
-                {
-                    hold: (m) => isTo(m, env.hipo.treasury.address, JackpotOp.depositCoins),
-                },
-            )
-            const x = queryIdOfMessage(run.held[0])
-            // the attacker mints 1 GRAM worth to the Jackpot under X
-            const attack = await deliver(
-                env.blockchain,
-                msg(
-                    mallory.address,
-                    env.hipo.treasury.address,
-                    toNano('1.1'),
-                    depositCoinsBody(x, env.jackpot.address, toNano('1')),
-                ),
-            )
-            expect(logsOf<BookingLog>(attack.externals, LogTopic.booking)).toEqual([]) // below the minimum: returned
-            expect(await hgramOf(env, alice.address)).toBe(toNano('1')) // alice got the dust
-            // the real mint arrives and finds no record
-            await deliver(env.blockchain, run.held)
-            const c = await counters(env)
-            const real = await walletTokens(env.blockchain, await jackpotWallet(env))
-            console.log(`stranded outside T: ${(real - c.T).toString()} nano-hGRAM; alice booked: ${c.P.toString()}`)
-            expect(c.P).toBeGreaterThanOrEqual(toNano('99')) // fails: P = 0, alice's 100 hGRAM sit outside T
-        },
-    )
+    // Anyone can mint hGRAM to the Jackpot with deposit_coins(owner = Jackpot, query_id = X), and the
+    // notification looks exactly like the Jackpot's own mint. X is public once the Jackpot sends its
+    // deposit_coins: the test holds the Jackpot's message back to stand for a delay between shards. A mint
+    // below 99% of the record's cap does not use the record up, so the real mint still books in full.
+    it("a dust mint under a pending deposit's public query_id leaves the record for the real mint", async () => {
+        const run = await deliver(
+            env.blockchain,
+            msg(alice.address, env.jackpot.address, toNano('100') + env.fees.deposit, opBody(JackpotOp.deposit)),
+            {
+                hold: (m) => isTo(m, env.hipo.treasury.address, JackpotOp.depositCoins),
+            },
+        )
+        const x = queryIdOfMessage(run.held[0])
+        // the attacker mints 1 GRAM worth to the Jackpot under X
+        const attack = await deliver(
+            env.blockchain,
+            msg(
+                mallory.address,
+                env.hipo.treasury.address,
+                toNano('1.1'),
+                depositCoinsBody(x, env.jackpot.address, toNano('1')),
+            ),
+        )
+        expect(logsOf<BookingLog>(attack.externals, LogTopic.booking)).toEqual([])
+        expect((await env.jackpot.getBooks()).pending.has(x)).toBe(true)
+        // the real mint arrives and books alice's deposit; the dust stays outside T, for the governor
+        await deliver(env.blockchain, run.held)
+        const c = await counters(env)
+        const real = await walletTokens(env.blockchain, await jackpotWallet(env))
+        expect(c.P).toBeGreaterThanOrEqual(toNano('99'))
+        expect(real - c.T).toBeGreaterThanOrEqual(toNano('0.9'))
+        await expectSolvent(env)
+    })
 })
 
 describe('Attacks with instant_mint off', () => {
@@ -399,51 +400,35 @@ describe('Attacks with instant_mint off', () => {
     // Hipo's bill mints carry the query_id of the message that started the burn, not the deposit's. That
     // message is the treasury's external participate_in_election (or finish_participation), which anyone
     // may send with any query_id. The attacker deposits a little after the victim, reads their own
-    // pending query_id, and starts the burn under it: the victim's bill, burned first, is booked to the
-    // attacker.
-    openBug(
-        "an attacker who starts Hipo's bill burn under their own pending query_id is booked the victim's deposit",
-        async () => {
-            await depositGram(env, alice, toNano('1000'))
-            const run = await deliver(
-                env.blockchain,
-                msg(mallory.address, env.jackpot.address, toNano('10') + env.fees.deposit, opBody(JackpotOp.deposit)),
-            )
-            const out = run.transactions
-                .flatMap((t) => [...t.outMessages.values()])
-                .find((m) => isFrom(m, env.jackpot.address, JackpotOp.depositCoins))!
-            const x = queryIdOfMessage(out)
-            expect((await env.jackpot.getBooks()).pending.size).toBe(2)
+    // pending query_id, and starts the burn under it. The mint books at most the attacker's own cap; the
+    // rest stays outside T, and the victim's record waits for resolve_pending.
+    it("an attacker who starts Hipo's bill burn under their own pending query_id is booked no more than their own deposit", async () => {
+        await depositGram(env, alice, toNano('1000'))
+        const run = await deliver(
+            env.blockchain,
+            msg(mallory.address, env.jackpot.address, toNano('10') + env.fees.deposit, opBody(JackpotOp.deposit)),
+        )
+        const out = run.transactions
+            .flatMap((t) => [...t.outMessages.values()])
+            .find((m) => isFrom(m, env.jackpot.address, JackpotOp.depositCoins))!
+        const x = queryIdOfMessage(out)
+        const pending = (await env.jackpot.getBooks()).pending
+        expect(pending.size).toBe(2)
+        const aliceRecord = [...pending.keys()].find((k) => k !== x)!
 
-            const now = BigInt(env.blockchain.now!)
-            const burn = await env.hipo.treasury.sendParticipateInElection({ queryId: x, roundSince: now - 10n })
-            const booked = logsOf<BookingLog>(burn.externals, LogTopic.booking)
-            console.log(
-                booked
-                    .map(
-                        (b) =>
-                            `${b.owner.equals(mallory.address) ? 'mallory' : 'alice'} booked ${b.principal.toString()}`,
-                    )
-                    .join('; '),
-            )
-            const malloryPrincipal = booked
-                .filter((b) => b.owner.equals(mallory.address))
-                .reduce((a, b) => a + b.principal, 0n)
-            // she leaves at once with it
-            const mine = booked.find((b) => b.owner.equals(mallory.address))
-            if (mine != null) {
-                await rangeAt(env, mine.start).sendWithdraw(mallory.getSender(), {
-                    value: env.fees.withdraw,
-                    amount: 0n,
-                })
-                console.log(
-                    `mallory withdrew ${(await hgramOf(env, mallory.address)).toString()} nano-hGRAM for a 10 GRAM deposit; ` +
-                        `alice's deposit is still pending: ${(await env.jackpot.getBooks()).pending.size.toString()} record(s)`,
-                )
-            }
-            expect(malloryPrincipal).toBeLessThanOrEqual(toNano('10')) // fails: mallory is booked alice's 1000 GRAM
-        },
-    )
+        const now = BigInt(env.blockchain.now!)
+        const burn = await env.hipo.treasury.sendParticipateInElection({ queryId: x, roundSince: now - 10n })
+        const booked = logsOf<BookingLog>(burn.externals, LogTopic.booking)
+        const malloryPrincipal = booked
+            .filter((b) => b.owner.equals(mallory.address))
+            .reduce((a, b) => a + b.principal, 0n)
+        expect(booked.filter((b) => b.owner.equals(alice.address))).toEqual([])
+        expect(malloryPrincipal).toBeLessThanOrEqual(toNano('10'))
+        expect(malloryPrincipal).toBeGreaterThanOrEqual(toNano('9.9'))
+        // alice's record is still there, for the governor
+        expect((await env.jackpot.getBooks()).pending.has(aliceRecord)).toBe(true)
+        await expectSolvent(env)
+    })
 })
 
 describe('Attacks on fees', () => {
@@ -460,25 +445,21 @@ describe('Attacks on fees', () => {
         let before = await jackpotHash()
 
         // locate
-        const r = await env.jackpot.getTicket(0)
-        const range = rangeOf(env, r)!
-        let res = await env.jackpot.sendLocate(mallory.getSender(), {
-            value: short(env.fees.locate),
-            slot: 0,
-            start: range.start,
-        })
+        let res = await env.jackpot.sendLocate(mallory.getSender(), { value: short(env.fees.locate), slot: 0 })
         expect(res.transactions).toHaveTransaction({
             to: env.jackpot.address,
             success: false,
             exitCode: JackpotError.insufficientFee,
         })
         expect(await jackpotHash()).toBe(before)
-        res = await env.jackpot.sendLocate(mallory.getSender(), { value: env.fees.locate, slot: 0, start: range.start })
+        res = await env.jackpot.sendLocate(mallory.getSender(), { value: env.fees.locate, slot: 0 })
         expectChainSucceeded(res)
         expect(logsOf<SlotLog>(res.externals, LogTopic.slot).length).toBe(1)
 
-        // withdraw, at the range
+        // withdraw, at the range: in the draw's window, from an eligible range, so the fee and the surcharge
         const rangeOfAlice = rangeAt(env, 0n)
+        const surcharge = await env.jackpot.getSurcharge(0n, toNano('10'))
+        expect(surcharge).toBeGreaterThan(0n)
         const rangeBefore = await dataHash(env.blockchain, rangeOfAlice.address)
         before = await jackpotHash()
         res = await rangeOfAlice.sendWithdraw(alice.getSender(), {
@@ -493,7 +474,10 @@ describe('Attacks on fees', () => {
         expect(await dataHash(env.blockchain, rangeOfAlice.address)).toBe(rangeBefore)
         expect(await jackpotHash()).toBe(before)
         const held = await hgramOf(env, alice.address)
-        res = await rangeOfAlice.sendWithdraw(alice.getSender(), { value: env.fees.withdraw, amount: toNano('10') })
+        res = await rangeOfAlice.sendWithdraw(alice.getSender(), {
+            value: env.fees.withdraw + surcharge,
+            amount: toNano('10'),
+        })
         expectChainSucceeded(res)
         expect(await hgramOf(env, alice.address)).toBeGreaterThan(held)
 
@@ -533,12 +517,7 @@ describe('Attacks on fees', () => {
             const d = await env.jackpot.getDrawState()
             if (d.openSlots === 0) break
             const slot = [0, 1, 2].find((i) => (d.openSlots >> i) & 1)!
-            const t = await env.jackpot.getTicket(slot)
-            await env.jackpot.sendLocate(env.keeper.getSender(), {
-                value: env.fees.locate,
-                slot,
-                start: rangeOf(env, t)!.start,
-            })
+            await env.jackpot.sendLocate(env.keeper.getSender(), { value: env.fees.locate, slot })
         }
         await nextRound(env, toNano('30'))
         env.blockchain.now = roundTime(drawRounds[1]) - 60
@@ -619,7 +598,7 @@ describe('Attacks on fees', () => {
             env.blockchain,
             msg(
                 bob.address,
-                rangeAt(env, booked[0].start).address,
+                rangeAt(env, booked[0].b).address,
                 env.fees.withdraw,
                 opBody(JackpotOp.withdraw).asBuilder().storeCoins(0).endCell(),
             ),
@@ -758,38 +737,56 @@ describe('Attacks on payouts', () => {
     })
 
     // Hipo's wallet sends gas_excess to whatever return_excess a transfer names, so anyone can make the
-    // RECIPIENT's own wallet send one with any query_id: 0 hGRAM to the recipient, return_excess =
-    // Jackpot. That is the one source the Jackpot trusts, and it deletes the record. A payout whose second
-    // hop failed (here: the wallet was unusable, then usable again) can then no longer be settled; its
-    // tokens stay outside T and the owner is paid only if the governor notices and uses return_tokens.
-    openBug(
-        "a confirmation forged through the recipient's own wallet closes a failed payout before it can be settled",
-        async () => {
-            const { repair, id, amount } = await failedSecondHop()
-            await repair()
-            await mintHgram(env, mallory, toNano('20'))
-            await deliver(
-                env.blockchain,
-                msg(
-                    mallory.address,
-                    await env.hipo.walletAddress(mallory.address),
-                    toNano('0.2'),
-                    sendTokensBody({
-                        queryId: id,
-                        amount: 0n,
-                        recipient: alice.address,
-                        returnExcess: env.jackpot.address,
-                    }),
-                ),
-            )
-            const settled = await env.jackpot.sendSettleFailedPayout(env.governor.getSender(), {
-                value: toNano('0.1'),
-                target: id,
-            })
-            expectChainSucceeded(settled) // fails: unknown_query, the record is gone
-            expect(await env.jackpot.getClaimable(alice.address)).toBe(amount)
-        },
-    )
+    // RECIPIENT's own wallet send one with any query_id: 0 hGRAM to the recipient, return_excess = Jackpot.
+    // That is the one source the Jackpot trusts, and it deletes the record and credits nothing (spec,
+    // amendment 6). A payout whose second hop failed can then no longer be settled; its tokens are outside T
+    // and the governor returns them with return_tokens.
+    it("a confirmation forged through the recipient's own wallet deletes the record and credits nothing; return_tokens recovers the tokens", async () => {
+        const { repair, id, amount } = await failedSecondHop()
+        await repair()
+        const before = await counters(env)
+        await mintHgram(env, mallory, toNano('20'))
+        await deliver(
+            env.blockchain,
+            msg(
+                mallory.address,
+                await env.hipo.walletAddress(mallory.address),
+                toNano('0.2'),
+                sendTokensBody({
+                    queryId: id,
+                    amount: 0n,
+                    recipient: alice.address,
+                    returnExcess: env.jackpot.address,
+                }),
+            ),
+        )
+        expect((await env.jackpot.getBooks()).payouts.has(id)).toBe(false)
+        expect(await counters(env)).toEqual(before)
+        expect(await env.jackpot.getClaimable(alice.address)).toBe(0n)
+        const settled = await env.jackpot.sendSettleFailedPayout(env.governor.getSender(), {
+            value: toNano('0.1'),
+            target: id,
+        })
+        expect(settled.transactions).toHaveTransaction({
+            to: env.jackpot.address,
+            success: false,
+            exitCode: JackpotError.unknownQuery,
+        })
+        // the tokens are in the Jackpot's wallet outside T; the governor returns them
+        const jw = await jackpotWallet(env)
+        expect(await walletTokens(env.blockchain, jw)).toBe(before.T + amount)
+        const aliceBefore = await hgramOf(env, alice.address)
+        expectChainSucceeded(
+            await env.jackpot.sendReturnTokens(env.governor.getSender(), {
+                value: env.fees.claim,
+                owner: alice.address,
+                amount,
+            }),
+        )
+        expect(await hgramOf(env, alice.address)).toBe(aliceBefore + amount)
+        expect(await walletTokens(env.blockchain, jw)).toBe(before.T)
+        await expectSolvent(env)
+    })
 })
 
 function opBodyOf(m: Message): number | undefined {
@@ -968,16 +965,20 @@ describe('Governor recovery paths: resolve_pending, return_tokens, set_hipo_wall
         expect(again.booking!.owner.equals(bob.address)).toBe(true)
     })
 
-    it('a GRAM deposit of exactly the minimum, made after the rate has risen, is returned as hGRAM instead of booked', async () => {
+    it('a GRAM deposit of exactly the minimum, made after the rate has risen, is booked', async () => {
+        // the stored quote is refreshed by any booking; then the rate rises a little, as in a round
+        // an hGRAM booking stores the quote of its reply, after a rise of the rate since the deploy
         await env.hipo.raiseRate('7')
+        await depositHgram(env, bob, await mintHgram(env, bob, toNano('50')))
+        const [tc] = await env.hipo.quote()
+        await env.hipo.raiseRate(tc / 2000n) // +0.05%
         const { booking, result } = await depositGram(env, alice, toNano('10'))
         expectChainSucceeded(result)
-        // documents the behaviour: the mint rounds down, so c = 10 GRAM − 1 nano < the 10 GRAM minimum
-        console.log(
-            `exact-minimum deposit after a rate rise: ${booking == null ? 'returned as hGRAM ' + (await hgramOf(env, alice.address)).toString() : 'booked ' + booking.principal.toString()}`,
-        )
-        expect(booking).toBeUndefined()
-        expect(await hgramOf(env, alice.address)).toBeGreaterThan(0n)
+        // the mint rounds down and the rate rose: c is a little under 10 GRAM, within the 1% margin
+        expect(booking).toBeDefined()
+        expect(booking!.principal).toBeLessThan(toNano('10'))
+        expect(booking!.principal).toBeGreaterThanOrEqual(toNano('9.9'))
+        expect(await hgramOf(env, alice.address)).toBe(0n)
     })
 })
 
@@ -986,54 +987,133 @@ describe('Economic attacks', () => {
         await setup()
     })
 
-    // Withdrawn tickets stay below the cutoff as gaps, and a slot whose 64 attempts all land in gaps rolls
-    // its prize over to the next draw. A whale can make most of a draw's tickets gaps for the price of two
-    // fees: deposit before the period opens, withdraw right after. The prize that rolls over was earned by
-    // the other players' capital alone; the whale re-deposits in time for the next draw and wins it there.
-    openBug(
-        'a whale cannot win yield earned while its capital was out, by leaving a gap that rolls the draw over',
-        async () => {
-            const whale = await env.blockchain.treasury('whale', { balance: toNano('3000000') })
-            await depositGram(env, alice, toNano('100'))
-            await depositGram(env, bob, toNano('100'))
-            // the first period opens on yield earned by alice and bob; the whale books just before, at the new
-            // rate, so that it is eligible for draw 1 and has earned nothing
-            await nextRound(env, toNano('5'))
-            const { booking: big } = await depositGram(env, whale, toNano('2000000'))
-            await startDraw(env)
-            expect((await jackpotState(env)).cutoff).toBeGreaterThan(big!.start)
-            await rangeAt(env, big!.start).sendWithdraw(whale.getSender(), { value: env.fees.withdraw, amount: 0n })
+    // A whale deposits before the period opens and withdraws right after, outside any draw's window: the
+    // tree's sums drop at once, so draw 1's positions are the honest players' tickets only. Nothing rolls
+    // over, and the yield their capital earned goes to them.
+    it('a whale cannot win yield earned while its capital was out, by leaving a gap that rolls the draw over', async () => {
+        const whale = await env.blockchain.treasury('whale', { balance: toNano('3000000') })
+        await depositGram(env, alice, toNano('100'))
+        await depositGram(env, bob, toNano('100'))
+        // the first period opens on yield earned by alice and bob; the whale books just before, at the new
+        // rate, so that it is eligible for draw 1 and has earned nothing
+        await nextRound(env, toNano('5'))
+        // in hGRAM: a GRAM deposit right after a 2.5% rise in one round would wait for resolve_pending
+        const { booking: big } = await depositHgram(env, whale, await mintHgram(env, whale, toNano('2000000')))
+        await startDraw(env)
+        expect((await jackpotState(env)).kNext).toBeGreaterThan(big!.b)
+        await rangeAt(env, big!.b).sendWithdraw(whale.getSender(), { value: env.fees.withdraw, amount: 0n })
 
-            // the next period's yield, earned by alice's and bob's capital only (the gift is sized to Hipo's
-            // total, which the whale's 2M hGRAM, now in its own wallet, dominates)
+        // the next period's yield, earned by alice's and bob's capital only (the gift is sized to Hipo's
+        // total, which the whale's 2M hGRAM, now in its own wallet, dominates)
+        await nextRound(env, toNano('20000'))
+        const back = await hgramOf(env, whale.address)
+        await depositHgram(env, whale, back) // booked before draw 1 starts: eligible for draw 2
+        await startDraw(env, roundTime(drawRounds[0]) - 60)
+        const draw1 = await env.jackpot.getDrawState()
+        expect(draw1.state).toBe(DrawState.waiting)
+        const honestPrizes1 = draw1.prizes[0] + draw1.prizes[1] + draw1.prizes[2]
+        await submitRound(env, Number(draw1.round))
+        const logs1 = (await resolveDraw(env)).flatMap((r) => logsOf<SlotLog>(r.externals, LogTopic.slot))
+        expect(logs1.filter((l) => l.result === SlotResult.rolledOver).length).toBe(0)
+        expect(logs1.filter((l) => l.result === SlotResult.miss).length).toBe(0)
+
+        await nextRound(env, toNano('1000'))
+        await startDraw(env, roundTime(drawRounds[1]) - 60)
+        const draw2 = await env.jackpot.getDrawState()
+        expect(draw2.state).toBe(DrawState.waiting)
+        await submitRound(env, Number(draw2.round))
+        const logs2 = (await resolveDraw(env)).flatMap((r) => logsOf<SlotLog>(r.externals, LogTopic.slot))
+        const won = (who: Player, logs: SlotLog[]) =>
+            logs
+                .filter((l) => l.result === SlotResult.hit && l.owner!.equals(who.address))
+                .reduce((a, l) => a + l.amount, 0n)
+        const honest1 = won(alice, logs1) + won(bob, logs1)
+        console.log(
+            `draw 1: honest players won ${honest1.toString()} of ${honestPrizes1.toString()}; ` +
+                `draw 2: the whale won ${won(whale, logs2).toString()}`,
+        )
+        expect(honest1).toBeGreaterThanOrEqual((honestPrizes1 * 9n) / 10n)
+    })
+
+    // The first version left a withdrawn ticket below every later cutoff. Now a withdrawal outside a draw's
+    // window leaves the sums exact at once, and every later draw lands on live tickets only.
+    it('a whale who books and leaves 10,000 times the honest total leaves no gap: every later draw hits 3 times and misses 0', async () => {
+        const whale = await env.blockchain.treasury('whale', { balance: toNano('3000000') })
+        await depositGram(env, alice, toNano('100'))
+        await depositGram(env, bob, toNano('100'))
+        const { booking: big } = await depositGram(env, whale, toNano('2000000'))
+        await rangeAt(env, big!.b).sendWithdraw(whale.getSender(), { value: env.fees.withdraw, amount: 0n })
+        // the gifts are sized to Hipo's total, which the whale's 2M hGRAM, now in its own wallet, dominates
+        await nextRound(env, toNano('20000'))
+        await startDraw(env)
+        for (const round of drawRounds) {
             await nextRound(env, toNano('20000'))
-            const back = await hgramOf(env, whale.address)
-            await depositHgram(env, whale, back) // booked before draw 1 starts: eligible for draw 2
-            await startDraw(env, roundTime(drawRounds[0]) - 60)
-            const draw1 = await env.jackpot.getDrawState()
-            expect(draw1.state).toBe(DrawState.waiting)
-            const honestPrizes1 = draw1.prizes[0] + draw1.prizes[1] + draw1.prizes[2]
-            await submitRound(env, Number(draw1.round))
-            const logs1 = (await resolveDraw(env)).flatMap((r) => logsOf<SlotLog>(r.externals, LogTopic.slot))
-            const rolled = logs1.filter((l) => l.result === SlotResult.rolledOver).length
-            console.log(`draw 1: ${rolled.toString()} of 3 slots rolled over (prizes ${honestPrizes1.toString()})`)
+            await startDraw(env, roundTime(round) - 60)
+            expect((await env.jackpot.getDrawState()).state).toBe(DrawState.waiting)
+            await submitRound(env, round)
+            const logs = (await resolveDraw(env)).flatMap((r) => logsOf<SlotLog>(r.externals, LogTopic.slot))
+            expect(logs.filter((l) => l.result === SlotResult.hit).length).toBe(3)
+            expect(logs.filter((l) => l.result !== SlotResult.hit).length).toBe(0)
+        }
+    })
+})
 
-            await nextRound(env, toNano('1000'))
-            await startDraw(env, roundTime(drawRounds[1]) - 60)
-            const draw2 = await env.jackpot.getDrawState()
-            expect(draw2.state).toBe(DrawState.waiting)
-            await submitRound(env, Number(draw2.round))
-            const logs2 = (await resolveDraw(env)).flatMap((r) => logsOf<SlotLog>(r.externals, LogTopic.slot))
-            const won = (who: Player, logs: SlotLog[]) =>
-                logs
-                    .filter((l) => l.result === SlotResult.hit && l.owner!.equals(who.address))
-                    .reduce((a, l) => a + l.amount, 0n)
-            const honest = won(alice, [...logs1, ...logs2]) + won(bob, [...logs1, ...logs2])
-            console.log(
-                `honest players won ${honest.toString()} over both draws; the whale won ${won(whale, logs2).toString()}; ` +
-                    `draw 1's prizes, earned by honest capital alone: ${honestPrizes1.toString()}`,
-            )
-            expect(honest).toBeGreaterThanOrEqual((honestPrizes1 * 9n) / 10n) // fails: the whale takes it
-        },
-    )
+describe('A range setup that fails', () => {
+    beforeEach(async () => {
+        await setup()
+    })
+
+    // Cannot happen with the setup's fixed value at a fresh address. The test makes the range refuse it (an
+    // account already set up at that address), to show the booking is undone rather than left half made.
+    it('is undone: the tickets leave the tree and P, and the tokens wait outside T for return_tokens', async () => {
+        await depositGram(env, bob, toNano('100'))
+        const before = await counters(env)
+        const run = await deliver(
+            env.blockchain,
+            msg(alice.address, env.jackpot.address, toNano('100') + env.fees.deposit, opBody(JackpotOp.deposit)),
+            { hold: (m) => isFrom(m, env.jackpot.address, JackpotOp.rangeSetup) },
+        )
+        expect(run.held.length).toBe(1)
+        const booked = logsOf<BookingLog>(run.externals, LogTopic.booking)[0]
+        expect(booked.b).toBe(1n)
+        // a range already set up sits at that address, so the setup throws and bounces
+        const range = rangeAt(env, 1n)
+        const data = beginCell()
+            .storeAddress(env.jackpot.address)
+            .storeUint(1, 32)
+            .storeUint(0, 256)
+            .storeRef(beginCell().storeAddress(mallory.address).storeCoins(1).storeCoins(1).endCell())
+            .endCell()
+        await env.blockchain.setShardAccount(
+            range.address,
+            createShardAccount({ address: range.address, code: env.rangeCode, data, balance: toNano('0.1') }),
+        )
+        const again = await deliver(env.blockchain, run.held[0])
+        expect(again.transactions).toHaveTransaction({
+            to: range.address,
+            success: false,
+            exitCode: JackpotError.alreadySetUp,
+        })
+        const undone = logsOf<SetupFailedLog>(again.externals, LogTopic.setupFailed)
+        expect(undone.length).toBe(1)
+        expect(undone[0].b).toBe(1n)
+        expect(undone[0].principal).toBe(booked.principal)
+        const after = await counters(env)
+        expect(after.P).toBe(before.P)
+        expect(after.lLo + after.lHi).toBe(before.lLo + before.lHi)
+        expect(after.N).toBe(2n) // the index stays used
+        expect((await nodeAt(env, 1, 0n).getNodeData()).committed[1]).toBe(0n)
+        const jw = await jackpotWallet(env)
+        expect(await walletTokens(env.blockchain, jw)).toBe(after.T + undone[0].tokens)
+        await expectSolvent(env)
+        // the governor returns the tokens to the owner named in the booking log
+        expectChainSucceeded(
+            await env.jackpot.sendReturnTokens(env.governor.getSender(), {
+                value: env.fees.claim,
+                owner: booked.owner,
+                amount: undone[0].tokens,
+            }),
+        )
+        expect(await hgramOf(env, alice.address)).toBe(undone[0].tokens)
+    })
 })

@@ -1,16 +1,16 @@
-;; A range: one booking's block of tickets [start, start + length), of which the first `live` can still
+;; A range: one booking, of `length` tickets (nano-GRAM of principal), of which the first `live` can still
 ;; win. One contract per booking keeps the Jackpot's own storage bounded however many players there are.
 ;;
-;; The address follows from (jackpot, epoch, start) alone. The owner and length arrive in a one-time
-;; setup that only the Jackpot can send. The code is fixed: ranges cannot be upgraded, and never delete
-;; themselves, because a withdrawn range must keep answering draws.
+;; The address follows from (jackpot, b) alone, b the booking index. The owner, the length and the address
+;; of its level-1 node arrive in a one-time setup that only the Jackpot can send. The code is fixed: ranges
+;; cannot be upgraded, and never delete themselves, because a withdrawn range must keep answering draws.
 
 #include "imports/utils.fc";
 
 global slice jackpot;
-global int epoch;
-global int start;
+global int b;
 global int set_up?;
+global int node_hash;   ;; the address hash of node(1, floor(b / 64)), the only sender of check
 global slice owner;
 global int length;
 global int live;
@@ -18,14 +18,17 @@ global int live;
 () load_data() impure inline {
     slice ds = get_data().begin_parse();
     jackpot = ds~load_msg_addr();
-    epoch = ds~load_uint(32);
-    start = ds~load_uint(128);
+    b = ds~load_uint(32);
     set_up? = ds.slice_bits() > 0;
     if set_up? {
-        owner = ds~load_msg_addr();
-        length = ds~load_coins();
-        live = ds~load_coins();
+        node_hash = ds~load_uint(256);
+        slice booking = ds~load_ref().begin_parse();
+        owner = booking~load_msg_addr();
+        length = booking~load_coins();
+        live = booking~load_coins();
+        booking.end_parse();
     } else {
+        node_hash = 0;
         owner = null();
         length = 0;
         live = 0;
@@ -36,21 +39,26 @@ global int live;
 () save_data() impure inline {
     builder data = begin_cell()
         .store_slice(jackpot)
-        .store_uint(epoch, 32)
-        .store_uint(start, 128);
+        .store_uint(b, 32);
     if set_up? {
-        data = data
+        ;; the booking in a ref of its own, so that the cell never overflows at any length
+        cell booking = begin_cell()
             .store_slice(owner)
             .store_coins(length)
-            .store_coins(live);
+            .store_coins(live)
+            .end_cell();
+        data = data
+            .store_uint(node_hash, 256)
+            .store_ref(booking);
     }
     data.end_cell().set_data();
 }
 
 () range_setup(slice src, slice s) impure inline {
     s~load_uint(64);
-    slice new_owner = s~load_msg_addr();
     int new_length = s~load_coins();
+    slice new_owner = s~load_msg_addr();
+    int new_node_hash = s~load_uint(256);
     s.end_parse();
 
     throw_unless(err::access_denied, equal_slice_bits(src, jackpot));
@@ -58,6 +66,7 @@ global int live;
 
     ;; what the setup carried above its gas stays here as the storage reserve
     set_up? = true;
+    node_hash = new_node_hash;
     owner = new_owner;
     length = new_length;
     live = new_length;
@@ -72,7 +81,8 @@ global int live;
 
     throw_unless(err::not_set_up, set_up?);
     throw_unless(err::access_denied, equal_slice_bits(src, owner));
-    throw_unless(err::insufficient_fee, get_incoming_value().pair_first() >= fee::withdraw);
+    int sent = get_incoming_value().pair_first();
+    throw_unless(err::insufficient_fee, sent >= fee::withdraw);
 
     ifnot x {
         x = live;
@@ -82,53 +92,63 @@ global int live;
 
     live -= x;
 
-    ;; x first, so that a bounce carries it back
+    ;; x first, so that a bounce carries it back. The Jackpot throws, and so bounces this, when the
+    ;; withdrawal falls in a draw's window and what the owner sent lacks the surcharge.
     builder body = begin_cell()
         .store_uint(op::withdrawn, 32)
         .store_uint(query_id, 64)
         .store_coins(x)
-        .store_uint(start, 128)
-        .store_slice(owner);
+        .store_uint(b, 32)
+        .store_slice(owner)
+        .store_coins(sent);
     send_msg(true, jackpot.to_builder(), null(), body, 0, send::remaining_value);
 }
 
-;; Answers only about a ticket inside this range, so a wrong start throws and bounces to the Jackpot.
+;; Asked by its level-1 node whether the ticket at `offset` is still live: it is if offset < live.
 () check(slice src, slice s) impure inline {
     int query_id = s~load_uint(64);
     int draw = s~load_uint(32);
     int slot = s~load_uint(8);
     int j = s~load_uint(8);
-    int r = s~load_uint(128);
-    s~load_uint(128); ;; start, as the Jackpot computed it: the address already proved it
+    int k = s~load_uint(128);
+    int offset = s~load_uint(128);
     s.end_parse();
 
-    throw_unless(err::access_denied, equal_slice_bits(src, jackpot));
     throw_unless(err::not_set_up, set_up?);
-    throw_unless(err::ticket_out_of_range, (start <= r) & (r < start + length));
+    throw_unless(err::access_denied, is_base_addr?(src, node_hash));
 
-    int hit? = r < start + live;
+    int hit? = offset < live;
     builder body = begin_cell()
         .store_uint(hit? ? op::hit : op::miss, 32)
         .store_uint(query_id, 64)
         .store_uint(draw, 32)
         .store_uint(slot, 8)
         .store_uint(j, 8)
-        .store_uint(r, 128)
-        .store_uint(start, 128);
+        .store_uint(k, 128)
+        .store_uint(b, 32);
     if hit? {
         body = body.store_slice(owner);
     }
     send_msg(false, jackpot.to_builder(), null(), body, 0, send::remaining_value);
 }
 
+;; The Jackpot refused the withdrawal (in a draw's window without its surcharge): the tickets are live
+;; again, and what the refusal sent back goes to the owner, less this handler's gas.
 () on_bounce(slice s) impure inline {
     s~skip_bits(32); ;; 0xffffffff
     int op = s~load_uint(32);
-    s~load_uint(64);
+    int query_id = s~load_uint(64);
+    if op != op::withdrawn {
+        return ();
+    }
+    live += s~load_coins();
 
-    ;; the Jackpot refused the withdrawal: the tickets are live again
-    if op == op::withdrawn {
-        live += s~load_coins();
+    int value = get_incoming_value().pair_first() - fee::range_bounce;
+    if value > 0 {
+        builder excess = begin_cell()
+            .store_uint(op::gas_excess, 32)
+            .store_uint(query_id, 64);
+        send_msg(false, owner.to_builder(), null(), excess, value, send::ignore_errors);
     }
 }
 
@@ -137,10 +157,11 @@ global int live;
     int flags = cs~load_uint(4);
     slice src = cs~load_msg_addr();
 
-    load_data();
-
     if flags & 1 {
-        on_bounce(s);
+        load_data();
+        if set_up? & equal_slice_bits(src, jackpot) {
+            on_bounce(s);
+        }
         return save_data();
     }
 
@@ -149,7 +170,11 @@ global int live;
     }
 
     int op = s~load_uint(32);
+    if op == op::top_up {
+        return ();
+    }
 
+    load_data();
     if op == op::range_setup {
         range_setup(src, s);
         return save_data();
@@ -161,9 +186,6 @@ global int live;
     if op == op::check {
         return check(src, s);
     }
-    if op == op::top_up {
-        return ();
-    }
 
     throw(err::invalid_op);
 }
@@ -174,5 +196,5 @@ global int live;
 
 var get_range_data() method_id {
     load_data();
-    return ( jackpot, epoch, start, set_up?, owner, length, live );
+    return ( jackpot, b, set_up?, owner, length, live, node_hash );
 }

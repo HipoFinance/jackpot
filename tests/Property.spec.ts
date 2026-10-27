@@ -1,7 +1,10 @@
 // The property test of the spec's first two acceptance criteria. Random sequences of GRAM and hGRAM
 // deposits, partial and full withdrawals, rate rises, validation-round changes and full draws, against the
 // real Hipo contracts. After every transaction on the Jackpot or its hGRAM wallet: F·TC ≥ P·TT, F ≥ 0, and
-// the real wallet holds at least T. At the end everyone withdraws, and each player's hGRAM must be worth at
+// the real wallet holds at least T. Every slot's answer comes from the range holding the k(i, j)-th eligible
+// live ticket, recomputed here from the logs as of the draw's start, while players withdraw in the draw's
+// window; after each draw every node's committed less held equals the live tickets below it, and
+// L_lo + L_hi all of them. At the end everyone withdraws, and each player's hGRAM must be worth at
 // least their principal, less 1 nano-hGRAM per withdrawal; nothing may be left stranded or unconfirmed.
 //
 // It runs PROPERTY_SEQUENCES sequences (default 10,000) or until PROPERTY_SECONDS have passed (default 540),
@@ -23,6 +26,8 @@ describe('Property: solvency and principal over random sequences', () => {
             let transactions = 0
             let draws = 0
             let withdrawals = 0
+            let winners = 0
+            let misses = 0
             const failures: string[] = []
             for (let i = 0; i < sequences; i++) {
                 if ((Date.now() - started) / 1000 > seconds) break
@@ -32,6 +37,8 @@ describe('Property: solvency and principal over random sequences', () => {
                     transactions += result.transactions
                     draws += result.draws
                     withdrawals += result.withdrawals
+                    winners += result.winners
+                    misses += result.misses
                 } catch (e) {
                     if (!(e instanceof SequenceFailure)) throw e
                     failures.push(e.message)
@@ -44,6 +51,7 @@ describe('Property: solvency and principal over random sequences', () => {
             console.log(
                 `property: ${ran.toString()} sequences (seeds ${baseSeed.toString()}..${(baseSeed + ran - 1).toString()}) in ${elapsed} s: ` +
                     `${transactions.toString()} transactions, ${draws.toString()} draws, ${withdrawals.toString()} withdrawals, ` +
+                    `${winners.toString()} winners and ${misses.toString()} misses checked, ` +
                     `${failures.length.toString()} failure(s)`,
             )
             expect(failures).toEqual([])

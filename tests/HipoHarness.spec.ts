@@ -49,7 +49,8 @@ describe('Hipo harness', () => {
         const tx = result.transactions.find(
             (t) => t.inMessage?.info.src?.toString() === hipo.treasury.address.toString(),
         )
-        const s = tx!.inMessage!.body.beginParse()
+        if (tx?.inMessage == null) throw new Error('no reply from the treasury')
+        const s = tx.inMessage.body.beginParse()
         expect(s.loadUint(32)).toBe(op.takeCurrentQuote)
         expect(s.loadUintBig(64)).toBe(7n)
         const [coins, tokens] = await hipo.quote()
@@ -87,7 +88,9 @@ describe('Hipo harness', () => {
 
     it('nextValidationRound moves utime_since forward', async () => {
         const since = () => {
-            const s = getConfig(blockchain, config.currentValidators)!.beginParse()
+            const vset = getConfig(blockchain, config.currentValidators)
+            if (vset == null) throw new Error('no config 34')
+            const s = vset.beginParse()
             s.skip(8)
             return s.loadUintBig(32)
         }

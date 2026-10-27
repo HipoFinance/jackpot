@@ -1,0 +1,18 @@
+;; Test-only contract: a stand-in for a later Jackpot version, for tests/Acceptance.spec.ts. Its migrate
+;; step reads storage version 1 and writes version 2, in the transaction of the upgrade. Never deployed.
+
+#include "imports/stdlib.fc";
+
+() recv_internal() impure {
+}
+
+() migrate(int old_draw_id, int old_draw_state) impure method_id {
+    slice ds = get_data().begin_parse();
+    throw_unless(413, ds~load_uint(8) == 1);
+    set_data(begin_cell().store_uint(2, 8).store_slice(ds).end_cell());
+    throw(0);
+}
+
+int get_storage_version() method_id {
+    return get_data().begin_parse().preload_uint(8);
+}

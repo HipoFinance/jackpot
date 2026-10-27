@@ -30,6 +30,9 @@ export const JackpotOp = {
     rangeSetup: 0xe82ed41c,
     withdraw: 0x35528864,
     check: 0x7eda5174,
+    update: 0x4bb1957e,
+    descend: 0x3b4030a5,
+    lost: 0xa6208f83,
     upgradeCode: 0x1870f697,
     setHipoWallet: 0x8ceea056,
     resolvePending: 0x0827b963,
@@ -74,16 +77,34 @@ export const JackpotError = {
     nothingToClaim: 409,
     alreadySetUp: 410,
     notSetUp: 411,
-    ticketOutOfRange: 412,
+    unknownVersion: 413,
+    noQuote: 414,
+    drawChanged: 415,
 } as const
 
 export const DrawState = { idle: 0, quoting: 1, waiting: 2, resolving: 3 } as const
 
-export const LogTopic = { booking: 1, withdrawal: 2, drawStart: 3, randomness: 4, slot: 5 } as const
+export const LogTopic = {
+    booking: 1,
+    withdrawal: 2,
+    drawStart: 3,
+    randomness: 4,
+    slot: 5,
+    withdrawn: 6,
+    setupFailed: 7,
+} as const
 
-export const SlotResult = { hit: 0, miss: 1, rolledOver: 2, expired: 3, held: 4 } as const
+export const SlotResult = { hit: 0, miss: 1, rolledOver: 2, expired: 3, returned: 4, lost: 5 } as const
 
-export const QuoteKind = { booking: 0, withdrawal: 1, draw: 2 } as const
+export const QuoteKind = { booking: 0, withdrawal: 1, draw: 2, refresh: 3 } as const
+
+export const PayoutKind = { other: 0, burn: 1, prize: 2 } as const
+
+// Protocol constants of contracts/imports/constants.fc.
+export const attemptsPerSlot = 16
+export const treeLevels = 4
+export const storageVersion = 1
+
 
 // Decisions of the spec, used as the initial parameters.
 export const defaults = {
@@ -98,6 +119,7 @@ export interface JackpotConfig {
     parent: Address
     walletCode: Cell
     rangeCode: Cell
+    nodeCode: Cell
     burner: Address
     governor: Address
     halter: Address
@@ -109,6 +131,7 @@ export interface JackpotConfig {
     minDeposit?: bigint
 }
 
+// The deploy data: storage version 0, which the first message checks and rewrites (contracts/jackpot.fc).
 export function jackpotConfigToCell(config: JackpotConfig): Cell {
     const params = beginCell()
         .storeUint(config.burnShare ?? defaults.burnShare, 16)
@@ -116,19 +139,25 @@ export function jackpotConfigToCell(config: JackpotConfig): Cell {
         .storeCoins(config.burnBatch ?? defaults.burnBatch)
         .storeCoins(config.minDeposit ?? defaults.minDeposit)
         .endCell()
-    const lastStart = beginCell().storeUint(0, 32).storeCoins(0).storeUint(0, 128).storeUint(0, 128).endCell()
-    const extra = beginCell().storeCoins(0).storeRef(params).storeRef(lastStart).endCell()
-    const prizes = beginCell().storeCoins(0).storeCoins(0).storeCoins(0).endCell()
+    const lastStart = beginCell().storeUint(0, 32).storeUint(0, 128).storeUint(0, 128).endCell()
+    const tree = beginCell().storeUint(0, 32).storeUint(0, 32).storeCoins(0).storeCoins(0).endCell()
+    const extra = beginCell().storeCoins(0).storeCoins(0).storeRef(params).storeRef(lastStart).storeRef(tree).endCell()
+    const misc = beginCell()
+        .storeUint(0, 64)
+        .storeUint(0, 64)
+        .storeUint(0, 32)
+        .storeCoins(0)
+        .storeCoins(0)
+        .storeCoins(0)
+        .endCell()
     const draw = beginCell()
         .storeUint(0, 2)
         .storeUint(0, 32)
-        .storeUint(0, 64)
+        .storeUint(0, 32)
         .storeCoins(0)
-        .storeUint(0, 64)
         .storeUint(0, 256)
         .storeUint(0, 32)
-        .storeUint(0, 32)
-        .storeRef(prizes)
+        .storeRef(misc)
         .endCell()
     const hipo = beginCell().storeAddress(config.parent).storeRef(config.walletCode).endCell()
     const roles = beginCell()
@@ -140,16 +169,17 @@ export function jackpotConfigToCell(config: JackpotConfig): Cell {
         .storeAddress(config.treasury)
         .storeAddress(config.wallet ?? null)
         .storeRef(config.rangeCode)
+        .storeRef(config.nodeCode)
         .storeRef(hipo)
         .storeRef(roles)
         .endCell()
     const books = beginCell().storeDict(null).storeDict(null).storeDict(null).storeDict(null).endCell()
     return beginCell()
+        .storeUint(0, 8) // version: the deploy data
         .storeCoins(0) // T
         .storeCoins(0) // I
         .storeCoins(0) // O
         .storeCoins(0) // P
-        .storeCoins(0) // N
         .storeUint(0, 128) // TC
         .storeUint(0, 128) // TT
         .storeUint(0, 32) // query counter
@@ -167,7 +197,11 @@ export interface JackpotState {
     inFlight: bigint
     setAside: bigint
     principal: bigint
-    nextTicket: bigint
+    nextBooking: bigint
+    kNext: bigint
+    lLo: bigint
+    lHi: bigint
+    carried: bigint
     quoteCoins: bigint
     quoteTokens: bigint
     halted: boolean
@@ -178,16 +212,17 @@ export interface JackpotState {
     burnOwed: bigint
     minDeposit: bigint
     lastRoundSince: bigint
-    cutoff: bigint
     lastCoins: bigint
     lastTokens: bigint
+    nodeFloat: bigint
 }
 
 export interface DrawStateView {
     state: number
     drawId: bigint
     queryId: bigint
-    cutoff: bigint
+    cutoff: bigint // E
+    eligible: bigint // draw_L
     round: bigint
     seed: bigint
     randomnessTime: bigint
@@ -213,15 +248,21 @@ export interface QuoteRecord {
     kind: number
     owner?: Address
     tokens?: bigint
-    start?: bigint
+    b?: bigint
     amount?: bigint
-    roundSince?: number
 }
 
 export interface PayoutRecord {
     kind: number
     recipient: Address
     amount: bigint
+}
+
+export interface PendingDeposit {
+    owner: Address
+    coins: bigint
+    cap: bigint
+    createdAt: number
 }
 
 export class Jackpot implements Contract {
@@ -244,6 +285,7 @@ export class Jackpot implements Contract {
         await provider.internal(via, { value, bounce, sendMode: SendMode.PAY_GAS_SEPARATELY, body })
     }
 
+    // The first message checks the deploy data and asks the treasury for the first rate.
     async sendDeploy(provider: ContractProvider, via: Sender, value: bigint) {
         await this.sendMessage(provider, via, value, op(JackpotOp.topUp).endCell())
     }
@@ -269,12 +311,8 @@ export class Jackpot implements Contract {
         await this.sendMessage(provider, via, opts.value, body.endCell())
     }
 
-    async sendLocate(
-        provider: ContractProvider,
-        via: Sender,
-        opts: { value: bigint; slot: number; start: bigint; queryId?: bigint },
-    ) {
-        const body = op(JackpotOp.locate, opts.queryId).storeUint(opts.slot, 8).storeUint(opts.start, 128)
+    async sendLocate(provider: ContractProvider, via: Sender, opts: { value: bigint; slot: number; queryId?: bigint }) {
+        const body = op(JackpotOp.locate, opts.queryId).storeUint(opts.slot, 8)
         await this.sendMessage(provider, via, opts.value, body.endCell())
     }
 
@@ -375,6 +413,11 @@ export class Jackpot implements Contract {
 
     // get methods
 
+    async getStorageVersion(provider: ContractProvider): Promise<number> {
+        const { stack } = await provider.get('get_storage_version', [])
+        return stack.readNumber()
+    }
+
     async getJackpotState(provider: ContractProvider): Promise<JackpotState> {
         const { stack } = await provider.get('get_jackpot_state', [])
         return {
@@ -382,7 +425,11 @@ export class Jackpot implements Contract {
             inFlight: stack.readBigNumber(),
             setAside: stack.readBigNumber(),
             principal: stack.readBigNumber(),
-            nextTicket: stack.readBigNumber(),
+            nextBooking: stack.readBigNumber(),
+            kNext: stack.readBigNumber(),
+            lLo: stack.readBigNumber(),
+            lHi: stack.readBigNumber(),
+            carried: stack.readBigNumber(),
             quoteCoins: stack.readBigNumber(),
             quoteTokens: stack.readBigNumber(),
             halted: stack.readBoolean(),
@@ -393,9 +440,9 @@ export class Jackpot implements Contract {
             burnOwed: stack.readBigNumber(),
             minDeposit: stack.readBigNumber(),
             lastRoundSince: stack.readBigNumber(),
-            cutoff: stack.readBigNumber(),
             lastCoins: stack.readBigNumber(),
             lastTokens: stack.readBigNumber(),
+            nodeFloat: stack.readBigNumber(),
         }
     }
 
@@ -406,6 +453,7 @@ export class Jackpot implements Contract {
             drawId: stack.readBigNumber(),
             queryId: stack.readBigNumber(),
             cutoff: stack.readBigNumber(),
+            eligible: stack.readBigNumber(),
             round: stack.readBigNumber(),
             seed: stack.readBigNumber(),
             randomnessTime: stack.readBigNumber(),
@@ -415,10 +463,20 @@ export class Jackpot implements Contract {
         }
     }
 
-    async getTicket(provider: ContractProvider, slot: number): Promise<bigint> {
+    // The position the open slot tries next, or -1.
+    async getPosition(provider: ContractProvider, slot: number): Promise<bigint> {
         const args = new TupleBuilder()
         args.writeNumber(slot)
-        const { stack } = await provider.get('get_ticket', args.build())
+        const { stack } = await provider.get('get_position', args.build())
+        return stack.readBigNumber()
+    }
+
+    // The surcharge a withdrawal of x from range b owes now, on top of the withdraw fee.
+    async getSurcharge(provider: ContractProvider, b: bigint, x: bigint): Promise<bigint> {
+        const args = new TupleBuilder()
+        args.writeNumber(b)
+        args.writeNumber(x)
+        const { stack } = await provider.get('get_surcharge', args.build())
         return stack.readBigNumber()
     }
 
@@ -427,10 +485,18 @@ export class Jackpot implements Contract {
         return [stack.readBigNumber(), stack.readBigNumber()]
     }
 
-    async getRangeAddress(provider: ContractProvider, start: bigint): Promise<Address> {
+    async getRangeAddress(provider: ContractProvider, b: bigint): Promise<Address> {
         const args = new TupleBuilder()
-        args.writeNumber(start)
+        args.writeNumber(b)
         const { stack } = await provider.get('get_range_address', args.build())
+        return stack.readAddress()
+    }
+
+    async getNodeAddress(provider: ContractProvider, level: number, index: bigint): Promise<Address> {
+        const args = new TupleBuilder()
+        args.writeNumber(level)
+        args.writeNumber(index)
+        const { stack } = await provider.get('get_node_address', args.build())
         return stack.readAddress()
     }
 
@@ -445,32 +511,24 @@ export class Jackpot implements Contract {
             halter: stack.readAddress(),
             walletCode: stack.readCell(),
             rangeCode: stack.readCell(),
+            nodeCode: stack.readCell(),
         }
     }
 
     async getBooks(provider: ContractProvider) {
         const { stack } = await provider.get('get_books', [])
-        const pending = Dictionary.loadDirect(
-            Dictionary.Keys.BigUint(64),
-            inline,
-            stack.readCellOpt(),
-        )
+        const pending = Dictionary.loadDirect(Dictionary.Keys.BigUint(64), inline, stack.readCellOpt())
         const quotes = Dictionary.loadDirect(Dictionary.Keys.BigUint(64), inline, stack.readCellOpt())
-        const payouts = Dictionary.loadDirect(
-            Dictionary.Keys.BigUint(64),
-            inline,
-            stack.readCellOpt(),
-        )
-        const claimable = Dictionary.loadDirect(
-            Dictionary.Keys.BigUint(256),
-            inline,
-            stack.readCellOpt(),
-        )
+        const payouts = Dictionary.loadDirect(Dictionary.Keys.BigUint(64), inline, stack.readCellOpt())
+        const claimable = Dictionary.loadDirect(Dictionary.Keys.BigUint(256), inline, stack.readCellOpt())
         return {
-            pending: new Map(
+            pending: new Map<bigint, PendingDeposit>(
                 pending.keys().map((k) => {
                     const s = must(pending.get(k)).beginParse()
-                    return [k, { owner: s.loadAddress(), createdAt: s.loadUint(32) }]
+                    return [
+                        k,
+                        { owner: s.loadAddress(), coins: s.loadCoins(), cap: s.loadCoins(), createdAt: s.loadUint(32) },
+                    ]
                 }),
             ),
             quotes: new Map(quotes.keys().map((k) => [k, parseQuote(must(quotes.get(k)))])),
@@ -478,17 +536,23 @@ export class Jackpot implements Contract {
             claimable: new Map(
                 claimable.keys().map((k) => {
                     const s = must(claimable.get(k)).beginParse()
-                    return [s.loadAddress().toString(), s.loadCoins()]
+                    return [s.loadAddress().toString(), { prize: s.loadCoins(), other: s.loadCoins() }]
                 }),
             ),
         }
     }
 
+    // Both kinds together.
     async getClaimable(provider: ContractProvider, owner: Address): Promise<bigint> {
+        const { prize, other } = await this.getClaimableParts(provider, owner)
+        return prize + other
+    }
+
+    async getClaimableParts(provider: ContractProvider, owner: Address): Promise<{ prize: bigint; other: bigint }> {
         const args = new TupleBuilder()
         args.writeAddress(owner)
         const { stack } = await provider.get('get_claimable', args.build())
-        return stack.readBigNumber()
+        return { prize: stack.readBigNumber(), other: stack.readBigNumber() }
     }
 
     async getJackpotFees(provider: ContractProvider): Promise<JackpotFees> {
@@ -538,37 +602,45 @@ function parseQuote(cell: Cell): QuoteRecord {
         return { createdAt, kind, owner: s.loadAddress(), tokens: s.loadCoins() }
     }
     if (kind === QuoteKind.withdrawal) {
-        return { createdAt, kind, owner: s.loadAddress(), start: s.loadUintBig(128), amount: s.loadCoins() }
+        return { createdAt, kind, owner: s.loadAddress(), b: s.loadUintBig(32), amount: s.loadCoins() }
     }
-    return { createdAt, kind, roundSince: s.loadUint(32) }
+    return { createdAt, kind }
 }
 
 function parsePayout(cell: Cell): PayoutRecord {
     const s = cell.beginParse()
-    return { kind: s.loadUint(1), recipient: s.loadAddress(), amount: s.loadCoins() }
+    return { kind: s.loadUint(2), recipient: s.loadAddress(), amount: s.loadCoins() }
 }
 
 // Logs: external-out messages to addr_extern(256 bits) = topic.
 
 export interface BookingLog {
     owner: Address
-    start: bigint
+    b: bigint
     principal: bigint
     tokens: bigint
 }
 export interface WithdrawalLog {
     owner: Address
-    start: bigint
+    b: bigint
     principal: bigint
     tokens: bigint
+}
+export interface WithdrawnLog {
+    owner: Address
+    b: bigint
+    principal: bigint
+    deferred: boolean
 }
 export interface DrawStartLog {
     drawId: bigint
     roundSince: bigint
-    cutoff: bigint
-    nextCutoff: bigint
+    cutoff: bigint // E; 0 when the start only moved the period
+    eligible: bigint // draw_L
+    nextCutoff: bigint // K_next after the start
     pot: bigint
     burn: bigint
+    carried: bigint // before the start
     prizes: [bigint, bigint, bigint]
     drandRound: bigint
 }
@@ -582,21 +654,21 @@ export interface SlotLog {
     slot: number
     attempt: number
     result: number
-    ticket: bigint
-    start: bigint
+    position: bigint
+    b: bigint // the range; for a lost descent, the index of the node that lost it
     amount: bigint
     owner: Address | null
+}
+export interface SetupFailedLog {
+    b: bigint
+    principal: bigint
+    tokens: bigint
 }
 
 // An external-out message as the sandbox returns it (ExternalOut) or as a Message.
 export interface LogMessage {
     info: { dest?: ExternalAddress | Address | null }
     body: Cell
-}
-
-// The body as parsed out of the message, inline or ^Cell alike.
-function logBody(message: LogMessage): Slice {
-    return message.body.beginParse()
 }
 
 export function logTopic(message: LogMessage): number | undefined {
@@ -607,42 +679,40 @@ export function logTopic(message: LogMessage): number | undefined {
 export function parseLog(message: LogMessage) {
     const topic = logTopic(message)
     if (topic == null) return undefined
-    const s = logBody(message)
+    const s: Slice = message.body.beginParse()
     switch (topic) {
         case LogTopic.booking:
-            return {
-                topic,
-                log: {
-                    owner: s.loadAddress(),
-                    start: s.loadUintBig(128),
-                    principal: s.loadCoins(),
-                    tokens: s.loadCoins(),
-                },
-            }
         case LogTopic.withdrawal:
             return {
                 topic,
-                log: {
-                    owner: s.loadAddress(),
-                    start: s.loadUintBig(128),
-                    principal: s.loadCoins(),
-                    tokens: s.loadCoins(),
-                },
+                log: { owner: s.loadAddress(), b: s.loadUintBig(32), principal: s.loadCoins(), tokens: s.loadCoins() },
             }
-        case LogTopic.drawStart:
+        case LogTopic.withdrawn:
+            return {
+                topic,
+                log: { owner: s.loadAddress(), b: s.loadUintBig(32), principal: s.loadCoins(), deferred: s.loadBit() },
+            }
+        case LogTopic.drawStart: {
+            const log = {
+                drawId: s.loadUintBig(32),
+                roundSince: s.loadUintBig(32),
+                cutoff: s.loadUintBig(32),
+                eligible: s.loadCoins(),
+                nextCutoff: s.loadUintBig(32),
+                pot: s.loadCoins(),
+                burn: s.loadCoins(),
+                carried: s.loadCoins(),
+            }
+            const r = s.loadRef().beginParse()
             return {
                 topic,
                 log: {
-                    drawId: s.loadUintBig(32),
-                    roundSince: s.loadUintBig(32),
-                    cutoff: s.loadCoins(),
-                    nextCutoff: s.loadCoins(),
-                    pot: s.loadCoins(),
-                    burn: s.loadCoins(),
-                    prizes: [s.loadCoins(), s.loadCoins(), s.loadCoins()],
-                    drandRound: s.loadUintBig(64),
+                    ...log,
+                    prizes: [r.loadCoins(), r.loadCoins(), r.loadCoins()],
+                    drandRound: r.loadUintBig(64),
                 },
             }
+        }
         case LogTopic.randomness:
             return {
                 topic,
@@ -656,12 +726,14 @@ export function parseLog(message: LogMessage) {
                     slot: s.loadUint(8),
                     attempt: s.loadUint(8),
                     result: s.loadUint(8),
-                    ticket: s.loadUintBig(128),
-                    start: s.loadUintBig(128),
+                    position: s.loadUintBig(128),
+                    b: s.loadUintBig(32),
                     amount: s.loadCoins(),
                     owner: s.loadMaybeAddress(),
                 },
             }
+        case LogTopic.setupFailed:
+            return { topic, log: { b: s.loadUintBig(32), principal: s.loadCoins(), tokens: s.loadCoins() } }
     }
     return undefined
 }

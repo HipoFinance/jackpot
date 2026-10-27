@@ -1,4 +1,4 @@
-// Hipo Jackpot: every message the Jackpot and its range contracts send or accept.
+// Hipo Jackpot: every message the Jackpot, its node contracts and its range contracts send or accept.
 //
 // Op codes are crc32("jackpot::<constructor name>"), so they cannot collide with Hipo's. Hipo's own
 // messages (deposit_coins, provide_current_quote, take_current_quote, send_tokens, transfer_notification,
@@ -25,79 +25,105 @@ addr_var$11 anycast:(Maybe Anycast) addr_len:(## 9) workchain_id:int32 address:(
 _ _:MsgAddressInt = MsgAddress;
 _ _:MsgAddressExt = MsgAddress;
 
-// Jackpot storage.
+// Jackpot storage. version = 1; the deploy data has version = 0, which the first message checks
+// (b_share <= 2000, min_deposit >= 1) and rewrites as version 1.
 
-_ burn_share:uint16 min_pot:Coins burn_batch:Coins min_deposit:Coins = Params;
-_ round_since:uint32 cutoff:Coins rate_coins:uint128 rate_tokens:uint128 = LastStart;
-_ burn_owed:Coins params:^Params last_start:^LastStart = Extra;
-_ p0:Coins p1:Coins p2:Coins = Prizes;
-// slots: bits 0..2 = slot i open; bits 8+8i .. 15+8i = attempt of slot i
-_ state:uint2 draw_id:uint32 query_id:uint64 cutoff:Coins drand_round:uint64 seed:uint256
-    randomness_time:uint32 slots:uint32 prizes:^Prizes = Draw;
+_ b_share:uint16 min_pot:Coins burn_batch:Coins min_deposit:Coins = Params;
+_ round_since:uint32 rate_coins:uint128 rate_tokens:uint128 = LastStart;
+// n, K_next, L_lo, L_hi
+_ next_booking:uint32 k_next:uint32 l_lo:Coins l_hi:Coins = Tree;
+_ burn_owed:Coins carried:Coins params:^Params last_start:^LastStart tree:^Tree = Extra;
+_ query_id:uint64 drand_round:uint64 randomness_time:uint32 p0:Coins p1:Coins p2:Coins = DrawMisc;
+// slots: bits 0..2 = slot i open; bits 8+8i .. 15+8i = attempt of slot i. e = E, eligible = draw_L.
+_ state:uint2 draw_id:uint32 e:uint32 eligible:Coins seed:uint256 slots:uint32 misc:^DrawMisc = Draw;
 _ parent:MsgAddress wallet_code:^Cell = Hipo;
 _ burner:MsgAddress governor:MsgAddress halter:MsgAddress = Roles;
 // wallet = addr_none in the init data: derived from the Jackpot's own address on the first message
-_ treasury:MsgAddress wallet:MsgAddress range_code:^Cell hipo:^Hipo roles:^Roles = Addresses;
+_ treasury:MsgAddress wallet:MsgAddress range_code:^Cell node_code:^Cell hipo:^Hipo roles:^Roles = Addresses;
 
-// pending: query_id -> PendingDeposit
-_ owner:MsgAddress created_at:uint32 = PendingDeposit;
+// pending: query_id -> PendingDeposit. cap = floor(coins·TT/TC) at the quote stored at the deposit.
+_ owner:MsgAddress coins:Coins cap:Coins created_at:uint32 = PendingDeposit;
 // quotes: query_id -> QuoteRecord
 booking$00 owner:MsgAddress tokens:Coins = QuoteKind;
-withdrawal$01 owner:MsgAddress start:uint128 amount:Coins = QuoteKind;
-draw$10 round_since:uint32 = QuoteKind;
+withdrawal$01 owner:MsgAddress b:uint32 amount:Coins = QuoteKind;
+draw$10 = QuoteKind;
+refresh$11 = QuoteKind;
 _ created_at:uint32 kind:QuoteKind = QuoteRecord;
-// payouts: query_id -> PayoutRecord; kind 0 = player, 1 = burn
-_ kind:uint1 recipient:MsgAddress amount:Coins = PayoutRecord;
-// claimable: sha256 of the owner's address slice -> Claim
-_ owner:MsgAddress amount:Coins = Claim;
+// payouts: query_id -> PayoutRecord; kind 0 = other, 1 = burn, 2 = prize
+_ kind:uint2 recipient:MsgAddress amount:Coins = PayoutRecord;
+// claimable: sha256 of the owner's address slice -> Claim. A prize claim waits while the rate has fallen.
+_ owner:MsgAddress prize:Coins other:Coins = Claim;
 _ pending:(HashmapE 64 PendingDeposit) quotes:(HashmapE 64 QuoteRecord)
     payouts:(HashmapE 64 PayoutRecord) claimable:(HashmapE 256 Claim) = Books;
 
-_ total_tokens:Coins in_flight:Coins set_aside:Coins principal:Coins next_ticket:Coins
+_ version:uint8 total_tokens:Coins in_flight:Coins set_aside:Coins principal:Coins
     quote_coins:uint128 quote_tokens:uint128 query_counter:uint32 halted:Bool falling:Bool
     extra:^Extra draw:^Draw addresses:^Addresses books:^Books = JackpotStorage;
 
-// Range storage. The init data, which with the code fixes the address, is the first three fields; the
-// rest is added by the one-time setup.
+// Range storage. The init data, which with the code fixes the address, is the first two fields; the
+// setup adds the rest. node = the address hash of node(1, floor(b / 64)).
 
-_ jackpot:MsgAddress epoch:uint32 start:uint128 = RangeInitData;
-_ jackpot:MsgAddress epoch:uint32 start:uint128 owner:MsgAddress length:Coins live:Coins = RangeStorage;
+_ jackpot:MsgAddress b:uint32 = RangeInitData;
+_ owner:MsgAddress length:Coins live:Coins = Booking;
+_ jackpot:MsgAddress b:uint32 node:uint256 booking:^Booking = RangeStorage;
 
-// The random ticket of slot i, attempt j: hash exactly these 272 bits with sha256, read the hash as a
-// uint256, and take it mod the draw's cutoff E.
+// Node storage. The init data fixes the address; the first update from the parent adds the rest.
+// An array holds one Coins per child, 64 of them: 8 chunk sums, then 2 refs of 4 chunks of 8 values.
+// committed[c] - held[c] = the live tickets below child c once the held updates are folded in.
 
-_ seed:uint256 slot:uint8 attempt:uint8 = TicketPreimage;
+_ jackpot:MsgAddress level:uint8 index:uint32 range_code_hash:uint256 range_code_depth:uint16 = NodeInitData;
+_ v0:Coins v1:Coins v2:Coins v3:Coins v4:Coins v5:Coins v6:Coins v7:Coins = Chunk;
+_ sums:Chunk h0:^[ ^Chunk ^Chunk ^Chunk ^Chunk ] h1:^[ ^Chunk ^Chunk ^Chunk ^Chunk ] = NodeArray;
+// parent = the address hash of node(level + 1, floor(index / 64)); 0 for the top node, whose parent is
+// the Jackpot. pending_draw = the draw the held updates belong to, 0 when none.
+_ init:NodeInitData parent:uint256 pending_draw:uint32 committed:^NodeArray held:^NodeArray = NodeStorage;
+
+// The position of slot i, attempt j: hash exactly these 272 bits with sha256, read the hash as a uint256,
+// and take it mod draw_L.
+
+_ seed:uint256 slot:uint8 attempt:uint8 = PositionPreimage;
 
 // Entry messages (internal, to the Jackpot unless noted). Each must carry at least its fee
 // (get_jackpot_fees), or it is refused before anything changes.
 
-// value = coins to stake + fee; the depositor must be on the basechain
+// value = coins to stake + fee; the depositor must be on the basechain; refused before the first quote
 deposit#7c6bacac query_id:uint64 = InternalMsgBody;
 // hGRAM deposit: Hipo's send_tokens to the Jackpot with forward_ton_amount >= the hGRAM deposit fee
 
 // to a range, from its owner. amount = 0 withdraws the whole live part; a partial amount is at least
-// 1 GRAM of principal
+// 1 GRAM of principal. value >= the withdraw fee, plus get_surcharge(b, amount) in a draw's window from a
+// range the draw can pick; anything above both is returned.
 withdraw#35528864 query_id:uint64 amount:Coins = InternalMsgBody;
 
 start_draw#b9af1e01 query_id:uint64 = InternalMsgBody;
 // signature: exactly 48 bytes, a compressed G1 point; witness: drand.fc's layout,
 // q0:uint132 r0:bits384 ^[q1:uint132 r1:bits384]
 submit_randomness#52cc77c3 query_id:uint64 signature:^Cell witness:^Cell = InternalMsgBody;
-locate#100ffec7 query_id:uint64 slot:uint8 start:uint128 = InternalMsgBody;
+// the Jackpot computes the position; what the message carries above the fee rides down the tree
+locate#100ffec7 query_id:uint64 slot:uint8 = InternalMsgBody;
 requote#fa418de9 query_id:uint64 target:uint64 = InternalMsgBody;
 expire#ff25ead2 query_id:uint64 slot:uint8 = InternalMsgBody;
 claim#e53d2340 query_id:uint64 = InternalMsgBody;
 
-// Between the Jackpot and its ranges.
+// Between the Jackpot, its nodes and its ranges.
 
-range_setup#e82ed41c query_id:uint64 owner:MsgAddress length:Coins = InternalMsgBody;
-// amount comes first so that a bounce carries it back
-withdrawn#32e2541b query_id:uint64 amount:Coins start:uint128 owner:MsgAddress = InternalMsgBody;
-check#7eda5174 query_id:uint64 draw:uint32 slot:uint8 attempt:uint8 ticket:uint128 start:uint128
+// bounceable; query_id = b and length first, so that a bounce carries what undoes the booking
+range_setup#e82ed41c query_id:uint64 length:Coins owner:MsgAddress node:uint256 = InternalMsgBody;
+// amount comes first so that a bounce carries it back; sent = what the owner sent the range
+withdrawn#32e2541b query_id:uint64 amount:Coins b:uint32 owner:MsgAddress sent:Coins = InternalMsgBody;
+// down the tree, from each parent to the child holding b; tag = the Jackpot's draw_id
+update#4bb1957e query_id:uint64 tag:uint32 deferred:Bool b:uint32 delta:int128 = InternalMsgBody;
+// down the tree to the position k; offset = k's offset inside the receiving node
+descend#3b4030a5 query_id:uint64 draw:uint32 slot:uint8 attempt:uint8 k:uint128 offset:uint128
     = InternalMsgBody;
-hit#5c850e0e query_id:uint64 draw:uint32 slot:uint8 attempt:uint8 ticket:uint128 start:uint128
-    owner:MsgAddress = InternalMsgBody;
-miss#847501f7 query_id:uint64 draw:uint32 slot:uint8 attempt:uint8 ticket:uint128 start:uint128
+// from the level-1 node to the range; offset = k's offset inside the range
+check#7eda5174 query_id:uint64 draw:uint32 slot:uint8 attempt:uint8 k:uint128 offset:uint128
+    = InternalMsgBody;
+hit#5c850e0e query_id:uint64 draw:uint32 slot:uint8 attempt:uint8 k:uint128 b:uint32 owner:MsgAddress
+    = InternalMsgBody;
+miss#847501f7 query_id:uint64 draw:uint32 slot:uint8 attempt:uint8 k:uint128 b:uint32 = InternalMsgBody;
+// from a node whose children add up to no more than the offset: cannot happen while the sums agree
+lost#a6208f83 query_id:uint64 draw:uint32 slot:uint8 attempt:uint8 k:uint128 level:uint8 index:uint32
     = InternalMsgBody;
 
 // Governance. From the governor, except set_halted, which the halter may send with halted = true.
@@ -135,18 +161,25 @@ transfer_notification#7362d09c query_id:uint64 amount:Coins sender:MsgAddress
     forward_payload:(Either Cell ^Cell) = InternalMsgBody;
 // confirms a payout only when it comes from the recipient's own hGRAM wallet; also the body of a refund
 gas_excess#d53276db query_id:uint64 = InternalMsgBody;
+// also what a level-1 node sends back to the Jackpot: the rest of an update's value
 top_up#5372158c query_id:uint64 = InternalMsgBody;
 
 // Logs: external-out messages to addr_extern of 256 bits holding the topic. A log that does not fit
 // inline is sent in a ref.
 
-booking_log$_ owner:MsgAddress start:uint128 principal:Coins tokens:Coins = Log 1;
-withdrawal_log$_ owner:MsgAddress start:uint128 principal:Coins tokens:Coins = Log 2;
-// cutoff = 0 and pot = 0 when the draw only opened the first period
-draw_start_log$_ draw_id:uint32 round_since:uint32 cutoff:Coins next_cutoff:Coins pot:Coins burn:Coins
-    p0:Coins p1:Coins p2:Coins drand_round:uint64 = Log 3;
+booking_log$_ owner:MsgAddress b:uint32 principal:Coins tokens:Coins = Log 1;
+// the payment of a withdrawal, at the quote's reply
+withdrawal_log$_ owner:MsgAddress b:uint32 principal:Coins tokens:Coins = Log 2;
+// e = 0 and pot = 0 when the start only moved the period; carried is the value before the start
+draw_start_log$_ draw_id:uint32 round_since:uint32 e:uint32 eligible:Coins next_cutoff:uint32 pot:Coins
+    burn:Coins carried:Coins ^[p0:Coins p1:Coins p2:Coins drand_round:uint64] = Log 3;
 randomness_log$_ draw_id:uint32 drand_round:uint64 seed:uint256 = Log 4;
-// result: 0 hit, 1 miss, 2 rolled over after A misses, 3 expired, 4 held (a hit while the rate has
-// fallen); owner = addr_none unless a hit or held
-slot_log$_ draw_id:uint32 slot:uint8 attempt:uint8 result:uint8 ticket:uint128 start:uint128 amount:Coins
+// result: 0 hit, 1 miss, 2 rolled over after A misses, 3 expired, 4 returned (a hit while the rate has
+// fallen: the prize went back into F), 5 lost (b is then the node's index); owner = addr_none unless a hit
+// or returned
+slot_log$_ draw_id:uint32 slot:uint8 attempt:uint8 result:uint8 k:uint128 b:uint32 amount:Coins
     owner:MsgAddress = Log 5;
+// the update of a withdrawal leaving for the tree, when the Jackpot handles `withdrawn`
+withdrawn_log$_ owner:MsgAddress b:uint32 principal:Coins deferred:Bool = Log 6;
+// a range setup that bounced: the booking undone; tokens wait outside T for return_tokens
+setup_failed_log$_ b:uint32 principal:Coins tokens:Coins = Log 7;

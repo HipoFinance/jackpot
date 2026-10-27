@@ -116,24 +116,45 @@ cell create_wallet_data(builder owner, slice parent) inline {
     return (wallet, state_init, addr);
 }
 
-;; A range's initial data, which with the range code fixes its address: (jackpot, epoch, start). The owner
-;; and length are not part of it, so that nobody can deploy a range at a booking's address ahead of the
-;; Jackpot with different contents; the one-time setup that carries them is accepted only from the
-;; Jackpot.
-cell create_range_data(slice jackpot, int epoch, int start) inline {
+;; The address hash of a contract from its code's hash and depth and its init data: the representation
+;; hash of the StateInit cell `00110` (code and data present, nothing else) with those two refs, computed
+;; directly so that a node or a range needs only the hash and depth of another contract's code, not the
+;; code itself. Tests check it against @ton/core's contractAddress.
+int sha256_builder(builder b) asm "1 PUSHINT" "HASHEXT_SHA256";
+
+int state_init_hash(int code_hash, int code_depth, cell data) inline {
+    return begin_cell()
+        .store_uint(2, 8) ;; d1: two refs, ordinary, level 0
+        .store_uint(1, 8) ;; d2: 5 data bits, so one incomplete byte
+        .store_uint(0x34, 8) ;; 00110, then the completion tag 100
+        .store_uint(code_depth, 16)
+        .store_uint(data.cell_depth(), 16)
+        .store_uint(code_hash, 256)
+        .store_uint(data.cell_hash(), 256)
+        .sha256_builder();
+}
+
+;; A range's initial data, which with the range code fixes its address: (jackpot, b), b the booking index.
+;; The owner, length and level-1 node are not part of it, so that nobody can deploy a range at a booking's
+;; address ahead of the Jackpot with different contents; the one-time setup that carries them is accepted
+;; only from the Jackpot.
+cell create_range_data(slice jackpot, int b) inline {
     return begin_cell()
         .store_slice(jackpot)
-        .store_uint(epoch, 32)
-        .store_uint(start, 128)
+        .store_uint(b, 32)
         .end_cell();
 }
 
-(builder, builder, int) create_range_address(slice jackpot, int epoch, int start, cell range_code) inline_ref {
-    cell range_data = create_range_data(jackpot, epoch, start);
-    builder state_init = create_state_init(range_code, range_data);
-    int addr = state_init.end_cell().cell_hash();
-    builder range = create_address(chain::base, addr);
-    return (range, state_init, addr);
+;; A node's initial data: (jackpot, level, index), and the hash and depth of the range code, so that a
+;; level-1 node can compute its ranges' addresses. A node computes other nodes' addresses from its own code.
+cell create_node_data(slice jackpot, int level, int index, int range_hash, int range_depth) inline {
+    return begin_cell()
+        .store_slice(jackpot)
+        .store_uint(level, 8)
+        .store_uint(index, 32)
+        .store_uint(range_hash, 256)
+        .store_uint(range_depth, 16)
+        .end_cell();
 }
 
 ;; True when `src` is the standard basechain address whose hash part is `addr`.

@@ -30,6 +30,7 @@ import {
     jackpotState,
     mintHgram,
     nextRound,
+    nodeAt,
     pendingQuote,
     rangeAt,
     replyQuote,
@@ -82,7 +83,7 @@ describe('Jackpot', () => {
         const c = (tokens * tc) / tt
         expect(booking).toBeDefined()
         expect(booking!.owner.equals(alice.address)).toBe(true)
-        expect(booking!.start).toBe(0n)
+        expect(booking!.b).toBe(0n)
         expect(booking!.principal).toBe(c)
         expect(booking!.tokens).toBe(tokens)
 
@@ -91,8 +92,18 @@ describe('Jackpot', () => {
         expect(s.inFlight).toBe(0n)
         expect(s.setAside).toBe(0n)
         expect(s.principal).toBe(c)
-        expect(s.nextTicket).toBe(c)
+        expect(s.nextBooking).toBe(1n)
+        expect(s.lHi).toBe(c)
+        expect(s.lLo).toBe(0n)
         expect([s.quoteCoins, s.quoteTokens]).toEqual([tc, tt])
+
+        // the update went down the tree, deploying the first node of each level
+        for (let level = 4; level >= 1; level--) {
+            const node = await nodeAt(env, level, 0n).getNodeData()
+            expect(node.initialized).toBe(true)
+            expect(node.committed[0]).toBe(c)
+            expect(node.committed.slice(1).every((v) => v === 0n)).toBe(true)
+        }
 
         const range = rangeAt(env, 0n)
         expect(result.transactions).toHaveTransaction({
@@ -115,9 +126,11 @@ describe('Jackpot', () => {
         expect(books.quotes.size).toBe(0)
         await expectSolvent(env)
 
-        // a second booking takes the next range
+        // a second booking takes the next range, the next child of the level-1 node
         const second = await depositGram(env, bob, toNano('20'))
-        expect(second.booking!.start).toBe(c)
+        expect(second.booking!.b).toBe(1n)
+        expect((await nodeAt(env, 1, 0n).getNodeData()).committed.slice(0, 2)).toEqual([c, second.booking!.principal])
+        expect((await nodeAt(env, 4, 0n).getNodeData()).committed[0]).toBe(c + second.booking!.principal)
         await expectSolvent(env)
     })
 
@@ -156,13 +169,13 @@ describe('Jackpot', () => {
         const s = await jackpotState(env)
         expect(s.totalTokens).toBe(0n)
         expect(s.principal).toBe(0n)
-        expect(s.nextTicket).toBe(0n)
+        expect(s.nextBooking).toBe(0n)
         const { payouts } = await env.jackpot.getBooks()
         expect(payouts.size).toBe(0) // both returns confirmed by alice's wallet
 
         // the next booking still gets range 0
         const ok = await depositHgram(env, alice, tokens)
-        expect(ok.booking!.start).toBe(0n)
+        expect(ok.booking!.b).toBe(0n)
     })
 
     it('refunds a GRAM deposit from the masterchain', async () => {
@@ -261,7 +274,9 @@ describe('Jackpot', () => {
         expect(opened.cutoff).toBe(0n)
         expect(opened.pot).toBe(0n)
         let s = await jackpotState(env)
-        expect(s.cutoff).toBe(s.nextTicket)
+        expect(s.kNext).toBe(s.nextBooking)
+        expect(s.lLo).toBe(s.principal)
+        expect(s.lHi).toBe(0n)
         expect(s.setAside).toBe(0n)
 
         // not twice in one validation round
@@ -274,7 +289,7 @@ describe('Jackpot', () => {
 
         // a late joiner books after the period opened: not eligible for the next draw
         const late = await depositGram(env, await env.blockchain.treasury('late'), toNano('1000'))
-        expect(late.booking!.start).toBe(s.cutoff)
+        expect(late.booking!.b).toBe(s.kNext)
 
         // the second start draws for real; the pot is small, so its burn waits for the batch
         await nextRound(env, toNano('30'))
@@ -286,7 +301,9 @@ describe('Jackpot', () => {
         expect(draw.state).toBe(DrawState.waiting)
         expect(draw.drawId).toBe(1n)
         expect(draw.round).toBe(BigInt(R0))
-        expect(draw.cutoff).toBe(s.cutoff)
+        expect(draw.cutoff).toBe(s.kNext)
+        expect(draw.eligible).toBe(s.lLo)
+        expect(started.carried).toBe(0n)
         expect(started.burn).toBe((started.pot * 1000n) / 10000n)
         const rest = started.pot - started.burn
         expect(draw.prizes).toEqual([
@@ -311,8 +328,9 @@ describe('Jackpot', () => {
         const hits = slots.filter((l) => l.result === SlotResult.hit)
         expect(hits.length).toBe(3)
         for (const r of results) expectChainSucceeded(r)
-        // every winning ticket is below the cutoff, so the late joiner never wins
-        for (const h of hits) expect(h.ticket).toBeLessThan(draw.cutoff)
+        // every winner was booked below the cutoff, so the late joiner never wins
+        for (const h of hits) expect(h.b).toBeLessThan(draw.cutoff)
+        expect(slots.filter((l) => l.result !== SlotResult.hit)).toEqual([])
 
         const after = await Promise.all(players.map((p) => hgramOf(env, p.address)))
         const won = after.map((a, i) => a - before[i])
@@ -511,7 +529,7 @@ describe('Jackpot with a stand-in treasury', () => {
         await expectSolvent(env)
     })
 
-    it('handles a falling rate: pro-rata withdrawals, no draw starts, prizes held, bookings returned', async () => {
+    it('handles a falling rate: pro-rata withdrawals, no draw starts, prizes back into F, bookings returned', async () => {
         const a = await book(alice, toNano('1000'), ...rate(1100n))
         const b = await book(bob, toNano('1000'), ...rate(1100n))
         expect(a.booking).toBeDefined()
@@ -529,9 +547,15 @@ describe('Jackpot with a stand-in treasury', () => {
         expect(draw.state).toBe(DrawState.waiting)
         await submitRound(env, R0)
 
-        // a withdrawal's quote comes back lower: the flag goes up, and the payout is pro-rata
+        // a withdrawal's quote comes back lower: the flag goes up, and the payout is pro-rata. It is in the
+        // window, from an eligible range: it pays the surcharge.
         const x = toNano('100')
-        await rangeAt(env, a.booking!.start).sendWithdraw(alice.getSender(), { value: env.fees.withdraw, amount: x })
+        const surcharge = await env.jackpot.getSurcharge(a.booking!.b, x)
+        expect(surcharge).toBeGreaterThan(0n)
+        await rangeAt(env, a.booking!.b).sendWithdraw(alice.getSender(), {
+            value: env.fees.withdraw + surcharge,
+            amount: x,
+        })
         let s = await jackpotState(env)
         const free = s.totalTokens - s.inFlight - s.setAside
         const P = s.principal
@@ -543,21 +567,25 @@ describe('Jackpot with a stand-in treasury', () => {
         expect(proRata).toBeLessThan((x * 1000n) / 900n)
         expect(await hgramOf(env, alice.address)).toBe(proRata)
 
-        // the running draw resolves, but its prizes are held as claims, not paid
+        // the running draw resolves, but its prizes go back into F and into carried, not to the winners
+        const O = s.setAside
         const results = await resolveDraw(env)
         const slots = results.flatMap((r) => logsOf<SlotLog>(r.externals, LogTopic.slot))
-        expect(slots.filter((l) => l.result === SlotResult.held).length).toBe(3)
+        const returned = slots.filter((l) => l.result === SlotResult.returned)
         expect(slots.filter((l) => l.result === SlotResult.hit).length).toBe(0)
-        const held = new Map<string, bigint>()
-        for (const l of slots) held.set(l.owner!.toString(), (held.get(l.owner!.toString()) ?? 0n) + l.amount)
-        const winner = [alice, bob].find((p) => held.has(p.address.toString()))!
-        const owed = held.get(winner.address.toString())!
-        expect(await env.jackpot.getClaimable(winner.address)).toBe(owed)
-        expect(await hgramOf(env, winner.address)).toBe(winner === alice ? proRata : 0n)
+        const back = slots
+            .filter((l) => l.result === SlotResult.returned || l.result === SlotResult.rolledOver)
+            .reduce((t, l) => t + l.amount, 0n)
+        expect(back).toBe(draw.prizes[0] + draw.prizes[1] + draw.prizes[2])
+        expect(returned.length).toBeGreaterThan(0)
+        s = await jackpotState(env)
+        expect(s.carried).toBe(back)
+        expect(s.setAside).toBe(O - back) // the burn owed is still set aside
+        expect(s.burnOwed).toBeGreaterThan(0n)
+        expect(await env.jackpot.getClaimable(alice.address)).toBe(0n)
+        expect(await env.jackpot.getClaimable(bob.address)).toBe(0n)
 
-        // no claim, no draw start, and a new booking is returned
-        const claim = await env.jackpot.sendClaim(winner.getSender(), { value: env.fees.claim })
-        expect(claim.transactions).toHaveTransaction({ success: false, exitCode: JackpotError.rateFalling })
+        // no draw start, and a new booking is returned
         await env.hipo.nextValidationRound()
         const refused = await startDraw(env)
         expect(refused.transactions).toHaveTransaction({ success: false, exitCode: JackpotError.rateFalling })
@@ -566,18 +594,11 @@ describe('Jackpot with a stand-in treasury', () => {
         expect(c.booking).toBeUndefined()
         expect(await hgramOf(env, carol.address)).toBe(c.minted)
 
-        // only the governor clears the flag; then the held prize is claimed, once
+        // only the governor clears the flag
         const notGovernor = await env.jackpot.sendClearFalling(alice.getSender(), { value: toNano('0.05') })
         expect(notGovernor.transactions).toHaveTransaction({ success: false, exitCode: JackpotError.accessDenied })
         await env.jackpot.sendClearFalling(env.governor.getSender(), { value: toNano('0.05') })
         expect((await jackpotState(env)).falling).toBe(false)
-        const before = await hgramOf(env, winner.address)
-        const paid = await env.jackpot.sendClaim(winner.getSender(), { value: env.fees.claim })
-        expectChainSucceeded(paid)
-        expect(await hgramOf(env, winner.address)).toBe(before + owed)
-        const twice = await env.jackpot.sendClaim(winner.getSender(), { value: env.fees.claim })
-        expect(twice.transactions).toHaveTransaction({ success: false, exitCode: JackpotError.nothingToClaim })
-        expect(await hgramOf(env, winner.address)).toBe(before + owed)
         expect((await env.jackpot.getBooks()).payouts.size).toBe(0)
     })
 })

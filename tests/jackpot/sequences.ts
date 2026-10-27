@@ -13,10 +13,14 @@ import {
     SlotLog,
     SlotResult,
     WithdrawalLog,
+    WithdrawnLog,
+    attemptsPerSlot,
     logsOf,
+    treeLevels,
 } from '../../wrappers/Jackpot'
 import { roundTime } from '../../wrappers/drand'
-import { Env, quicknet } from './setup'
+import { getConfig } from '../hipo/chain'
+import { Env, nodeAt, quicknet } from './setup'
 import {
     Counters,
     Player,
@@ -28,6 +32,7 @@ import {
     jackpotWallet,
     msg,
     opBody,
+    positionOf,
     sendTokensBody,
     setupAt,
     solvencyError,
@@ -87,7 +92,7 @@ export async function makeWorld(): Promise<World> {
 
 interface RangeView {
     owner: Address
-    start: bigint
+    b: bigint
     length: bigint
     live: bigint
 }
@@ -98,6 +103,8 @@ export interface SequenceResult {
     transactions: number
     draws: number
     withdrawals: number
+    winners: number
+    misses: number
 }
 
 export class SequenceFailure extends Error {
@@ -108,6 +115,17 @@ export class SequenceFailure extends Error {
     ) {
         super(`seed ${seed.toString()}: ${message}\n  ops: ${ops.join(' → ')}`)
     }
+}
+
+// The range at position k among the given ranges in order of b, each holding `live` positions, and k's
+// offset in it.
+export function rangeAtPosition(ranges: { b: bigint; live: bigint }[], k: bigint) {
+    let offset = k
+    for (const r of [...ranges].sort((x, y) => (x.b < y.b ? -1 : 1))) {
+        if (offset < r.live) return { b: r.b, offset }
+        offset -= r.live
+    }
+    return undefined
 }
 
 // One sequence from the world's snapshot. Throws SequenceFailure, naming the seed, on any violation.
@@ -123,6 +141,8 @@ export async function runSequence(world: World, seed: number, maxOps = 10): Prom
     let txCount = 0
     let draws = 0
     let withdrawals = 0
+    let winners = 0
+    let misses = 0
     let roundIndex = 0
     const key = (a: Address) => a.toString()
 
@@ -149,16 +169,43 @@ export async function runSequence(world: World, seed: number, maxOps = 10): Prom
 
     const absorb = (result: Run) => {
         for (const b of logsOf<BookingLog>(result.externals, LogTopic.booking)) {
-            ranges.push({ owner: b.owner, start: b.start, length: b.principal, live: b.principal })
+            ranges.push({ owner: b.owner, b: b.b, length: b.principal, live: b.principal })
             env.bookings.push(b)
             principal.set(key(b.owner), (principal.get(key(b.owner)) ?? 0n) + b.principal)
         }
-        for (const w of logsOf<WithdrawalLog>(result.externals, LogTopic.withdrawal)) {
-            const range = ranges.find((x) => x.start === w.start)!
+        // the live parts change when the Jackpot handles `withdrawn`, which is when the tree's update leaves
+        for (const w of logsOf<WithdrawnLog>(result.externals, LogTopic.withdrawn)) {
+            const range = ranges.find((x) => x.b === w.b)!
             range.live -= w.principal
+        }
+        for (const w of logsOf<WithdrawalLog>(result.externals, LogTopic.withdrawal)) {
             const s = withdrawn.get(key(w.owner)) ?? { tokens: 0n, count: 0n }
             withdrawn.set(key(w.owner), { tokens: s.tokens + w.tokens, count: s.count + 1n })
             withdrawals++
+        }
+    }
+
+    // Each node's committed less held equals the live tickets below each child, and L_lo + L_hi all of
+    // them. Every booking of a sequence is below node(1, 0), so the nodes are node(ℓ, 0).
+    const checkTree = async () => {
+        if (ranges.length === 0) return
+        const total = ranges.reduce((a, x) => a + x.live, 0n)
+        const c = await counters(env)
+        if (c.lLo + c.lHi !== total) fail(`L_lo + L_hi = ${(c.lLo + c.lHi).toString()}, live ${total.toString()}`)
+        for (let level = 1; level <= treeLevels; level++) {
+            const node = await nodeAt(env, level, 0n).getNodeData()
+            for (let child = 0; child < 64; child++) {
+                const below =
+                    level === 1
+                        ? (ranges.find((x) => x.b === BigInt(child))?.live ?? 0n)
+                        : child === 0
+                          ? total
+                          : 0n
+                const net = node.committed[child] - node.held[child]
+                if (net !== below) {
+                    fail(`node(${level.toString()}, 0) child ${child.toString()}: ${net.toString()} ≠ live ${below.toString()}`)
+                }
+            }
         }
     }
 
@@ -196,11 +243,18 @@ export async function runSequence(world: World, seed: number, maxOps = 10): Prom
         )
     }
 
+    // With the surcharge it owes, when it falls in a draw's window from a range that draw can pick.
     const withdraw = async (range: RangeView, x: bigint) => {
-        ops.push(`withdraw(${range.start.toString()}, ${x.toString()})`)
-        const rangeAddress = await env.jackpot.getRangeAddress(range.start)
+        ops.push(`withdraw(${range.b.toString()}, ${x.toString()})`)
+        const rangeAddress = await env.jackpot.getRangeAddress(range.b)
+        const surcharge = await env.jackpot.getSurcharge(range.b, x === 0n ? range.live : x)
         const body = beginCell().storeUint(JackpotOp.withdraw, 32).storeUint(0, 64).storeCoins(x).endCell()
-        await run(range.owner, rangeAddress, fees.withdraw, body, 'withdraw')
+        await run(range.owner, rangeAddress, fees.withdraw + surcharge, body, 'withdraw')
+    }
+
+    const pickWithdrawal = async (range: RangeView) => {
+        if (range.live > toNano('2') && r.next() < 0.7) await withdraw(range, r.big(toNano('1'), range.live - 1n))
+        else await withdraw(range, 0n)
     }
 
     const raise = async (gram: bigint) => {
@@ -237,6 +291,11 @@ export async function runSequence(world: World, seed: number, maxOps = 10): Prom
         let state = await env.jackpot.getDrawState()
         if (state.state !== DrawState.waiting) return
         draws++
+        const log = started[0]
+        // the positions as of the start: the eligible ranges' live parts at that moment
+        const atStart = ranges.filter((x) => x.b < log.cutoff).map((x) => ({ b: x.b, live: x.live }))
+        const eligible = atStart.reduce((a, x) => a + x.live, 0n)
+        if (eligible !== log.eligible) fail(`draw_L ${log.eligible.toString()} ≠ eligible live ${eligible.toString()}`)
         await run(
             env.keeper.address,
             env.jackpot.address,
@@ -244,33 +303,50 @@ export async function runSequence(world: World, seed: number, maxOps = 10): Prom
             submitBody(round),
             'submit_randomness',
         )
+        state = await env.jackpot.getDrawState()
+
+        // players may leave in the window, the seed known: their updates are held back
+        const leavers = ranges.filter((x) => x.live > 0n && r.next() < 0.3)
+        for (const range of leavers) await pickWithdrawal(range)
+
         const paid: SlotLog[] = []
-        for (let guard = 0; guard < 3 * 64 + 3; guard++) {
+        for (let guard = 0; guard < 3 * attemptsPerSlot + 3; guard++) {
             state = await env.jackpot.getDrawState()
             if (state.openSlots === 0) break
             const slot = [0, 1, 2].find((i) => (state.openSlots >> i) & 1)!
-            const t = await env.jackpot.getTicket(slot)
-            const range = ranges.find((x) => x.start <= t && t < x.start + x.length)
-            if (range == null) fail(`no range holds ticket ${t.toString()}`)
             const result = await run(
                 env.keeper.address,
                 env.jackpot.address,
                 fees.locate,
-                opBody(JackpotOp.locate, [slot, 8], [range!.start, 128]),
+                opBody(JackpotOp.locate, [slot, 8]),
                 'locate',
             )
             paid.push(...logsOf<SlotLog>(result.externals, LogTopic.slot))
         }
         state = await env.jackpot.getDrawState()
         if (state.state !== DrawState.idle) fail('draw did not resolve')
-        // the prizes paid are exactly the three of the draw
-        const log = started[0]
-        for (const s of paid.filter((x) => x.result === SlotResult.hit)) {
-            if (s.amount !== log.prizes[s.slot]) fail(`slot ${s.slot.toString()} paid ${s.amount.toString()}`)
-            const range = ranges.find((x) => x.start <= s.ticket && s.ticket < x.start + x.length)!
-            if (s.ticket >= log.cutoff) fail('a ticket at or above the cutoff won')
-            if (s.ticket >= range.start + range.live) fail('a withdrawn ticket won')
+
+        // every answer is about the k(i, j)-th eligible live ticket as of the start, recomputed here
+        for (const s of paid) {
+            if (s.result === SlotResult.lost) fail('a descent was lost')
+            if (s.result !== SlotResult.hit && s.result !== SlotResult.miss && s.result !== SlotResult.rolledOver) continue
+            const k = positionOf(state.seed, s.slot, s.attempt, log.eligible)
+            if (s.position !== k) fail(`slot ${s.slot.toString()} attempt ${s.attempt.toString()} at ${s.position.toString()}, not k = ${k.toString()}`)
+            const at = rangeAtPosition(atStart, k)
+            if (at == null) fail(`no eligible range holds position ${k.toString()}`)
+            if (s.b !== at!.b) fail(`slot ${s.slot.toString()} answered by range ${s.b.toString()}, not ${at!.b.toString()}`)
+            const live = ranges.find((x) => x.b === at!.b)!.live
+            if (s.result === SlotResult.hit) {
+                winners++
+                if (at!.offset >= live) fail('a withdrawn ticket won')
+                if (s.amount !== log.prizes[s.slot]) fail(`slot ${s.slot.toString()} paid ${s.amount.toString()}`)
+                if (!s.owner!.equals(ranges.find((x) => x.b === at!.b)!.owner)) fail('a prize went to another owner')
+            } else {
+                misses++
+                if (at!.offset < live) fail('a live ticket missed')
+            }
         }
+        await checkTree()
     }
 
     try {
@@ -284,9 +360,7 @@ export async function runSequence(world: World, seed: number, maxOps = 10): Prom
             } else if (roll < 0.4) {
                 await hgramDeposit(p, r.big(toNano('5'), toNano('3000')))
             } else if (roll < 0.55 && live.length > 0) {
-                const range = r.pick(live)
-                if (range.live > toNano('2')) await withdraw(range, r.big(toNano('1'), range.live - 1n))
-                else await withdraw(range, 0n)
+                await pickWithdrawal(r.pick(live))
             } else if (roll < 0.62 && live.length > 0) {
                 await withdraw(r.pick(live), 0n)
             } else if (roll < 0.75) {
@@ -297,9 +371,32 @@ export async function runSequence(world: World, seed: number, maxOps = 10): Prom
                 await draw()
             }
         }
+        await checkTree()
+
+        // GRAM deposits whose mint came below 99% of their cap (the stored quote was older than a rise)
+        // wait for the governor's resolve_pending, two rounds later, with what the wallet holds for them
+        const waiting = (await env.jackpot.getBooks()).pending
+        if (waiting.size > 0) {
+            ops.push(`resolve(${waiting.size.toString()})`)
+            const config15 = getConfig(env.blockchain, 15n)!.beginParse().loadUint(32)
+            env.blockchain.now = env.blockchain.now! + 2 * config15 + 1
+            for (const [id, record] of waiting) {
+                const outside = (await walletTokens(env.blockchain, world.jackpotWallet)) - (await counters(env)).T
+                const tokens = outside < record.cap ? outside : record.cap
+                if (tokens <= 0n) fail('a pending deposit with no tokens minted for it')
+                const body = beginCell()
+                    .storeUint(JackpotOp.resolvePending, 32)
+                    .storeUint(0, 64)
+                    .storeUint(id, 64)
+                    .storeCoins(tokens)
+                    .endCell()
+                await run(env.governor.address, env.jackpot.address, fees.hgramDeposit, body, 'resolve_pending')
+            }
+        }
 
         // everyone leaves
         for (const range of ranges.filter((x) => x.live > 0n)) await withdraw(range, 0n)
+        await checkTree()
 
         const c: Counters = await counters(env)
         const books = await env.jackpot.getBooks()
@@ -323,5 +420,5 @@ export async function runSequence(world: World, seed: number, maxOps = 10): Prom
         if (e instanceof SequenceFailure) throw e
         throw new SequenceFailure(seed, ops, e instanceof Error ? e.message : String(e))
     }
-    return { seed, ops, transactions: txCount, draws, withdrawals }
+    return { seed, ops, transactions: txCount, draws, withdrawals, winners, misses }
 }

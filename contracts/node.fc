@@ -1,0 +1,400 @@
+;; A node of the tree: for each of its 64 children, the live tickets below that child. A level-1 node's
+;; children are the ranges b = 64q .. 64q+63; a level-ℓ node's children are the level-(ℓ-1) nodes
+;; 64q .. 64q+63. There are 4 levels; the Jackpot is the parent of the one level-4 node, the top node.
+;;
+;; The Jackpot sends every change of live tickets down the tree as update(tag, deferred, b, delta), and
+;; every attempt of a draw as descend(draw, i, j, k, offset); each node passes them on to the child that
+;; holds b, or that covers the offset. Every update and every descent starts at the Jackpot and travels
+;; down the same parent-to-child pairs, and TON delivers the messages of each pair in order, so a descent
+;; sees each node exactly as the Jackpot saw the tree when it sent it.
+;;
+;; A deferred update (a withdrawal in a draw's window from a range that draw can pick) is held apart in
+;; `held` until a message tagged with a later draw arrives, so that the running draw's positions never
+;; move. That message first folds it in: committed[c] -= held[c] for every child, at a cost that does not
+;; depend on how many children have something held.
+;;
+;; Both arrays have the same shape: 8 chunk sums, ^[4 chunks] ^[4 chunks]; a chunk holds the values of 8
+;; children. So an update rewrites one chunk and its path, a descent reads at most 8 sums and 8 values,
+;; and a fold rewrites at most every chunk once.
+;;
+;; Every message a node sends carries the remaining value of the one it received (mode 64), so whoever
+;; overpays pushes a costly step through; a node's own balance is its storage reserve only.
+;;
+;; The address follows from (jackpot, level, index, range code hash and depth). The code is fixed: nodes
+;; cannot be upgraded. A node accepts update and descend only from its parent, and never throws on a
+;; genuine update: a throw there would lose the update, and the sums below would be wrong for good.
+
+#include "imports/utils.fc";
+
+global slice jackpot;
+global int level;
+global int index;
+global int range_hash;
+global int range_depth;
+global int initialized?;
+global int parent_hash;   ;; the parent node's address hash; unused by the top node, whose parent is the Jackpot
+global int pending_draw;  ;; the draw the held updates belong to; 0 when nothing is held
+global cell committed;    ;; the live tickets below each child, as this node has applied them
+global cell held;         ;; withdrawals held back for the draw `pending_draw`, as positive amounts
+
+cell preload_ref_at(slice s, int i) asm "PLDREFVAR";
+
+int compute_parent_hash() inline {
+    cell code = my_code();
+    cell data = create_node_data(jackpot, level + 1, index >> tree::bits, range_hash, range_depth);
+    return state_init_hash(code.cell_hash(), code.cell_depth(), data);
+}
+
+() load_data() impure inline {
+    slice ds = get_data().begin_parse();
+    jackpot = ds~load_msg_addr();
+    level = ds~load_uint(8);
+    index = ds~load_uint(32);
+    range_hash = ds~load_uint(256);
+    range_depth = ds~load_uint(16);
+    ;; the init data, which fixes the address, ends here; the first message from the parent adds the rest
+    initialized? = ds.slice_bits() > 0;
+    if initialized? {
+        parent_hash = ds~load_uint(256);
+        pending_draw = ds~load_uint(32);
+        committed = ds~load_ref();
+        held = ds~load_ref();
+    } else {
+        parent_hash = level < tree::levels ? compute_parent_hash() : 0;
+        pending_draw = 0;
+        committed = null();
+        held = null();
+    }
+    ds.end_parse();
+}
+
+() save_data() impure inline {
+    begin_cell()
+        .store_slice(jackpot)
+        .store_uint(level, 8)
+        .store_uint(index, 32)
+        .store_uint(range_hash, 256)
+        .store_uint(range_depth, 16)
+        .store_uint(parent_hash, 256)
+        .store_uint(pending_draw, 32)
+        .store_ref(committed)
+        .store_ref(held)
+        .end_cell()
+        .set_data();
+}
+
+;; All zero: eight zero sums per chunk, and the same chunk cell in all eight places, which storage counts once.
+cell empty_array() inline {
+    cell chunk = begin_cell().store_uint(0, 32).end_cell();
+    cell half = begin_cell().store_ref(chunk).store_ref(chunk).store_ref(chunk).store_ref(chunk).end_cell();
+    return begin_cell().store_uint(0, 32).store_ref(half).store_ref(half).end_cell();
+}
+
+;; Reads eight Coins from `s`, the one at `p` raised by `delta` but never below 0. Returns them stored in a
+;; new builder, the rest of `s` (its refs), and the change actually made.
+(builder, slice, int) add_at(slice s, int p, int delta) inline {
+    builder b = begin_cell();
+    repeat (p) {
+        b = b.store_coins(s~load_coins());
+    }
+    int old = s~load_coins();
+    int new = max(old + delta, 0);
+    b = b.store_coins(new);
+    repeat (7 - p) {
+        b = b.store_coins(s~load_coins());
+    }
+    return (b, s, new - old);
+}
+
+;; array[c] += delta, never below 0. The committed sums cannot go below 0 while the Jackpot's counts are
+;; right, and a node must not throw on an update.
+cell array_add(cell array, int c, int delta) inline_ref {
+    int g = c >> 3;
+    slice top = array.begin_parse();
+    slice half = top.preload_ref_at(g >> 2).begin_parse();
+    ( builder chunk, _, int applied ) = add_at(half.preload_ref_at(g & 3).begin_parse(), c & 7, delta);
+
+    builder new_half = begin_cell();
+    int i = 0;
+    repeat (4) {
+        cell r = half~load_ref();
+        new_half = new_half.store_ref(i == (g & 3) ? chunk.end_cell() : r);
+        i += 1;
+    }
+
+    ( builder new_top, slice halves, _ ) = add_at(top, g, applied);
+    cell h0 = halves~load_ref();
+    cell h1 = halves~load_ref();
+    if g < 4 {
+        h0 = new_half.end_cell();
+    } else {
+        h1 = new_half.end_cell();
+    }
+    return new_top.store_ref(h0).store_ref(h1).end_cell();
+}
+
+;; The child whose committed sums cover position k, taking the children in order, and k's offset inside it.
+;; -1 when the children add up to no more than k.
+(int, int) child_at(int k) inline {
+    slice top = committed.begin_parse();
+    int g = 0;
+    int found? = false;
+    do {
+        int v = top~load_coins();
+        if k < v {
+            found? = true;
+        } else {
+            k -= v;
+            g += 1;
+        }
+    } until found? | (g == 8);
+    ifnot found? {
+        return (-1, k);
+    }
+
+    slice chunk = top.preload_ref_at(g >> 2).begin_parse().preload_ref_at(g & 3).begin_parse();
+    int p = 0;
+    found? = false;
+    do {
+        int v = chunk~load_coins();
+        if k < v {
+            found? = true;
+        } else {
+            k -= v;
+            p += 1;
+        }
+    } until found? | (p == 8);
+    ifnot found? {
+        return (-1, k); ;; a chunk short of its sum: cannot happen
+    }
+    return (g * 8 + p, k);
+}
+
+;; On a message tagged with a later draw than the held updates belong to, they are folded in first:
+;; committed[c] -= held[c], chunk by chunk, skipping chunks with nothing held.
+() fold_held(int tag) impure inline_ref {
+    if (pending_draw == 0) | (tag <= pending_draw) {
+        return ();
+    }
+    slice ct = committed.begin_parse();
+    slice ht = held.begin_parse();
+    builder top = begin_cell();
+    tuple chunks = empty_tuple();
+    int g = 0;
+    repeat (8) {
+        int sum = ct~load_coins();
+        int held_sum = ht~load_coins();
+        cell chunk = ct.preload_ref_at(g >> 2).begin_parse().preload_ref_at(g & 3);
+        if held_sum {
+            slice cs = chunk.begin_parse();
+            slice hs = ht.preload_ref_at(g >> 2).begin_parse().preload_ref_at(g & 3).begin_parse();
+            builder b = begin_cell();
+            sum = 0;
+            repeat (8) {
+                int v = max(cs~load_coins() - hs~load_coins(), 0);
+                sum += v;
+                b = b.store_coins(v);
+            }
+            chunk = b.end_cell();
+        }
+        top = top.store_coins(sum);
+        chunks~tpush(chunk);
+        g += 1;
+    }
+    cell h0 = begin_cell().store_ref(chunks.at(0)).store_ref(chunks.at(1))
+        .store_ref(chunks.at(2)).store_ref(chunks.at(3)).end_cell();
+    cell h1 = begin_cell().store_ref(chunks.at(4)).store_ref(chunks.at(5))
+        .store_ref(chunks.at(6)).store_ref(chunks.at(7)).end_cell();
+    committed = top.store_ref(h0).store_ref(h1).end_cell();
+    held = empty_array();
+    pending_draw = 0;
+}
+
+int from_parent?(slice src) inline {
+    if level == tree::levels {
+        return equal_slice_bits(src, jackpot);
+    }
+    return is_base_addr?(src, parent_hash);
+}
+
+builder node_address(int child_level, int child_index) inline {
+    cell code = my_code();
+    cell data = create_node_data(jackpot, child_level, child_index, range_hash, range_depth);
+    return create_address(chain::base, state_init_hash(code.cell_hash(), code.cell_depth(), data));
+}
+
+() update(slice src, slice s) impure inline {
+    int query_id = s~load_uint(64);
+    int tag = s~load_uint(32);
+    int deferred? = s~load_int(1);
+    int b = s~load_uint(32);
+    int delta = s~load_int(128);
+    s.end_parse();
+
+    throw_unless(err::access_denied, from_parent?(src));
+
+    ;; Sent on: the remaining value, or, on the update that opens this node, all but the storage reserve
+    ;; it carried for it.
+    int mode = send::remaining_value;
+    ifnot initialized? {
+        initialized? = true;
+        committed = empty_array();
+        held = empty_array();
+        raw_reserve(fee::node_storage, reserve::at_most);
+        mode = send::unreserved_balance;
+    }
+
+    fold_held(tag);
+
+    int shift = tree::bits * (level - 1);
+    int c = (b >> shift) & 63;
+    if deferred? & (delta < 0) {
+        held = array_add(held, c, - delta);
+        pending_draw = tag;
+    } else {
+        committed = array_add(committed, c, delta);
+    }
+
+    if level == 1 {
+        ;; the range changed its own live part already; what is left of the value goes back to the Jackpot
+        builder excess = begin_cell().store_uint(op::top_up, 32).store_uint(query_id, 64);
+        send_msg(false, jackpot.to_builder(), null(), excess, 0, mode + send::ignore_errors);
+        return ();
+    }
+
+    ;; the child at level - 1 holding b is b >> shift; the first booking below it deploys it
+    int child = b >> shift;
+    builder state_init = null();
+    if (delta > 0) & ((b & ((1 << shift) - 1)) == 0) {
+        cell data = create_node_data(jackpot, level - 1, child, range_hash, range_depth);
+        state_init = create_state_init(my_code(), data);
+    }
+
+    builder body = begin_cell()
+        .store_uint(op::update, 32)
+        .store_uint(query_id, 64)
+        .store_uint(tag, 32)
+        .store_int(deferred?, 1)
+        .store_uint(b, 32)
+        .store_int(delta, 128);
+    send_msg(false, node_address(level - 1, child), state_init, body, 0, mode);
+}
+
+() descend(slice src, slice s) impure inline {
+    int query_id = s~load_uint(64);
+    int draw = s~load_uint(32);
+    int slot = s~load_uint(8);
+    int j = s~load_uint(8);
+    int k = s~load_uint(128);
+    int offset = s~load_uint(128);
+    s.end_parse();
+
+    throw_unless(err::access_denied, from_parent?(src));
+    throw_unless(err::not_set_up, initialized?);
+
+    fold_held(draw);
+
+    ( int c, int inner ) = child_at(offset);
+
+    if c < 0 {
+        ;; cannot happen while the sums agree with the Jackpot's; the Jackpot counts it as a miss
+        builder lost = begin_cell()
+            .store_uint(op::lost, 32)
+            .store_uint(query_id, 64)
+            .store_uint(draw, 32)
+            .store_uint(slot, 8)
+            .store_uint(j, 8)
+            .store_uint(k, 128)
+            .store_uint(level, 8)
+            .store_uint(index, 32);
+        send_msg(false, jackpot.to_builder(), null(), lost, 0, send::remaining_value);
+        return ();
+    }
+
+    int child = (index << tree::bits) + c;
+    if level > 1 {
+        builder body = begin_cell()
+            .store_uint(op::descend, 32)
+            .store_uint(query_id, 64)
+            .store_uint(draw, 32)
+            .store_uint(slot, 8)
+            .store_uint(j, 8)
+            .store_uint(k, 128)
+            .store_uint(inner, 128);
+        send_msg(false, node_address(level - 1, child), null(), body, 0, send::remaining_value);
+        return ();
+    }
+
+    ;; the range at b = child answers whether the ticket at `inner` is still live
+    cell data = create_range_data(jackpot, child);
+    builder range = create_address(chain::base, state_init_hash(range_hash, range_depth, data));
+    builder check = begin_cell()
+        .store_uint(op::check, 32)
+        .store_uint(query_id, 64)
+        .store_uint(draw, 32)
+        .store_uint(slot, 8)
+        .store_uint(j, 8)
+        .store_uint(k, 128)
+        .store_uint(inner, 128);
+    send_msg(false, range, null(), check, 0, send::remaining_value);
+}
+
+() recv_internal(cell in_msg_full, slice s) impure {
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if flags & 1 {
+        return (); ;; a node sends nothing bounceable
+    }
+    slice src = cs~load_msg_addr();
+
+    if s.slice_bits() < 32 {
+        return (); ;; plain GRAM: anyone may top up the storage reserve
+    }
+    int op = s~load_uint(32);
+    if op == op::top_up {
+        return ();
+    }
+
+    load_data();
+    if op == op::update {
+        update(src, s);
+        return save_data();
+    }
+    if op == op::descend {
+        descend(src, s);
+        return save_data();
+    }
+
+    throw(err::invalid_op);
+}
+
+;;
+;; get methods
+;;
+
+tuple array_values(cell array) inline {
+    tuple values = empty_tuple();
+    slice top = array.begin_parse();
+    int g = 0;
+    repeat (8) {
+        slice chunk = top.preload_ref_at(g >> 2).begin_parse().preload_ref_at(g & 3).begin_parse();
+        repeat (8) {
+            values~tpush(chunk~load_coins());
+        }
+        g += 1;
+    }
+    return values;
+}
+
+;; ( jackpot, level, index, initialized, pending_draw, committed[64], held[64] ): committed[c] - held[c] is
+;; the live tickets below child c once the held updates are folded in.
+var get_node_data() method_id {
+    load_data();
+    tuple c = empty_tuple();
+    tuple h = empty_tuple();
+    if initialized? {
+        c = array_values(committed);
+        h = array_values(held);
+    }
+    return ( jackpot, level, index, initialized?, pending_draw, c, h );
+}

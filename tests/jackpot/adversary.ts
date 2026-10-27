@@ -2,49 +2,36 @@
 // Helpers for the acceptance, attack and property tests: a set-up at any start time, a message runner
 // that can hold, drop or reorder messages, direct edits of Hipo's state (participations, wallets), forged
 // message bodies, and fast reads of the Jackpot's counters straight from its data cell.
-import { Blockchain, BlockchainTransaction, internal, SandboxContract, TreasuryContract } from '@ton/sandbox'
+import {
+    Blockchain,
+    BlockchainTransaction,
+    createShardAccount,
+    internal,
+    SandboxContract,
+    TreasuryContract,
+} from '@ton/sandbox'
 import { Address, beginCell, Cell, Message, toNano } from '@ton/core'
 import { createHash } from 'crypto'
-import { deployHipo } from '../hipo/deploy'
 import { ParticipationState, treasuryConfigToCell } from '../hipo/Treasury'
-import { BookingLog, Jackpot, JackpotConfig, JackpotOp, LogMessage, LogTopic, logsOf } from '../../wrappers/Jackpot'
-import { Env, codes, depositGram, drawRounds, fixtureRound, nextRound, startDraw, submitRound } from './setup'
+import { BookingLog, JackpotOp, LogMessage, LogTopic, logsOf, treeLevels } from '../../wrappers/Jackpot'
+import {
+    Env,
+    SetupOptions,
+    depositGram,
+    drawRounds,
+    fixtureRound,
+    nextRound,
+    nodeAt,
+    setupJackpot,
+    startDraw,
+    submitRound,
+} from './setup'
 import { buildWitness, roundTime } from '../../wrappers/drand'
 
 // setupJackpot with a start time of the caller's choice, so a test can run draws for older drand rounds
 // (the sandbox refuses to move an account's clock backwards).
-export async function setupAt(
-    time: number,
-    opts: { fakeTreasury?: boolean; config?: Partial<JackpotConfig>; instantMint?: boolean } = {},
-): Promise<Env> {
-    const { jackpotCode, rangeCode } = await codes()
-    const blockchain = await Blockchain.create()
-    blockchain.now = time
-    const hipo = await deployHipo(blockchain, { instantMint: opts.instantMint })
-    const [, , , , walletCode] = await hipo.parent.getJettonData()
-    const governor = await blockchain.treasury('jackpot-governor')
-    const halter = await blockchain.treasury('jackpot-halter')
-    const burner = await blockchain.treasury('burner')
-    const keeper = await blockchain.treasury('keeper')
-    const fakeTreasury = opts.fakeTreasury ? await blockchain.treasury('fake-treasury') : undefined
-    const jackpot = blockchain.openContract(
-        Jackpot.createFromConfig(
-            {
-                treasury: fakeTreasury?.address ?? hipo.treasury.address,
-                parent: hipo.parent.address,
-                walletCode,
-                rangeCode,
-                burner: burner.address,
-                governor: governor.address,
-                halter: halter.address,
-                ...opts.config,
-            },
-            jackpotCode,
-        ),
-    )
-    await jackpot.sendDeploy(governor.getSender(), toNano('11'))
-    const fees = await jackpot.getJackpotFees()
-    return { blockchain, hipo, jackpot, governor, halter, burner, keeper, fakeTreasury, rangeCode, fees, bookings: [] }
+export async function setupAt(time: number, opts: Omit<SetupOptions, 'time'> = {}): Promise<Env> {
+    return setupJackpot({ ...opts, time })
 }
 
 // ---- a message runner with control over delivery ----------------------------------------------------------
@@ -121,6 +108,8 @@ export interface Counters {
     O: bigint
     P: bigint
     N: bigint
+    lLo: bigint
+    lHi: bigint
     TC: bigint
     TT: bigint
     halted: boolean
@@ -135,16 +124,25 @@ export async function dataOf(blockchain: Blockchain, address: Address): Promise<
 // The Jackpot's counters, parsed from its data cell (the layout of JackpotStorage in schema.tlb).
 export async function counters(env: Env): Promise<Counters> {
     const s = (await dataOf(env.blockchain, env.jackpot.address))!.beginParse()
+    s.skip(8) // version
     const T = s.loadCoins()
     const I = s.loadCoins()
     const O = s.loadCoins()
     const P = s.loadCoins()
-    const N = s.loadCoins()
     const TC = s.loadUintBig(128)
     const TT = s.loadUintBig(128)
     s.skip(32)
     const halted = s.loadBit()
-    return { T, I, O, P, N, TC, TT, halted, falling: s.loadBit() }
+    const falling = s.loadBit()
+    const extra = s.loadRef().beginParse()
+    extra.loadRef()
+    extra.loadRef()
+    const tree = extra.loadRef().beginParse()
+    const N = tree.loadUintBig(32)
+    tree.skip(32)
+    const lLo = tree.loadCoins()
+    const lHi = tree.loadCoins()
+    return { T, I, O, P, N, lLo, lHi, TC, TT, halted, falling }
 }
 
 // The hGRAM a Hipo wallet holds, parsed from its data (owner, parent, tokens, ...); 0 when not deployed.
@@ -245,59 +243,104 @@ async function rewriteParent(blockchain: Blockchain, wallet: Address, parent: Ad
 
 // ---- message bodies -------------------------------------------------------------------------------------
 
-export function hitBody(o: { draw: bigint; slot: number; j: number; r: bigint; start: bigint; owner: Address }) {
+export interface Attempt {
+    draw: bigint
+    slot: number
+    j: number
+    k: bigint
+}
+
+export function hitBody(o: Attempt & { b: bigint; owner: Address }) {
     return beginCell()
         .storeUint(JackpotOp.hit, 32)
         .storeUint(0, 64)
         .storeUint(o.draw, 32)
         .storeUint(o.slot, 8)
         .storeUint(o.j, 8)
-        .storeUint(o.r, 128)
-        .storeUint(o.start, 128)
+        .storeUint(o.k, 128)
+        .storeUint(o.b, 32)
         .storeAddress(o.owner)
         .endCell()
 }
 
-export function missBody(o: { draw: bigint; slot: number; j: number; r: bigint; start: bigint }) {
+export function missBody(o: Attempt & { b: bigint }) {
     return beginCell()
         .storeUint(JackpotOp.miss, 32)
         .storeUint(0, 64)
         .storeUint(o.draw, 32)
         .storeUint(o.slot, 8)
         .storeUint(o.j, 8)
-        .storeUint(o.r, 128)
-        .storeUint(o.start, 128)
+        .storeUint(o.k, 128)
+        .storeUint(o.b, 32)
         .endCell()
 }
 
-export function checkBody(o: { draw: bigint; slot: number; j: number; r: bigint; start: bigint }) {
+export function lostBody(o: Attempt & { level: number; index: bigint }) {
+    return beginCell()
+        .storeUint(JackpotOp.lost, 32)
+        .storeUint(0, 64)
+        .storeUint(o.draw, 32)
+        .storeUint(o.slot, 8)
+        .storeUint(o.j, 8)
+        .storeUint(o.k, 128)
+        .storeUint(o.level, 8)
+        .storeUint(o.index, 32)
+        .endCell()
+}
+
+export function checkBody(o: Attempt & { offset: bigint }) {
     return beginCell()
         .storeUint(JackpotOp.check, 32)
         .storeUint(0, 64)
         .storeUint(o.draw, 32)
         .storeUint(o.slot, 8)
         .storeUint(o.j, 8)
-        .storeUint(o.r, 128)
-        .storeUint(o.start, 128)
+        .storeUint(o.k, 128)
+        .storeUint(o.offset, 128)
         .endCell()
 }
 
-export function rangeSetupBody(owner: Address, length: bigint) {
+export function descendBody(o: Attempt & { offset: bigint }) {
+    return beginCell()
+        .storeUint(JackpotOp.descend, 32)
+        .storeUint(0, 64)
+        .storeUint(o.draw, 32)
+        .storeUint(o.slot, 8)
+        .storeUint(o.j, 8)
+        .storeUint(o.k, 128)
+        .storeUint(o.offset, 128)
+        .endCell()
+}
+
+export function updateBody(o: { tag: bigint; deferred: boolean; b: bigint; delta: bigint }) {
+    return beginCell()
+        .storeUint(JackpotOp.update, 32)
+        .storeUint(0, 64)
+        .storeUint(o.tag, 32)
+        .storeBit(o.deferred)
+        .storeUint(o.b, 32)
+        .storeInt(o.delta, 128)
+        .endCell()
+}
+
+export function rangeSetupBody(owner: Address, length: bigint, nodeHash = 0n, b = 0n) {
     return beginCell()
         .storeUint(JackpotOp.rangeSetup, 32)
-        .storeUint(0, 64)
-        .storeAddress(owner)
+        .storeUint(b, 64)
         .storeCoins(length)
+        .storeAddress(owner)
+        .storeUint(nodeHash, 256)
         .endCell()
 }
 
-export function withdrawnBody(x: bigint, start: bigint, owner: Address) {
+export function withdrawnBody(x: bigint, b: bigint, owner: Address, sent = toNano('10')) {
     return beginCell()
         .storeUint(JackpotOp.withdrawn, 32)
         .storeUint(0, 64)
         .storeCoins(x)
-        .storeUint(start, 128)
+        .storeUint(b, 32)
         .storeAddress(owner)
+        .storeCoins(sent)
         .endCell()
 }
 
@@ -375,13 +418,13 @@ export function opBody(op: number, ...uints: [bigint | number, number][]) {
 
 // ---- the draw, off chain ---------------------------------------------------------------------------------
 
-// r(i, j) = uint256(sha256(seed ‖ uint8 i ‖ uint8 j)) mod E
-export function ticketOf(seed: bigint, slot: number, j: number, cutoff: bigint): bigint {
+// k(i, j) = uint256(sha256(seed ‖ uint8 i ‖ uint8 j)) mod draw_L
+export function positionOf(seed: bigint, slot: number, j: number, eligible: bigint): bigint {
     const pre = Buffer.alloc(34)
     Buffer.from(seed.toString(16).padStart(64, '0'), 'hex').copy(pre, 0)
     pre[32] = slot
     pre[33] = j
-    return BigInt('0x' + createHash('sha256').update(pre).digest('hex')) % cutoff
+    return BigInt('0x' + createHash('sha256').update(pre).digest('hex')) % eligible
 }
 
 export function bookingsOfRun(run: { externals: LogMessage[] }): BookingLog[] {
@@ -417,7 +460,84 @@ export async function drawReady(env: Env, deposits: [Player, bigint][]) {
     await submitRound(env, drawRounds[0])
 }
 
-// The booking whose range holds ticket r, or undefined.
-export function rangeOf(env: Env, r: bigint): BookingLog | undefined {
-    return env.bookings.find((x) => x.start <= r && r < x.start + x.principal)
+// Walks down the tree as a descent does, reading the nodes' committed sums: the range at position k and
+// k's offset in it, or undefined when the sums end before k.
+export async function walkTree(env: Env, k: bigint): Promise<{ b: bigint; offset: bigint } | undefined> {
+    let index = 0n
+    let offset = k
+    for (let level = treeLevels; level >= 1; level--) {
+        const data = await nodeAt(env, level, index).getNodeData()
+        let c = 0
+        while (c < 64 && offset >= data.committed[c]) {
+            offset -= data.committed[c]
+            c++
+        }
+        if (c === 64) return undefined
+        index = index * 64n + BigInt(c)
+    }
+    return { b: index, offset }
+}
+
+// The booking a position falls in, by the tree.
+export async function rangeOf(env: Env, k: bigint): Promise<BookingLog | undefined> {
+    const at = await walkTree(env, k)
+    return at == null ? undefined : env.bookings.find((x) => x.b === at.b)
+}
+
+// ---- nodes in a chosen state ------------------------------------------------------------------------------
+
+// A node array as contracts/node.fc stores it: 8 chunk sums, ^[4 chunks] ^[4 chunks], 8 Coins per chunk.
+export function nodeArrayCell(values: bigint[]): Cell {
+    if (values.length !== 64) throw new Error('a node array has 64 values')
+    const chunks: Cell[] = []
+    const sums: bigint[] = []
+    for (let g = 0; g < 8; g++) {
+        const b = beginCell()
+        let sum = 0n
+        for (let p = 0; p < 8; p++) {
+            b.storeCoins(values[g * 8 + p])
+            sum += values[g * 8 + p]
+        }
+        chunks.push(b.endCell())
+        sums.push(sum)
+    }
+    const half = (from: number) =>
+        beginCell()
+            .storeRef(chunks[from])
+            .storeRef(chunks[from + 1])
+            .storeRef(chunks[from + 2])
+            .storeRef(chunks[from + 3])
+            .endCell()
+    const top = beginCell()
+    for (const sum of sums) top.storeCoins(sum)
+    return top.storeRef(half(0)).storeRef(half(4)).endCell()
+}
+
+// Deploys node(level, index) in the given state, as if its updates had arrived (for gas measurements of
+// the worst case, which needs more children than a test can book).
+export async function craftNode(
+    env: Env,
+    level: number,
+    index: bigint,
+    state: { committed: bigint[]; held: bigint[]; pendingDraw: bigint },
+) {
+    const node = nodeAt(env, level, index)
+    const parentHash =
+        level < treeLevels ? BigInt('0x' + nodeAt(env, level + 1, index >> 6n).address.hash.toString('hex')) : 0n
+    const data = beginCell()
+        .storeAddress(env.jackpot.address)
+        .storeUint(level, 8)
+        .storeUint(index, 32)
+        .storeBuffer(env.rangeCode.hash())
+        .storeUint(env.rangeCode.depth(), 16)
+        .storeUint(parentHash, 256)
+        .storeUint(state.pendingDraw, 32)
+        .storeRef(nodeArrayCell(state.committed))
+        .storeRef(nodeArrayCell(state.held))
+        .endCell()
+    await env.blockchain.setShardAccount(
+        node.address,
+        createShardAccount({ address: node.address, code: env.nodeCode, data, balance: toNano('1') }),
+    )
+    return node
 }

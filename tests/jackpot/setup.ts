@@ -16,9 +16,11 @@ import {
     JackpotState,
     LogTopic,
     QuoteKind,
+    attemptsPerSlot,
     logsOf,
 } from '../../wrappers/Jackpot'
 import { Range } from '../../wrappers/Range'
+import { Node } from '../../wrappers/Node'
 import { buildWitness, roundTime } from '../../wrappers/drand'
 
 interface FixtureRound {
@@ -54,25 +56,36 @@ export interface Env {
     // Set when the Jackpot asks a stand-in for quotes instead of Hipo's treasury.
     fakeTreasury?: SandboxContract<TreasuryContract>
     rangeCode: Cell
+    nodeCode: Cell
     fees: JackpotFees
     bookings: BookingLog[]
 }
 
 let jackpotCode: Cell | undefined
 let rangeCode: Cell | undefined
+let nodeCode: Cell | undefined
 
 export async function codes() {
     jackpotCode ??= await compile('Jackpot')
     rangeCode ??= await compile('Range')
-    return { jackpotCode, rangeCode }
+    nodeCode ??= await compile('Node')
+    return { jackpotCode, rangeCode, nodeCode }
 }
 
-export async function setupJackpot(
-    opts: { fakeTreasury?: boolean; config?: Partial<JackpotConfig>; instantMint?: boolean } = {},
-): Promise<Env> {
-    const { jackpotCode, rangeCode } = await codes()
+export interface SetupOptions {
+    fakeTreasury?: boolean
+    config?: Partial<JackpotConfig>
+    instantMint?: boolean
+    // the start time; the tests start an hour before the first recorded round by default
+    time?: number
+    // with a stand-in treasury: answer the deploy's quote request (default true)
+    firstQuote?: boolean
+}
+
+export async function setupJackpot(opts: SetupOptions = {}): Promise<Env> {
+    const { jackpotCode, rangeCode, nodeCode } = await codes()
     const blockchain = await Blockchain.create()
-    blockchain.now = startTime
+    blockchain.now = opts.time ?? startTime
     const hipo = await deployHipo(blockchain, { instantMint: opts.instantMint })
     const [, , , , walletCode] = await hipo.parent.getJettonData()
 
@@ -89,6 +102,7 @@ export async function setupJackpot(
                 parent: hipo.parent.address,
                 walletCode,
                 rangeCode,
+                nodeCode,
                 burner: burner.address,
                 governor: governor.address,
                 halter: halter.address,
@@ -97,15 +111,40 @@ export async function setupJackpot(
             jackpotCode,
         ),
     )
+    // the first message checks the deploy data and asks the treasury for the first rate
     const deploy = await jackpot.sendDeploy(governor.getSender(), toNano('11'))
     expect(deploy.transactions).toHaveTransaction({ to: jackpot.address, deploy: true, success: true })
 
     const fees = await jackpot.getJackpotFees()
-    return { blockchain, hipo, jackpot, governor, halter, burner, keeper, fakeTreasury, rangeCode, fees, bookings: [] }
+    const env: Env = {
+        blockchain,
+        hipo,
+        jackpot,
+        governor,
+        halter,
+        burner,
+        keeper,
+        fakeTreasury,
+        rangeCode,
+        nodeCode,
+        fees,
+        bookings: [],
+    }
+    // the stand-in treasury answers that first request at 1:1
+    if (fakeTreasury != null && opts.firstQuote !== false) {
+        await replyQuote(env, await pendingQuote(env, QuoteKind.refresh), 1n, 1n)
+    }
+    return env
 }
 
-export function rangeAt(env: Env, start: bigint): SandboxContract<Range> {
-    return env.blockchain.openContract(Range.createFromConfig({ jackpot: env.jackpot.address, start }, env.rangeCode))
+export function rangeAt(env: Env, b: bigint): SandboxContract<Range> {
+    return env.blockchain.openContract(Range.createFromConfig({ jackpot: env.jackpot.address, b }, env.rangeCode))
+}
+
+export function nodeAt(env: Env, level: number, index: bigint): SandboxContract<Node> {
+    return env.blockchain.openContract(
+        Node.createFromConfig({ jackpot: env.jackpot.address, level, index, rangeCode: env.rangeCode }, env.nodeCode),
+    )
 }
 
 export async function hgramOf(env: Env, owner: Address): Promise<bigint> {
@@ -213,28 +252,21 @@ export async function submitRound(env: Env, round: number) {
     })
 }
 
-// The booking whose range holds ticket r.
-export function bookingOf(env: Env, r: bigint): BookingLog {
-    const b = env.bookings.find((x) => x.start <= r && r < x.start + x.principal)
-    if (b == null) throw new Error(`no range holds ticket ${r.toString()}`)
-    return b
+// The booking of range b.
+export function bookingOf(env: Env, b: bigint): BookingLog {
+    const booking = env.bookings.find((x) => x.b === b)
+    if (booking == null) throw new Error(`no booking ${b.toString()}`)
+    return booking
 }
 
-// Plays the keeper until every slot is settled: reads each open slot's ticket and locates its range.
+// Plays the keeper until every slot is settled: locates the first open slot, again and again.
 export async function resolveDraw(env: Env) {
     const results: SendMessageResult[] = []
-    for (let guard = 0; guard < 3 * 64 + 3; guard++) {
+    for (let guard = 0; guard < 3 * attemptsPerSlot + 3; guard++) {
         const draw = await env.jackpot.getDrawState()
         if (draw.openSlots === 0) return results
         const slot = [0, 1, 2].find((i) => (draw.openSlots >> i) & 1)!
-        const r = await env.jackpot.getTicket(slot)
-        const booking = bookingOf(env, r)
-        const result = await env.jackpot.sendLocate(env.keeper.getSender(), {
-            value: env.fees.locate,
-            slot,
-            start: booking.start,
-        })
-        results.push(result)
+        results.push(await env.jackpot.sendLocate(env.keeper.getSender(), { value: env.fees.locate, slot }))
     }
     throw new Error('draw did not resolve')
 }

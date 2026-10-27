@@ -3,27 +3,22 @@ import { JackpotOp } from './Jackpot'
 
 export interface RangeConfig {
     jackpot: Address
-    epoch?: number
-    start: bigint
+    b: bigint
 }
 
-// The init data that fixes a range's address: (jackpot, epoch, start). Owner and length come with setup.
+// The init data that fixes a range's address: (jackpot, b). Owner, length and node come with the setup.
 export function rangeConfigToCell(config: RangeConfig): Cell {
-    return beginCell()
-        .storeAddress(config.jackpot)
-        .storeUint(config.epoch ?? 0, 32)
-        .storeUint(config.start, 128)
-        .endCell()
+    return beginCell().storeAddress(config.jackpot).storeUint(config.b, 32).endCell()
 }
 
 export interface RangeData {
     jackpot: Address
-    epoch: number
-    start: bigint
+    b: bigint
     setUp: boolean
     owner: Address | null
     length: bigint
     live: bigint
+    nodeHash: bigint
 }
 
 export class Range implements Contract {
@@ -46,7 +41,8 @@ export class Range implements Contract {
         await provider.internal(via, { value, bounce, sendMode: SendMode.PAY_GAS_SEPARATELY, body })
     }
 
-    // x = 0 withdraws the whole live part
+    // x = 0 withdraws the whole live part. In a draw's window, a range the draw can pick owes the
+    // surcharge (Jackpot get_surcharge) on top of the fee.
     async sendWithdraw(
         provider: ContractProvider,
         via: Sender,
@@ -72,11 +68,18 @@ export class Range implements Contract {
     async getRangeData(provider: ContractProvider): Promise<RangeData> {
         const { stack } = await provider.get('get_range_data', [])
         const jackpot = stack.readAddress()
-        const epoch = stack.readNumber()
-        const start = stack.readBigNumber()
+        const b = stack.readBigNumber()
         const setUp = stack.readBoolean()
         const owner = stack.readAddressOpt()
-        return { jackpot, epoch, start, setUp, owner, length: stack.readBigNumber(), live: stack.readBigNumber() }
+        return {
+            jackpot,
+            b,
+            setUp,
+            owner,
+            length: stack.readBigNumber(),
+            live: stack.readBigNumber(),
+            nodeHash: stack.readBigNumber(),
+        }
     }
 
     async getBalance(provider: ContractProvider): Promise<bigint> {
