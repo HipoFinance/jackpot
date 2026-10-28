@@ -4,19 +4,22 @@ What changed in Hipo Jackpot, newest first.
 
 ## Unreleased
 
-- The amended spec built: exact draws over a 64-ary, 4-level tree of node contracts (`contracts/node.fc`),
-  ranges keyed by booking index, withdrawals held back in a draw's window for the surcharge, A = 16,
-  `locate(slot)` only, `lost` replies; GRAM deposit records store `coins` and `cap` and book at most `cap`;
-  the 1% booking margin; prizes won while the rate has fallen go back into F and `other` claims still pay;
-  the burn is taken on new yield only; upgrades migrate in the same transaction (set_c3) with a storage
-  version, and the deploy checks its parameters. Fees resized for the tree, nodes in their worst case
-  (a 64-child fold at every level): see `contracts/imports/constants.fc` and `tests/Gas.spec.ts`. Every
-  former open bug now passes as a plain test. Not money-audited yet.
-- v1 contracts in FunC: `contracts/jackpot.fc`, `contracts/range.fc`, their imports and `schema.tlb`,
-  with wrappers and sandbox tests of each flow against Hipo's real contracts (deposits, withdrawals, draws,
-  requote, halt, a falling rate) and a gas/fee spec that runs every entry message on its bare fee. Not yet
-  money-audited. Open: the instant_mint-off path is untested (the sandbox treasury never defers), and query
-  ids are randomised because anyone can mint to the Jackpot under a chosen id, which the spec did not foresee.
+- Scripts and docs: `scripts/` (deploy, read-only `showState`, `submitRandomness`, one confirmed script
+  per governor and halter operation) and `docs/architecture.md`. Nothing has been run against a network.
+  The hand-operated scripts check
+  hGRAM outside `T` and, for a failed payout, the bounced transfer on chain; `upgradeCode` replays the upgrade
+  in a sandbox on a copy of the live account (`tests/UpgradeDryRun.spec.ts`) and wants the audited code hash
+  typed back; every governor script can print its message (`b`) for the governor multisig to submit. Left
+  open: a keeper service (its own spec).
+- v1 contracts (FunC): `jackpot.fc`, `range.fc`, `node.fc` (exact draws over a 64-ary, 4-level sum tree,
+  so withdrawn money leaves no gaps a whale could use), the drand quicknet check, wrappers, and sandbox
+  tests against Hipo's real contracts (flows, every acceptance criterion, attacks, property sequences, gas
+  pins). Money-audited (two opposite audits with two re-checks each) and code-reviewed (three rounds): no
+  confirmed failing case. Fixed on the way: bill mints under an attacker-chosen query_id (mints now book at
+  most `cap`), unsafe upgrades (migrate via set_c3), the whale gap attack (the tree), stuck tree hops
+  (worst-case fees, mode-64 forwarding). Accepted: a forged success `gas_excess` only removes the governor's
+  `settle_failed_payout` shortcut. Not done: a property run at the spec's 10,000 sequences (about 19 hours),
+  testnet.
 - v1 design approved: [`docs/specs/2026-10-27-jackpot-v1.md`](docs/specs/2026-10-27-jackpot-v1.md) — three
   ranked prizes every validation round, drand randomness, principal booked at Hipo's on-chain quote,
   payouts in hGRAM. Money-audited as a spec (all findings closed). Left for later: renumbering withdrawn
