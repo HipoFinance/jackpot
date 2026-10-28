@@ -51,7 +51,7 @@ refresh$11 = QuoteKind;
 _ created_at:uint32 kind:QuoteKind = QuoteRecord;
 // payouts: query_id -> PayoutRecord; kind 0 = other, 1 = burn, 2 = prize
 _ kind:uint2 recipient:MsgAddress amount:Coins = PayoutRecord;
-// claimable: sha256 of the owner's address slice -> Claim. A prize claim waits while the rate has fallen.
+// claimable: slice_hash (the cell representation hash) of the owner's address slice -> Claim. A prize claim waits while the rate has fallen.
 _ owner:MsgAddress prize:Coins other:Coins = Claim;
 _ pending:(HashmapE 64 PendingDeposit) quotes:(HashmapE 64 QuoteRecord)
     payouts:(HashmapE 64 PayoutRecord) claimable:(HashmapE 256 Claim) = Books;
@@ -108,7 +108,7 @@ claim#e53d2340 query_id:uint64 = InternalMsgBody;
 // Between the Jackpot, its nodes and its ranges.
 
 // bounceable; query_id = b and length first, so that a bounce carries what undoes the booking
-range_setup#e82ed41c query_id:uint64 length:Coins owner:MsgAddress node:uint256 = InternalMsgBody;
+range_setup#e82ed41c query_id:uint64 length:Coins owner:MsgAddress = InternalMsgBody;
 // amount comes first so that a bounce carries it back; sent = what the owner sent the range
 withdrawn#32e2541b query_id:uint64 amount:Coins b:uint32 owner:MsgAddress sent:Coins = InternalMsgBody;
 // down the tree, from each parent to the child holding b; tag = the Jackpot's draw_id

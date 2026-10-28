@@ -134,14 +134,16 @@ int state_init_hash(int code_hash, int code_depth, cell data) inline {
         .sha256_builder();
 }
 
-;; A range's initial data, which with the range code fixes its address: (jackpot, b), b the booking index.
-;; The owner, length and level-1 node are not part of it, so that nobody can deploy a range at a booking's
-;; address ahead of the Jackpot with different contents; the one-time setup that carries them is accepted
-;; only from the Jackpot.
-cell create_range_data(slice jackpot, int b) inline {
+;; A range's initial data, which with the range code fixes its address: (jackpot, b, node_hash), b the
+;; booking index and node_hash the address hash of its level-1 node, so that even a range that is not set
+;; up knows the only sender of check. The owner and length are not part of it, so that nobody can deploy a
+;; range at a booking's address ahead of the Jackpot with different contents; the one-time setup that
+;; carries them is accepted only from the Jackpot.
+cell create_range_data(slice jackpot, int b, int node_hash) inline {
     return begin_cell()
         .store_slice(jackpot)
         .store_uint(b, 32)
+        .store_uint(node_hash, 256)
         .end_cell();
 }
 

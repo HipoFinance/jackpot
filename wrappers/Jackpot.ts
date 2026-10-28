@@ -241,6 +241,7 @@ export interface JackpotFees {
     requote: bigint
     expire: bigint
     claim: bigint
+    attempt: bigint
 }
 
 export interface QuoteRecord {
@@ -567,6 +568,7 @@ export class Jackpot implements Contract {
             requote: stack.readBigNumber(),
             expire: stack.readBigNumber(),
             claim: stack.readBigNumber(),
+            attempt: stack.readBigNumber(),
         }
     }
 

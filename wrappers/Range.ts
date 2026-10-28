@@ -4,11 +4,12 @@ import { JackpotOp } from './Jackpot'
 export interface RangeConfig {
     jackpot: Address
     b: bigint
+    nodeHash: bigint // the address hash of its level-1 node
 }
 
-// The init data that fixes a range's address: (jackpot, b). Owner, length and node come with the setup.
+// The init data that fixes a range's address: (jackpot, b, node_hash). Owner and length come with the setup.
 export function rangeConfigToCell(config: RangeConfig): Cell {
-    return beginCell().storeAddress(config.jackpot).storeUint(config.b, 32).endCell()
+    return beginCell().storeAddress(config.jackpot).storeUint(config.b, 32).storeUint(config.nodeHash, 256).endCell()
 }
 
 export interface RangeData {

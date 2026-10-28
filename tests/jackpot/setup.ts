@@ -138,7 +138,16 @@ export async function setupJackpot(opts: SetupOptions = {}): Promise<Env> {
 }
 
 export function rangeAt(env: Env, b: bigint): SandboxContract<Range> {
-    return env.blockchain.openContract(Range.createFromConfig({ jackpot: env.jackpot.address, b }, env.rangeCode))
+    return env.blockchain.openContract(
+        Range.createFromConfig(
+            {
+                jackpot: env.jackpot.address,
+                b,
+                nodeHash: BigInt('0x' + nodeAt(env, 1, b >> 6n).address.hash.toString('hex')),
+            },
+            env.rangeCode,
+        ),
+    )
 }
 
 export function nodeAt(env: Env, level: number, index: bigint): SandboxContract<Node> {
@@ -275,7 +284,8 @@ export async function resolveDraw(env: Env) {
 export async function pendingQuote(env: Env, kind: number = QuoteKind.booking): Promise<bigint> {
     const { quotes } = await env.jackpot.getBooks()
     const ids = [...quotes.entries()].filter(([, q]) => q.kind === kind).map(([id]) => id)
-    if (ids.length !== 1) throw new Error(`expected one quote record of kind ${kind.toString()}, found ${ids.length.toString()}`)
+    if (ids.length !== 1)
+        throw new Error(`expected one quote record of kind ${kind.toString()}, found ${ids.length.toString()}`)
     return ids[0]
 }
 

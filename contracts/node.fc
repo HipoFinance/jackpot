@@ -326,7 +326,8 @@ builder node_address(int child_level, int child_index) inline {
     }
 
     ;; the range at b = child answers whether the ticket at `inner` is still live
-    cell data = create_range_data(jackpot, child);
+    ( _, int own_hash ) = parse_std_addr(my_address()); ;; this level-1 node is the range's node
+    cell data = create_range_data(jackpot, child, own_hash);
     builder range = create_address(chain::base, state_init_hash(range_hash, range_depth, data));
     builder check = begin_cell()
         .store_uint(op::check, 32)

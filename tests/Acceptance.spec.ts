@@ -596,8 +596,8 @@ describe('AC 7b: a withdrawal in the window from an eligible range needs its sur
         const x = toNano('300')
         const s = await env.jackpot.getSurcharge(0n, x)
         const draw = await env.jackpot.getDrawState()
-        // ceil(3·(A−1)·fee::locate·x / draw_L)
-        expect(s).toBe((3n * 15n * env.fees.locate * x + draw.eligible - 1n) / draw.eligible)
+        // ceil(3·(A−1)·fee::attempt·x / draw_L)
+        expect(s).toBe((3n * 15n * env.fees.attempt * x + draw.eligible - 1n) / draw.eligible)
         expect(await env.jackpot.getSurcharge(2n, x)).toBe(0n) // b ≥ E
 
         const hash = await jackpotHash()

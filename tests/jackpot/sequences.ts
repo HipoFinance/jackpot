@@ -167,7 +167,19 @@ export async function runSequence(world: World, seed: number, maxOps = 10): Prom
         return result
     }
 
+    // The amount each mint notification carried, by query_id: what Hipo actually minted for a GRAM deposit
+    const minted = new Map<bigint, bigint>()
+
     const absorb = (result: Run) => {
+        for (const tx of result.transactions) {
+            const m = tx.inMessage
+            if (m?.info.type !== 'internal' || m.info.bounced || !m.info.dest.equals(env.jackpot.address)) continue
+            const body = m.body.beginParse()
+            if (body.remainingBits < 32 + 64 || body.loadUint(32) !== JackpotOp.transferNotification) continue
+            const id = body.loadUintBig(64)
+            const amount = body.loadCoins()
+            if (body.loadAddress().equals(env.jackpot.address)) minted.set(id, amount)
+        }
         for (const b of logsOf<BookingLog>(result.externals, LogTopic.booking)) {
             ranges.push({ owner: b.owner, b: b.b, length: b.principal, live: b.principal })
             env.bookings.push(b)
@@ -196,14 +208,12 @@ export async function runSequence(world: World, seed: number, maxOps = 10): Prom
             const node = await nodeAt(env, level, 0n).getNodeData()
             for (let child = 0; child < 64; child++) {
                 const below =
-                    level === 1
-                        ? (ranges.find((x) => x.b === BigInt(child))?.live ?? 0n)
-                        : child === 0
-                          ? total
-                          : 0n
+                    level === 1 ? (ranges.find((x) => x.b === BigInt(child))?.live ?? 0n) : child === 0 ? total : 0n
                 const net = node.committed[child] - node.held[child]
                 if (net !== below) {
-                    fail(`node(${level.toString()}, 0) child ${child.toString()}: ${net.toString()} ≠ live ${below.toString()}`)
+                    fail(
+                        `node(${level.toString()}, 0) child ${child.toString()}: ${net.toString()} ≠ live ${below.toString()}`,
+                    )
                 }
             }
         }
@@ -329,12 +339,17 @@ export async function runSequence(world: World, seed: number, maxOps = 10): Prom
         // every answer is about the k(i, j)-th eligible live ticket as of the start, recomputed here
         for (const s of paid) {
             if (s.result === SlotResult.lost) fail('a descent was lost')
-            if (s.result !== SlotResult.hit && s.result !== SlotResult.miss && s.result !== SlotResult.rolledOver) continue
+            if (s.result !== SlotResult.hit && s.result !== SlotResult.miss && s.result !== SlotResult.rolledOver)
+                continue
             const k = positionOf(state.seed, s.slot, s.attempt, log.eligible)
-            if (s.position !== k) fail(`slot ${s.slot.toString()} attempt ${s.attempt.toString()} at ${s.position.toString()}, not k = ${k.toString()}`)
+            if (s.position !== k)
+                fail(
+                    `slot ${s.slot.toString()} attempt ${s.attempt.toString()} at ${s.position.toString()}, not k = ${k.toString()}`,
+                )
             const at = rangeAtPosition(atStart, k)
             if (at == null) fail(`no eligible range holds position ${k.toString()}`)
-            if (s.b !== at!.b) fail(`slot ${s.slot.toString()} answered by range ${s.b.toString()}, not ${at!.b.toString()}`)
+            if (s.b !== at!.b)
+                fail(`slot ${s.slot.toString()} answered by range ${s.b.toString()}, not ${at!.b.toString()}`)
             const live = ranges.find((x) => x.b === at!.b)!.live
             if (s.result === SlotResult.hit) {
                 winners++
@@ -381,8 +396,9 @@ export async function runSequence(world: World, seed: number, maxOps = 10): Prom
             const config15 = getConfig(env.blockchain, 15n)!.beginParse().loadUint(32)
             env.blockchain.now = env.blockchain.now! + 2 * config15 + 1
             for (const [id, record] of waiting) {
-                const outside = (await walletTokens(env.blockchain, world.jackpotWallet)) - (await counters(env)).T
-                const tokens = outside < record.cap ? outside : record.cap
+                // what Hipo minted for this record, as the governor reads it on chain, up to its cap
+                const arrived = minted.get(id) ?? 0n
+                const tokens = arrived < record.cap ? arrived : record.cap
                 if (tokens <= 0n) fail('a pending deposit with no tokens minted for it')
                 const body = beginCell()
                     .storeUint(JackpotOp.resolvePending, 32)

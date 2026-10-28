@@ -6,7 +6,16 @@
 import { BlockchainTransaction, SendMessageResult } from '@ton/sandbox'
 import '@ton/test-utils'
 import { Address, toNano } from '@ton/core'
-import { DrawState, JackpotOp, LogTopic, SlotLog, SlotResult, logsOf, treeLevels } from '../wrappers/Jackpot'
+import {
+    DrawState,
+    JackpotFees,
+    JackpotOp,
+    LogTopic,
+    SlotLog,
+    SlotResult,
+    logsOf,
+    treeLevels,
+} from '../wrappers/Jackpot'
 import { roundTime } from '../wrappers/drand'
 import {
     Env,
@@ -43,27 +52,31 @@ const opNames = new Map<number, string>(Object.entries(JackpotOp).map(([k, v]) =
 // Highest gas seen per "contract:op", over every test in this file.
 const measured = new Map<string, bigint>()
 
+// Highest total gas of one locate chain (one attempt), over every locate this file runs.
+let attemptGas = 0n
+let fees: JackpotFees
+
 // Pinned maxima. A handler that outgrows its pin fails here, and the fee that pays for it must be
 // re-checked before the pin is raised. The fees are sized from these at 400 nano-GRAM per gas
 // (contracts/imports/constants.fc).
 const maxGas: Record<string, bigint> = {
-    'jackpot:deposit': 18000n,
+    'jackpot:deposit': 20000n,
     'jackpot:transferNotification': 18000n,
     'jackpot:takeCurrentQuote': 32000n,
     'jackpot:gasExcess': 16000n,
-    'jackpot:withdrawn': 28000n,
-    'jackpot:startDraw': 20000n,
+    'jackpot:withdrawn': 32000n,
+    'jackpot:startDraw': 22500n,
     'jackpot:submitRandomness': 90000n,
     'jackpot:locate': 19000n,
-    'jackpot:hit': 24000n,
-    'jackpot:hit:burn': 31000n,
-    'jackpot:miss': 19000n,
+    'jackpot:hit': 28000n,
+    'jackpot:hit:burn': 36000n,
+    'jackpot:miss': 23000n,
     'jackpot:requote': 18000n,
-    'jackpot:claim': 20000n,
+    'jackpot:claim': 22500n,
     'jackpot:topUp': 1500n,
     'jackpot:bounce:sendTokens': 15000n,
-    'range:rangeSetup': 4000n,
-    'range:withdraw': 7500n,
+    'range:rangeSetup': 4500n,
+    'range:withdraw': 8500n,
     'range:check': 6500n,
     'range:bounce:withdrawn': 7000n,
     // the worst case: a fold of all 64 children; fee::node_hop pays 75,000 gas
@@ -101,6 +114,8 @@ function sendsBurn(tx: BlockchainTransaction, burner: Address): boolean {
 function record(env: Env, result: { transactions: BlockchainTransaction[] }) {
     const ranges = new Set(env.bookings.map((x) => rangeAt(env, x.b).address.toString()))
     const nodes = nodeAddresses(env)
+    let chain = 0n
+    let located = false
     for (const tx of result.transactions) {
         if (tx.description.type !== 'generic' || tx.description.computePhase.type !== 'vm') continue
         const addr = addressOf(tx)
@@ -125,7 +140,11 @@ function record(env: Env, result: { transactions: BlockchainTransaction[] }) {
         if (name === 'jackpot' && sendsBurn(tx, env.burner.address)) key += ':burn'
         const gas = tx.description.computePhase.gasUsed
         if (gas > (measured.get(key) ?? 0n)) measured.set(key, gas)
+        chain += gas
+        if (key === 'jackpot:locate') located = true
+        fees = env.fees
     }
+    if (located && chain > attemptGas) attemptGas = chain
 }
 
 function storageCollected(tx: BlockchainTransaction): bigint {
@@ -162,6 +181,12 @@ describe('Gas and fees', () => {
         }
         // every pinned handler was measured
         for (const k of Object.keys(maxGas)) expect([k, measured.has(k)]).toEqual([k, true])
+        // one attempt (locate handler, 4 node descents, range check, hit or miss handler) stays within
+        // fee::attempt at 400 nano-GRAM per gas, which the surcharge is sized from
+        const attemptFee = fees.attempt
+        console.log(`one attempt: ${attemptGas.toString()} gas, fee::attempt ${attemptFee.toString()}`)
+        expect(attemptGas).toBeGreaterThan(0n)
+        expect(attemptGas * 400n).toBeLessThanOrEqual(attemptFee)
     })
 
     it('runs every chain to the end on its bare minimum fee, without the Jackpot paying', async () => {
@@ -387,7 +412,7 @@ describe('Gas and fees', () => {
         for (const [k, v] of Object.entries(kept)) expect([k, v >= 0n]).toEqual([k, true])
     })
 
-    it('refuses every entry message below its minimum, with no state change', async () => {
+    it('refuses deposit, start_draw, locate, requote, expire and claim below their minimum, with no state change', async () => {
         const env = await setupJackpot()
         const alice = await env.blockchain.treasury('alice')
         const state = async () => {

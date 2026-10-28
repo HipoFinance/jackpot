@@ -1,8 +1,8 @@
 ;; A range: one booking, of `length` tickets (nano-GRAM of principal), of which the first `live` can still
 ;; win. One contract per booking keeps the Jackpot's own storage bounded however many players there are.
 ;;
-;; The address follows from (jackpot, b) alone, b the booking index. The owner, the length and the address
-;; of its level-1 node arrive in a one-time setup that only the Jackpot can send. The code is fixed: ranges
+;; The address follows from (jackpot, b, node_hash) alone, b the booking index and node_hash the hash of its
+;; level-1 node. The owner and the length arrive in a one-time setup that only the Jackpot can send. The code is fixed: ranges
 ;; cannot be upgraded, and never delete themselves, because a withdrawn range must keep answering draws.
 
 #include "imports/utils.fc";
@@ -10,7 +10,7 @@
 global slice jackpot;
 global int b;
 global int set_up?;
-global int node_hash;   ;; the address hash of node(1, floor(b / 64)), the only sender of check
+global int node_hash;   ;; the address hash of node(1, floor(b / 64)), the only sender of check; in the init data
 global slice owner;
 global int length;
 global int live;
@@ -19,16 +19,15 @@ global int live;
     slice ds = get_data().begin_parse();
     jackpot = ds~load_msg_addr();
     b = ds~load_uint(32);
-    set_up? = ds.slice_bits() > 0;
+    node_hash = ds~load_uint(256);
+    set_up? = ds.slice_refs() > 0;
     if set_up? {
-        node_hash = ds~load_uint(256);
         slice booking = ds~load_ref().begin_parse();
         owner = booking~load_msg_addr();
         length = booking~load_coins();
         live = booking~load_coins();
         booking.end_parse();
     } else {
-        node_hash = 0;
         owner = null();
         length = 0;
         live = 0;
@@ -39,7 +38,8 @@ global int live;
 () save_data() impure inline {
     builder data = begin_cell()
         .store_slice(jackpot)
-        .store_uint(b, 32);
+        .store_uint(b, 32)
+        .store_uint(node_hash, 256);
     if set_up? {
         ;; the booking in a ref of its own, so that the cell never overflows at any length
         cell booking = begin_cell()
@@ -47,9 +47,7 @@ global int live;
             .store_coins(length)
             .store_coins(live)
             .end_cell();
-        data = data
-            .store_uint(node_hash, 256)
-            .store_ref(booking);
+        data = data.store_ref(booking);
     }
     data.end_cell().set_data();
 }
@@ -58,7 +56,6 @@ global int live;
     s~load_uint(64);
     int new_length = s~load_coins();
     slice new_owner = s~load_msg_addr();
-    int new_node_hash = s~load_uint(256);
     s.end_parse();
 
     throw_unless(err::access_denied, equal_slice_bits(src, jackpot));
@@ -66,7 +63,6 @@ global int live;
 
     ;; what the setup carried above its gas stays here as the storage reserve
     set_up? = true;
-    node_hash = new_node_hash;
     owner = new_owner;
     length = new_length;
     live = new_length;
@@ -114,8 +110,23 @@ global int live;
     int offset = s~load_uint(128);
     s.end_parse();
 
-    throw_unless(err::not_set_up, set_up?);
+    ;; Only the range's own node may ask, set up or not (its hash is in the init data).
     throw_unless(err::access_denied, is_base_addr?(src, node_hash));
+
+    ;; Never throws on a range that is not set up: the node's message is not bounceable, and a throw would
+    ;; leave the slot stuck until it expires. It answers miss.
+    ifnot set_up? {
+        builder body = begin_cell()
+            .store_uint(op::miss, 32)
+            .store_uint(query_id, 64)
+            .store_uint(draw, 32)
+            .store_uint(slot, 8)
+            .store_uint(j, 8)
+            .store_uint(k, 128)
+            .store_uint(b, 32);
+        send_msg(false, jackpot.to_builder(), null(), body, 0, send::remaining_value);
+        return ();
+    }
 
     int hit? = offset < live;
     builder body = begin_cell()

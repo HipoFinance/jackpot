@@ -126,9 +126,10 @@ const int storage_version = 1;
 ;; governor can withdraw it.
 ;;
 ;; The figures are fixed rather than read from config 20/21, as the burner does. They are sized from the
-;; gas measured in tests/Gas.spec.ts (every Jackpot handler under 31k gas but the drand check, about 81k;
-;; a node about 52k in its worst case, a fold of all 64 children) at 400 nano-GRAM per gas, six times the
-;; sandbox's basechain price, so they hold even if prices went back. Most of
+;; gas measured in tests/Gas.spec.ts (every Jackpot handler under 32k gas but the drand check, about 81k;
+;; a node about 52k in its worst case, a fold of all 64 children) at 400 nano-GRAM per gas. Mainnet config 21
+;; currently reads 66.67 nano-GRAM per gas, so the fees carry about 6 times headroom over it; the node
+;; hops pin 56k gas against a 75k budget, about 1.3 times at the 400 basis. Most of
 ;; each fee is never burned: replies carry it back, and the rest stays above the storage float.
 ;; Gas.spec.ts sends every entry message with exactly its fee and fails if the chain does not finish or
 ;; costs the Jackpot GRAM.
@@ -153,7 +154,7 @@ const int fee::range_storage = 100000000; ;; 0.1 GRAM
 ;; fee of its state_init.
 const int fee::range_setup = fee::range_storage + 10000000; ;; 0.11 GRAM
 
-;; Gas of one Jackpot or range handler: 37,500 gas at 400 nano-GRAM per gas; the most measured is 31k.
+;; Gas of one Jackpot or range handler: 37,500 gas at 400 nano-GRAM per gas; the most measured is 32k.
 const int fee::handler = 15000000; ;; 0.015 GRAM
 
 ;; The tree. Every node message carries the remaining value of the one before it (mode 64), so a chain of
@@ -229,6 +230,12 @@ const int fee::start_draw = fee::handler + fee::quote + fee::payout + fee::burn_
 ;; per gas; the handler's gas limit comes from this value.
 const int fee::submit_randomness = 50000000; ;; 0.05 GRAM
 
+;; One attempt of a slot, in gas: the Jackpot's locate handler, the descent through 4 nodes, the range's
+;; check, and the hit or miss handler. The most measured in tests/Gas.spec.ts is 126,590 gas, 0.0506 GRAM
+;; at 400 nano-GRAM per gas, plus about 10% margin. The surcharge of a withdrawal held back in a draw
+;; is sized from it, not from fee::locate, which also pays the prize payout and a worst-case descent.
+const int fee::attempt = 56000000; ;; 0.056 GRAM
+
 ;; locate: a descent to a range and its answer, then a prize payout on a hit.
 const int fee::locate = fee::handler + fee::descent + fee::payout;
 
@@ -239,8 +246,8 @@ const int fee::requote = fee::handler + fee::quote;
 ;; expire: closes a slot, and may end the draw; the burn it may send was prepaid by start_draw.
 const int fee::expire = fee::handler;
 
-;; claim: one payout.
-const int fee::claim = fee::handler + fee::payout;
+;; claim: a payout of each kind, the prize and the rest.
+const int fee::claim = fee::handler + 2 * fee::payout;
 
 ;; The Jackpot's own GRAM, kept for its storage and never withdrawn by the governor.
 const int fee::jackpot_storage = 10000000000; ;; 10 GRAM

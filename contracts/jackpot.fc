@@ -318,15 +318,6 @@ int free_tokens() inline {
     return total_tokens - in_flight - set_aside;
 }
 
-int range_hash(int b) inline {
-    cell code = range_code();
-    return state_init_hash(code.cell_hash(), code.cell_depth(), create_range_data(my_address(), b));
-}
-
-int is_range?(slice src, int b) inline {
-    return is_base_addr?(src, range_hash(b));
-}
-
 cell node_data(int level, int index) inline {
     cell code = range_code();
     return create_node_data(my_address(), level, index, code.cell_hash(), code.cell_depth());
@@ -335,6 +326,19 @@ cell node_data(int level, int index) inline {
 int node_hash(int level, int index) inline {
     cell code = node_code();
     return state_init_hash(code.cell_hash(), code.cell_depth(), node_data(level, index));
+}
+
+cell range_data(int b) inline {
+    return create_range_data(my_address(), b, node_hash(1, b >> tree::bits));
+}
+
+int range_hash(int b) inline {
+    cell code = range_code();
+    return state_init_hash(code.cell_hash(), code.cell_depth(), range_data(b));
+}
+
+int is_range?(slice src, int b) inline {
+    return is_base_addr?(src, range_hash(b));
 }
 
 int is_wallet_of?(slice src, slice owner) inline {
@@ -370,10 +374,10 @@ int position(int slot, int j) inline {
     return data.sha256_builder() % draw_l;
 }
 
-;; s = ceil(3·(A−1)·fee::locate·x / draw_L): what a withdrawal held back in the running draw owes for the
-;; retries its empty positions may cause.
+;; s = ceil(3·(A−1)·fee::attempt·x / draw_L): what a withdrawal held back in the running draw owes for the
+;; retries its empty positions may cause, at the gas of one attempt.
 int surcharge(int x) inline {
-    return muldivc(3 * (attempts_per_slot - 1) * fee::locate, x, draw_l);
+    return muldivc(3 * (attempts_per_slot - 1) * fee::attempt, x, draw_l);
 }
 
 () request_quote(int query_id, builder record) impure inline_ref {
@@ -665,7 +669,7 @@ int surcharge(int x) inline {
     l_hi += c;
 
     cell code = range_code();
-    cell data = create_range_data(my_address(), b);
+    cell data = range_data(b);
     builder range = create_address(chain::base, state_init_hash(code.cell_hash(), code.cell_depth(), data));
     ;; Bounceable, b in the query_id and the length first: a setup that fails comes back with what it
     ;; takes to undo the booking (on_bounce).
@@ -673,8 +677,7 @@ int surcharge(int x) inline {
         .store_uint(op::range_setup, 32)
         .store_uint(b, 64)
         .store_coins(c)
-        .store_slice(owner)
-        .store_uint(node_hash(1, b >> tree::bits), 256);
+        .store_slice(owner);
     send_msg(true, range, create_state_init(code, data), setup, fee::range_setup, send::regular);
 
     send_update(b, c, false);
@@ -1142,8 +1145,14 @@ int current_reply?(int draw, int slot, int j, int k) inline {
     claimable~udict_delete?(256, key);
     int amount = prize_amount + other_amount;
     set_aside -= amount;
-    ;; one transfer; should it fail, all of it comes back as a prize when it held one
-    pay(src, amount, prize_amount ? payout::prize : payout::other, 0);
+    ;; one transfer per kind, each recorded under its own kind, so that a bounce returns each amount to
+    ;; its own kind
+    if prize_amount {
+        pay(src, prize_amount, payout::prize, 0);
+    }
+    if other_amount {
+        pay(src, other_amount, payout::other, 0);
+    }
 }
 
 ;; Never throws. Only the recipient's own hGRAM wallet confirms a payout. A gas_excess from the
@@ -1409,13 +1418,13 @@ int current_reply?(int draw, int slot, int j, int k) inline {
 }
 
 ;; The node float: each booking's node share, less the nodes it has opened so far. It follows from n
-;; alone: bookings 0 .. n-1 have opened ceil(n / 64^ℓ) nodes at each level ℓ. Below 0 while the first
-;; nodes, paid from the deploy float, are not yet earned back.
+;; alone: bookings 0 .. n-1 have opened ceil(n / 64^ℓ) nodes at each level ℓ. The first node of each
+;; level was paid from the deploy float, so only max(ceil(n / 64^ℓ) − 1, 0) nodes are counted per level.
 int node_float() inline {
     int float = next_booking * fee::node_share;
     int shift = tree::bits;
     repeat (tree::levels) {
-        float -= ((next_booking + (1 << shift) - 1) >> shift) * fee::node_open;
+        float -= max(((next_booking + (1 << shift) - 1) >> shift) - 1, 0) * fee::node_open;
         shift += tree::bits;
     }
     return float;
@@ -1704,5 +1713,6 @@ var get_jackpot_fees() method_id {
         , fee::requote
         , fee::expire
         , fee::claim
+        , fee::attempt
         );
 }

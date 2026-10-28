@@ -323,13 +323,12 @@ export function updateBody(o: { tag: bigint; deferred: boolean; b: bigint; delta
         .endCell()
 }
 
-export function rangeSetupBody(owner: Address, length: bigint, nodeHash = 0n, b = 0n) {
+export function rangeSetupBody(owner: Address, length: bigint, b = 0n) {
     return beginCell()
         .storeUint(JackpotOp.rangeSetup, 32)
         .storeUint(b, 64)
         .storeCoins(length)
         .storeAddress(owner)
-        .storeUint(nodeHash, 256)
         .endCell()
 }
 
