@@ -60,10 +60,11 @@ _ version:uint8 total_tokens:Coins in_flight:Coins set_aside:Coins principal:Coi
     quote_coins:uint128 quote_tokens:uint128 query_counter:uint32 halted:Bool falling:Bool
     extra:^Extra draw:^Draw addresses:^Addresses books:^Books = JackpotStorage;
 
-// Range storage. The init data, which with the code fixes the address, is the first two fields; the
-// setup adds the rest. node = the address hash of node(1, floor(b / 64)).
+// Range storage. The init data, which with the code fixes the address, is the first three fields;
+// node = the address hash of node(1, floor(b / 64)). The setup appends the booking ref; a range that was
+// never set up is the init data alone, with no ref and no flag bit (the code tests for the ref).
 
-_ jackpot:MsgAddress b:uint32 = RangeInitData;
+_ jackpot:MsgAddress b:uint32 node:uint256 = RangeInitData;
 _ owner:MsgAddress length:Coins live:Coins = Booking;
 _ jackpot:MsgAddress b:uint32 node:uint256 booking:^Booking = RangeStorage;
 
