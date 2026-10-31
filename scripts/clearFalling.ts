@@ -1,5 +1,5 @@
 import { NetworkProvider } from '@ton/blueprint'
-import { askAmount, confirmSend, openJackpot, warnIfNotRole } from './lib/common'
+import { askAmount, confirmSend, openJackpot, warnIfNotRole, done } from './lib/common'
 
 // Clears the "rate fell" flag. Only the governor may. While the flag is up no draw starts, new bookings are
 // refused and prizes are not paid; clear it only after the cause is understood (docs/architecture.md).
@@ -23,5 +23,5 @@ export async function run(provider: NetworkProvider) {
 
     await jackpot.sendClearFalling(via, { value })
 
-    ui.write('Done')
+    done(ui, via)
 }

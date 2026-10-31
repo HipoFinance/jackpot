@@ -1,5 +1,5 @@
 import { NetworkProvider } from '@ton/blueprint'
-import { amount, askAmount, confirmSend, openJackpot, readPool, requireQuiet, warnIfNotRole } from './lib/common'
+import { amount, askAmount, confirmSend, openJackpot, readPool, requireQuiet, warnIfNotRole, done } from './lib/common'
 
 // Sends the Jackpot's GRAM above its storage float to the governor: surcharges and what the keeper's
 // messages left over. The float is 10 GRAM plus the node float.
@@ -18,7 +18,7 @@ export async function run(provider: NetworkProvider) {
     ui.write(`Will be withdrawn: ${amount(surplus)} GRAM`)
 
     // Money in flight draws on the float, so nothing may be open.
-    requireQuiet(await readPool(provider, jackpot), 'Not withdrawing')
+    requireQuiet(await readPool(provider, jackpot, false), 'Not withdrawing')
     if (state.nextBooking === 0n) {
         ui.write(
             'WARNING: there is no booking yet. The first node of each level (1.28 GRAM) is still to be paid, ' +
@@ -42,5 +42,5 @@ export async function run(provider: NetworkProvider) {
 
     await jackpot.sendWithdrawSurplus(via, { value })
 
-    ui.write('Done')
+    done(ui, via)
 }

@@ -2,7 +2,7 @@ import { NetworkProvider } from '@ton/blueprint'
 import { beginCell } from '@ton/core'
 import { buildWitness, currentRound, fetchRound, roundTime } from '../wrappers/drand'
 import { DrawState } from '../wrappers/Jackpot'
-import { amount, askAmount, confirmSend, openJackpot } from './lib/common'
+import { amount, askAmount, confirmSend, openJackpot, done } from './lib/common'
 
 // Sends the drand round the running draw waits for. Anyone may run this; the contract checks the signature
 // on chain, and a wrong signature or witness only costs the sender the gas.
@@ -31,17 +31,24 @@ export async function run(provider: NetworkProvider) {
     const fees = await jackpot.getJackpotFees()
     const value = await askAmount(provider, 'Enter the GRAM to send', amount(fees.submitRandomness))
 
-    const via = await confirmSend(provider, 'Submit the drand randomness', jackpot.address, value, [
-        `draw id:     ${draw.drawId.toString()}`,
-        `round:       ${String(round)}`,
-        `signature:   ${fetched.signature.toString('hex')}`,
-        `randomness:  ${fetched.randomness.toString('hex')} (sha256 of the signature)`,
-    ])
+    const via = await confirmSend(
+        provider,
+        'Submit the drand randomness',
+        jackpot.address,
+        value,
+        [
+            `draw id:     ${draw.drawId.toString()}`,
+            `round:       ${String(round)}`,
+            `signature:   ${fetched.signature.toString('hex')}`,
+            `randomness:  ${fetched.randomness.toString('hex')} (sha256 of the signature)`,
+        ],
+        { allowBody: false },
+    )
     if (via == null) {
         return
     }
 
     await jackpot.sendSubmitRandomness(via, { value, signature, witness })
 
-    ui.write('Done')
+    done(ui, via)
 }

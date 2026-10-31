@@ -15,7 +15,7 @@ export async function run(provider: NetworkProvider) {
     const addresses = await jackpot.getAddresses()
     const books = await jackpot.getBooks()
     const balance = await jackpot.getBalance()
-    const pool = await readPool(provider, jackpot)
+    const pool = await readPool(provider, jackpot, false)
     const [quoteCoins, quoteTokens] = quote
     const free = state.totalTokens - state.inFlight - state.setAside
 

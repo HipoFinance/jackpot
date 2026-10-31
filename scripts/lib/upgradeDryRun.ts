@@ -67,9 +67,15 @@ export async function dryRunUpgrade(live: LiveAccount, newCode: Cell, expectedVe
 
     const governor = blockchain.sender(addresses.governor)
     const value = toNano('0.5')
+    const codeHash = async () => {
+        const account = (await blockchain.getContract(live.address)).accountState
+        return account?.type === 'active' ? account.state.code?.hash().toString('hex') : undefined
+    }
+    const balance = async () => (await blockchain.getContract(live.address)).balance
 
     const up = await jackpot.sendUpgradeCode(governor, { value, code: newCode })
     add('upgrade_code from the governor succeeds', outcome(up, live.address).ok)
+    add('the account now runs the new code', (await codeHash()) === newCode.hash().toString('hex'))
 
     const version = await jackpot.getStorageVersion()
     add(
@@ -102,8 +108,13 @@ export async function dryRunUpgrade(live: LiveAccount, newCode: Cell, expectedVe
         add('every getter parses', false, e instanceof Error ? e.message : String(e))
     }
 
+    // top_up returns early on a current version and keeps the value: the balance must rise.
+    const before = await balance()
     const topUp = await jackpot.sendTopUp(governor, toNano('0.1'))
-    add('a follow-up top_up succeeds', outcome(topUp, live.address).ok)
+    add(
+        'a follow-up top_up succeeds and the balance rises',
+        outcome(topUp, live.address).ok && (await balance()) > before,
+    )
 
     // A requote of a record that does not exist must be refused by the new code with unknown_query (408):
     // that shows its dispatch and handler run, without a record to move.
@@ -115,9 +126,20 @@ export async function dryRunUpgrade(live: LiveAccount, newCode: Cell, expectedVe
         `exit code ${String(r.exitCode)}`,
     )
 
-    const back = await jackpot.sendUpgradeCode(governor, { value, code: live.code })
-    add('an upgrade back to the old code succeeds', outcome(back, live.address).ok)
-    add('the old version is read again', (await jackpot.getStorageVersion()) === versionBefore)
+    if (versionBefore !== expectedVersion) {
+        // The layout changed, so the old code cannot read it: roll forward instead. A second upgrade_code to
+        // the new code proves the new code still routes upgrade_code, and must change neither the version
+        // nor the code.
+        const again = await jackpot.sendUpgradeCode(governor, { value, code: newCode })
+        add('a second upgrade_code to the new code succeeds', outcome(again, live.address).ok)
+        add('the version is unchanged by it', (await jackpot.getStorageVersion()) === expectedVersion)
+        add('the code is unchanged by it', (await codeHash()) === newCode.hash().toString('hex'))
+    } else {
+        const back = await jackpot.sendUpgradeCode(governor, { value, code: live.code })
+        add('an upgrade back to the old code succeeds', outcome(back, live.address).ok)
+        add('the old code runs again', (await codeHash()) === live.code.hash().toString('hex'))
+        add('the version is read again', (await jackpot.getStorageVersion()) === versionBefore)
+    }
 
     return checks
 }

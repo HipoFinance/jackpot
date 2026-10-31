@@ -89,23 +89,45 @@ export async function warnIfNotRole(provider: NetworkProvider, jackpot: JackpotC
             .ui()
             .write(
                 `WARNING: the sending wallet ${sender.toString()} is not the ${role} ${holder.toString()}. ` +
-                    'The Jackpot will refuse this message.',
+                    'If the ' +
+                    role +
+                    ' is a multisig, its signers submit this message (answer "b" to print it); ' +
+                    'sent from this wallet it would be refused.',
             )
     }
 }
 
+const printers = new WeakSet<Sender>()
+
 /** A sender that sends nothing: it prints the message, for the governor's multisig to submit. */
-export function bodyPrinter(ui: UIProvider): Sender {
-    return {
+export function bodyPrinter(ui: UIProvider, notes: string[] = []): Sender {
+    const printer: Sender = {
         send: (args) => {
             ui.write('\nMessage to submit from the governor contract (nothing was sent):')
             ui.write(`  to:     ${args.to.toString()}`)
             ui.write(`  value:  ${amount(args.value)} GRAM`)
             ui.write(`  bounce: ${String(args.bounce ?? true)}`)
             ui.write(`  body:   ${args.body?.toBoc().toString('base64') ?? ''}`)
+            for (const note of notes) {
+                ui.write(`  ${note}`)
+            }
             return Promise.resolve()
         },
     }
+    printers.add(printer)
+    return printer
+}
+
+/** Ends a script: "Done" after a send, and a plain statement after a printed body. */
+export function done(ui: UIProvider, via: Sender) {
+    ui.write(printers.has(via) ? 'Printed, nothing sent.' : 'Done')
+}
+
+export interface ConfirmOptions {
+    /** Lines printed under a body printed with "b": what the order was checked against. */
+    bodyNotes?: string[]
+    /** False for messages anyone may send: there is no multisig path to offer. */
+    allowBody?: boolean
 }
 
 /**
@@ -119,9 +141,10 @@ export async function confirmSend(
     to: Address,
     value: bigint,
     details: string[],
-    question = 'Send this message? [yN], or "b" to only print the body for the governor contract to submit',
+    options: ConfirmOptions = {},
 ): Promise<Sender | null> {
     const ui = provider.ui()
+    const allowBody = options.allowBody ?? true
     ui.write(`\n${title}`)
     ui.write(`  network:  ${provider.network()}`)
     ui.write(`  to:       ${to.toString()}`)
@@ -129,12 +152,15 @@ export async function confirmSend(
     for (const line of details) {
         ui.write(`  ${line}`)
     }
+    const question = allowBody
+        ? 'Send this message? [yN], or "b" to only print the body for the governor contract to submit'
+        : 'Send this message? [yN]'
     const answer = (await ui.input(question)).trim().toLowerCase()
     if (answer === 'y') {
         return provider.sender()
     }
-    if (answer === 'b') {
-        return bodyPrinter(ui)
+    if (answer === 'b' && allowBody) {
+        return bodyPrinter(ui, options.bodyNotes)
     }
     return null
 }
@@ -171,31 +197,65 @@ export async function readTreasuryRoles(provider: NetworkProvider, treasury: Add
 }
 
 export interface Pool {
-    /** The Jackpot's hGRAM wallet balance, W. */
+    /** The Jackpot's hGRAM wallet balance, W; 0 while the wallet does not exist yet. */
     wallet: bigint
     /** T, the hGRAM the Jackpot counts as its own. */
     held: bigint
-    /** W - T: hGRAM in the wallet that the Jackpot does not count. Only this pool may be given out by hand. */
+    /** W - T: hGRAM in the wallet that the Jackpot does not count. Every recovery draws on it. */
     outside: bigint
+    /** The sum of the amounts of all open payout records. */
+    payoutsTotal: bigint
     books: Books
     halted: boolean
     drawState: number
 }
 
-/** Reads W, T and W - T, the books and the draw state, one call at a time. */
-export async function readPool(provider: NetworkProvider, jackpot: JackpotContract): Promise<Pool> {
+/** W, the Jackpot's hGRAM wallet balance: 0 before the first hGRAM arrives, when the wallet is not deployed. */
+export async function readWalletBalance(provider: NetworkProvider, wallet: Address): Promise<bigint> {
+    const walletProvider = provider.provider(wallet)
+    if ((await walletProvider.getState()).state.type !== 'active') {
+        return 0n
+    }
+    const { stack } = await walletProvider.get('get_wallet_data', [])
+    return stack.readBigNumber()
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Reads W, T and W - T, the books and the draw state, one call at a time. With `twice` (the default) W and T
+ * are read a second time about 10 s later and the smaller W - T is used: payouts in transit and mints before
+ * their notification inflate it for a few seconds.
+ */
+export async function readPool(provider: NetworkProvider, jackpot: JackpotContract, twice = true): Promise<Pool> {
     const addresses = await jackpot.getAddresses()
-    const { stack } = await provider.provider(addresses.wallet).get('get_wallet_data', [])
-    const wallet = stack.readBigNumber()
-    const state = await jackpot.getJackpotState()
+    const readOnce = async () => {
+        const wallet = await readWalletBalance(provider, addresses.wallet)
+        const state = await jackpot.getJackpotState()
+        return { wallet, state }
+    }
+    let first = await readOnce()
+    if (twice) {
+        provider.ui().write('Reading the pool twice, 10 seconds apart...')
+        await sleep(10_000)
+        const second = await readOnce()
+        if (second.wallet - second.state.totalTokens < first.wallet - first.state.totalTokens) {
+            first = second
+        }
+    }
     const draw = await jackpot.getDrawState()
     const books = await jackpot.getBooks()
+    let payoutsTotal = 0n
+    for (const p of books.payouts.values()) {
+        payoutsTotal += p.amount
+    }
     return {
-        wallet,
-        held: state.totalTokens,
-        outside: wallet - state.totalTokens,
+        wallet: first.wallet,
+        held: first.state.totalTokens,
+        outside: first.wallet - first.state.totalTokens,
+        payoutsTotal,
         books,
-        halted: state.halted,
+        halted: first.state.halted,
         drawState: draw.state,
     }
 }
@@ -215,9 +275,75 @@ export function printPool(ui: UIProvider, pool: Pool) {
             `  payout ${id.toString()}: ${payoutKindName(p.kind)} ${amount(p.amount)} hGRAM to ${p.recipient.toString()}`,
         )
     }
-    if (pool.books.pending.size + pool.books.payouts.size > 0) {
-        ui.write('  (every record above draws on the same outside pool; give out at most the pool in all)')
+    ui.write(`Open payouts in all:    ${amount(pool.payoutsTotal)} hGRAM`)
+    ui.write('  (open payouts, pending deposits and returns all draw on the same outside pool)')
+}
+
+/**
+ * What a hand recovery may take: W - T less the open payouts, which may still be in transit. The operator
+ * can exclude a payout only by typing its id after checking that it was delivered; each one is shown.
+ * Returns the available amount and the excluded ids.
+ */
+export async function availableOutside(provider: NetworkProvider, pool: Pool) {
+    const ui = provider.ui()
+    let available = pool.outside - pool.payoutsTotal
+    const excluded: bigint[] = []
+    if (pool.books.payouts.size > 0) {
+        const answer = await ui.input(
+            'Open payouts count against the pool. To leave out payouts you have checked were DELIVERED, ' +
+                'type their ids separated by commas (empty: none)',
+        )
+        for (const part of answer
+            .split(',')
+            .map((x) => x.trim())
+            .filter((x) => x !== '')) {
+            const id = BigInt(part)
+            const record = pool.books.payouts.get(id)
+            if (record == null) {
+                throw new Error(`There is no open payout ${part}`)
+            }
+            ui.write(
+                `  excluded payout ${id.toString()}: ${payoutKindName(record.kind)} ${amount(record.amount)} hGRAM ` +
+                    `to ${record.recipient.toString()}`,
+            )
+            available += record.amount
+            excluded.push(id)
+        }
     }
+    return { available, excluded }
+}
+
+/**
+ * Asks whether this is a verify-only run: it re-reads everything and runs every check, prints pass or fail,
+ * and sends nothing. Signers of a multisig order run it just before signing.
+ */
+export async function askVerifyOnly(provider: NetworkProvider): Promise<boolean> {
+    const answer = await provider
+        .ui()
+        .input('Verify only? Answer "v" to run the checks and send nothing, anything else to go on')
+    return answer.trim().toLowerCase() === 'v'
+}
+
+/**
+ * Ends the checks. In a verify-only run it prints pass or fail and returns false; otherwise it throws on a
+ * problem and returns true when there is none.
+ */
+export function conclude(ui: UIProvider, problems: string[], verifyOnly: boolean): boolean {
+    if (verifyOnly) {
+        if (problems.length === 0) {
+            ui.write('\nVERIFY: PASS. Every check holds now. Nothing was sent.')
+        } else {
+            ui.write('\nVERIFY: FAIL. Nothing was sent.')
+            for (const p of problems) {
+                ui.write(`  - ${p}`)
+            }
+        }
+        return false
+    }
+    if (problems.length > 0) {
+        throw new Error(problems.join('; '))
+    }
+    return true
 }
 
 export function payoutKindName(kind: number) {

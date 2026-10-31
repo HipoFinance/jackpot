@@ -102,7 +102,7 @@ positions do not move) and pays a surcharge for the retries it can cause, priced
 
 A draw moves through four states: idle, quoting, waiting for drand, resolving.
 
-1. **Start.** Anyone sends `start_draw`. It is refused unless the draw is idle, the Jackpot is not halted
+1. **Start.** Anyone sends `start_draw`. It is refused unless the draw is idle, the Jackpot is not halted,
    the rate-fell flag is down, and a new validation round has begun since the last start (config parameter 34). The Jackpot asks for a
    quote. On the reply, if the rate has not risen or the pot is below the smallest pot, it goes back to
    idle with nothing changed. If nobody is eligible yet, the start only records the new period (the cutoff moves up, no draw opens, the pot rolls over). Otherwise it fixes the pot, the burn and the three prizes, fixes the drand
@@ -180,6 +180,21 @@ A change must keep all of these.
   raises a flag, starts no draw, books nothing new, and gives prizes back to `F`. Only the governor clears
   the flag (`scripts/clearFalling.ts`).
 
+## Recovery operations and the verify mode
+
+`resolvePending`, `returnTokens` and `settleFailedPayout` all give out hGRAM from one pool: the Jackpot
+wallet's balance W less T (what the Jackpot counts as its own). Open payouts may still be in transit and
+pending mints may land, so the first two check against W - T less every open payout record; an operator can
+leave a payout out only by typing its id after checking that it was delivered, and each excluded record is
+shown. `settleFailedPayout` checks against W - T alone, because the payout it closes is itself a claim on the
+pool. W and T are read twice, about 10 seconds apart, and the smaller W - T is used. A wallet that does not
+exist yet counts as W = 0.
+
+When the governor is a multisig, a printed order (`b`) states the W - T it was checked against and what it
+consumes, and is valid only if no other recovery order is pending. Signers should run the same script with
+`v` at the first prompt just before signing: it re-reads everything, runs every check, prints PASS or FAIL
+and sends nothing.
+
 ## Roles
 
 - **The governor** (Hipo's; a contract, see below) can upgrade the Jackpot's code, set its hGRAM wallet and the Hipo parent and
@@ -207,7 +222,8 @@ halter may be a plain wallet.
 
 The old code calls the new code's `migrate` by its method id, in the same transaction (`set_c3`). So every
 future version must define `migrate` as a `method_id` under exactly that name. `migrate` must keep
-`draw_id` and the draw state, must end with `throw(0)` (so the old code never saves over it), and must
+`draw_id` and the draw state, must end with `throw(0)` (so the old code never saves over it), must accept data
+already at its own version (an upgrade to the same code must succeed; the dry run does exactly that), and must
 never lower `draw_id`: nodes compare it with the tag of each
 message to decide what is held back. If `migrate` cannot read the stored layout, the transaction throws
 and the old code and data stay. Range and node code cannot be upgraded.

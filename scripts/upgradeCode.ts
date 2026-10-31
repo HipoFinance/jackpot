@@ -2,7 +2,7 @@ import { execFileSync } from 'child_process'
 import { Cell } from '@ton/core'
 import { compile, NetworkProvider } from '@ton/blueprint'
 import { storageVersion } from '../wrappers/Jackpot'
-import { askAmount, confirmSend, hashes, openJackpot, typeBackHash, warnIfNotRole } from './lib/common'
+import { askAmount, confirmSend, hashes, openJackpot, typeBackHash, warnIfNotRole, done } from './lib/common'
 import { dryRunUpgrade } from './lib/upgradeDryRun'
 
 // Upgrades the Jackpot's code. The old code calls the new code's `migrate` (a method_id, ending in throw(0))
@@ -15,9 +15,13 @@ export async function run(provider: NetworkProvider) {
     const ui = provider.ui()
     const jackpot = await openJackpot(provider)
 
-    const dirty = execFileSync('git', ['status', '--porcelain', 'contracts/'], { encoding: 'utf8' }).trim()
+    const dirty = execFileSync('git', ['status', '--porcelain', 'contracts/', 'wrappers/Jackpot.ts'], {
+        encoding: 'utf8',
+    }).trim()
     if (dirty !== '') {
-        throw new Error(`contracts/ has uncommitted changes, so the build is not the audited one:\n${dirty}`)
+        throw new Error(
+            `contracts/ or wrappers/Jackpot.ts (where storageVersion lives) has uncommitted changes, so the build is not the audited one:\n${dirty}`,
+        )
     }
     const head = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
 
@@ -83,5 +87,5 @@ export async function run(provider: NetworkProvider) {
 
     await jackpot.sendUpgradeCode(via, { value, code: newCode })
 
-    ui.write('Done')
+    done(ui, via)
 }

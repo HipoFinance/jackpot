@@ -11,6 +11,7 @@ import {
     readWalletCode,
     requireQuiet,
     warnIfNotRole,
+    done,
 } from './lib/common'
 
 // Points the Jackpot at a new Hipo parent, its hGRAM wallet and the wallet code, for when Hipo migrates its
@@ -57,5 +58,5 @@ export async function run(provider: NetworkProvider) {
 
     await jackpot.sendSetHipoWallet(via, { value, parent, wallet, walletCode })
 
-    ui.write('Done')
+    done(ui, via)
 }

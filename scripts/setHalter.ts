@@ -1,5 +1,5 @@
 import { NetworkProvider } from '@ton/blueprint'
-import { askAddress, askAmount, confirmSend, openJackpot, warnIfNotRole } from './lib/common'
+import { askAddress, askAmount, confirmSend, openJackpot, warnIfNotRole, done } from './lib/common'
 
 export async function run(provider: NetworkProvider) {
     const ui = provider.ui()
@@ -21,5 +21,5 @@ export async function run(provider: NetworkProvider) {
 
     await jackpot.sendSetHalter(via, { value, halter })
 
-    ui.write('Done')
+    done(ui, via)
 }

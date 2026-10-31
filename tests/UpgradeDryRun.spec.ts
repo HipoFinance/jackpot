@@ -6,6 +6,7 @@ import '@ton/test-utils'
 import { storageVersion } from '../wrappers/Jackpot'
 import { dryRunUpgrade, LiveAccount } from '../scripts/lib/upgradeDryRun'
 import { Env, setupJackpot } from './jackpot/setup'
+import { compileJackpotV2 } from './jackpot/v2'
 
 async function liveAccount(env: Env): Promise<LiveAccount> {
     const contract = await env.blockchain.getContract(env.jackpot.address)
@@ -42,5 +43,23 @@ describe('The upgrade dry run', () => {
         const probe = await compile('UpgradeProbe')
         const other = await dryRunUpgrade(account, probe, storageVersion)
         expect(other.some((c) => !c.ok)).toBe(true)
+    })
+
+    it('passes for a real layout bump from version 1 to version 2', async () => {
+        const env = await setupJackpot({ fakeTreasury: true })
+        await env.jackpot.sendSetHalted(env.halter.getSender(), { value: toNano('0.1'), halted: true })
+        const v2 = await compileJackpotV2()
+        const checks = await dryRunUpgrade(await liveAccount(env), v2, 2)
+        expect(checks.filter((c) => !c.ok)).toEqual([])
+        // the roll-forward checks ran, not the rollback
+        expect(checks.some((c) => c.name.startsWith('a second upgrade_code'))).toBe(true)
+        expect(checks.some((c) => c.name.startsWith('an upgrade back'))).toBe(false)
+    })
+
+    it('fails when the build claims version 2 but the code only writes version 1', async () => {
+        const env = await setupJackpot({ fakeTreasury: true })
+        await env.jackpot.sendSetHalted(env.halter.getSender(), { value: toNano('0.1'), halted: true })
+        const checks = await dryRunUpgrade(await liveAccount(env), env.jackpot.init!.code, 2)
+        expect(checks.some((c) => c.name.includes('version') && !c.ok)).toBe(true)
     })
 })

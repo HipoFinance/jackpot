@@ -1,6 +1,6 @@
 import { NetworkProvider } from '@ton/blueprint'
 import { Sender } from '@ton/core'
-import { amount, askAmount, askInteger, confirmSend, openJackpot, warnIfNotRole } from './lib/common'
+import { amount, askAmount, askInteger, confirmSend, openJackpot, warnIfNotRole, done } from './lib/common'
 
 // Sets one governor parameter: burn share, smallest pot, burn batch or minimum deposit. Run it again for
 // the next one. The contract refuses a burn share above 2000 basis points and a minimum deposit below 1.
@@ -53,5 +53,5 @@ export async function run(provider: NetworkProvider) {
 
     await send(via, value)
 
-    ui.write('Done')
+    done(ui, via)
 }
