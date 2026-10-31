@@ -302,6 +302,10 @@ export async function availableOutside(provider: NetworkProvider, pool: Pool) {
             if (record == null) {
                 throw new Error(`There is no open payout ${part}`)
             }
+            // a repeated id would count its amount twice and let more out than the pool holds
+            if (excluded.includes(id)) {
+                throw new Error(`Payout ${part} was typed twice`)
+            }
             ui.write(
                 `  excluded payout ${id.toString()}: ${payoutKindName(record.kind)} ${amount(record.amount)} hGRAM ` +
                     `to ${record.recipient.toString()}`,
