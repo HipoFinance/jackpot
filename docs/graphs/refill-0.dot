@@ -1,0 +1,18 @@
+digraph {
+  graph [ rankdir=TB nodesep=0.5 ranksep=0.55 pad="0.3,0.1" bgcolor=transparent fontname="Arial" ]
+  node [ shape=box style="rounded,filled" fontname="Arial" fontsize=13 margin="0.14,0.08" ]
+  edge [ fontname="Arial" fontsize=11 arrowsize=0.7 ]
+  "frank" [ label="Frank" class="n-person" ]
+  "jackpot" [ label="Jackpot" class="n-jackpot" ]
+  "jackpotHgram" [ label="Jackpot's\nhGRAM wallet" class="n-hgram" ]
+  "parent" [ label="Hipo parent" class="n-hipo" ]
+  "treasury" [ label="Hipo treasury" class="n-hipo" ]
+  "frank" -> "jackpot" [ label="1\lop::refill\l" class="e-msg" ]
+  "jackpot" -> "jackpotHgram" [ label="2\lop::unstake_tokens\ltokens: 3.717\l" class="e-token" ]
+  "jackpot" -> "frank" [ label="3\lop::gas_excess\l" class="e-gas" ]
+  "jackpotHgram" -> "parent" [ label="4\lop::proxy_reserve_tokens\ltokens: 3.717\l" class="e-msg" ]
+  "parent" -> "treasury" [ label="5\lop::reserve_tokens\ltokens: 3.717\l" class="e-msg" ]
+  "treasury" -> "parent" [ label="6\lop::proxy_tokens_burned\ltokens: 3.717\l" class="e-msg" ]
+  "parent" -> "jackpotHgram" [ label="7\lop::tokens_burned\ltokens: 3.717\l" class="e-token" ]
+  "jackpotHgram" -> "jackpot" [ label="8\lop::withdrawal_notification\ltokens: 3.717\lGRAM: 3.72\l" class="e-token" ]
+}

@@ -4,16 +4,19 @@
     "license": "MIT",
     "private": true,
     "scripts": {
-        "lint": "eslint . --max-warnings 0",
+        "lint": "eslint . --max-warnings 0 && node tools/lintNames.mjs",
         "typecheck": "tsc --noEmit",
         "start": "blueprint run",
         "build": "blueprint build",
         "pretest": "npm run typecheck",
         "test": "jest --verbose",
-        "check": "npm run typecheck && npm run lint && jest"
+        "check": "npm run typecheck && npm run lint && jest",
+        "graphs": "UPDATE_GRAPHS=1 jest tests/story --maxWorkers=1 && ts-node scripts/graphs/render.ts",
+        "graphs:check": "jest tests/story --maxWorkers=1"
     },
     "devDependencies": {
         "@eslint/js": "^10.0.1",
+        "@hpcc-js/wasm-graphviz": "1.13.0",
         "@testing-library/jest-dom": "^6.9.1",
         "@ton/blueprint": "^0.45.0",
         "@ton/core": "^0.63.1",

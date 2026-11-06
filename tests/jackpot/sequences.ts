@@ -73,6 +73,8 @@ export interface World {
     snapshot: BlockchainSnapshot
     // the number of cells of the Jackpot's data at deploy, content aside: it must never change
     dataCells: number
+    // the bits of the data that are not Coins fields, at deploy: they never change
+    fixedBits: number
     // counts the per-transaction checks when the stepper is installed
     mid: { count: number }
 }
@@ -89,6 +91,54 @@ function cellsOf(root: Cell, skip: Cell) {
     }
     walk(root)
     return seen.size
+}
+
+// The bits of the Jackpot's data (content aside) with the Coins fields at their width now and at full width. Everything
+// else is fixed: the data may never be larger than the same layout with every Coins field at its maximum, 124 bits.
+const fullCoins = 124
+function dataShape(root: Cell, content: Cell) {
+    const skip = content.hash().toString('hex')
+    const total = (c: Cell): number => {
+        if (c.hash().toString('hex') === skip) return 0
+        return c.bits.length + c.refs.reduce((a, r) => a + total(r), 0)
+    }
+    const bits = total(root)
+    let coins = 0
+    let coinBits = 0
+    const lc = (s: ReturnType<Cell['beginParse']>) => {
+        const o = s.remainingBits
+        s.loadCoins()
+        coinBits += o - s.remainingBits
+        coins++
+    }
+    const s = root.beginParse()
+    s.skip(8)
+    for (let i = 0; i < 5; i++) lc(s) // held, incoming, reserved, principal, tickets
+    s.skip(128 + 128 + 32 + 1 + 1)
+    const extra = s.loadRef().beginParse()
+    const draw = s.loadRef().beginParse()
+    s.loadRef() // addresses
+    const retirement = s.loadRef().beginParse()
+    for (let i = 0; i < 3; i++) lc(extra) // burn_owed, carried, unstaking
+    extra.skip(64)
+    const params = extra.loadRef().beginParse()
+    params.skip(16)
+    for (let i = 0; i < 3; i++) lc(params)
+    draw.skip(2)
+    lc(draw) // snapshot_tickets
+    draw.skip(256 + 32 + 256)
+    const misc = draw.loadRef().beginParse()
+    for (let i = 0; i < 3; i++) lc(misc)
+    retirement.skip(1)
+    retirement.loadMaybeAddress()
+    lc(retirement) // successor_deposit_fee
+    return { bits, coins, coinBits, fixed: bits - coinBits }
+}
+
+async function dataBits(env: Env) {
+    const c = await env.blockchain.getContract(env.jackpot.address)
+    if (c.accountState?.type !== 'active') throw new Error('the Jackpot is not active')
+    return dataShape(c.accountState.state.data!, (await env.jackpot.getJettonData()).content)
 }
 
 async function dataCells(env: Env) {
@@ -151,7 +201,7 @@ export async function makeWorld(): Promise<World> {
     await env.jackpot.sendSetMinPot(env.governor.getSender(), { value: toNano('0.05'), minPot: 1n })
     const mid = { count: 0 }
     if (process.env.PROPERTY_EACH_TX) installStepper(env, mid)
-    return { env, players, snapshot: env.blockchain.snapshot(), dataCells: await dataCells(env), mid }
+    return { env, players, snapshot: env.blockchain.snapshot(), dataCells: await dataCells(env), fixedBits: (await dataBits(env)).fixed, mid }
 }
 
 export interface Result {
@@ -294,6 +344,11 @@ export async function runSequence(world: World, seed: number, steps = 16): Promi
         const cells = await dataCells(env)
         if (cells !== world.dataCells)
             fail(`${what}: the data has ${cells.toString()} cells, not ${world.dataCells.toString()}`)
+        // and no more bits than with every Coins field at full width: all that is not a Coins field is fixed
+        const shape = await dataBits(env)
+        if (shape.fixed !== world.fixedBits) fail(`${what}: the fixed bits of the data moved: ${shape.fixed.toString()} != ${world.fixedBits.toString()}`)
+        if (shape.coins !== 16) fail(`${what}: ${shape.coins.toString()} Coins fields, not 16`)
+        if (shape.bits > world.fixedBits + shape.coins * fullCoins) fail(`${what}: the data has more bits than at full width`)
         // the tree: committed + added - removed of each position is its balance, and the top node is the principal
         const nodeState = await env.blockchain.getContract(nodeAt(env, 1, 0n).address)
         if (nodeState.accountState?.type === 'active') {

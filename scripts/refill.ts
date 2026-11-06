@@ -17,7 +17,7 @@ export async function run(provider: NetworkProvider) {
     ui.write(
         `Float:          ${amount(balance)} GRAM (draw budget ${amount(fees.drawBudget)}, low mark ${amount(fees.floatLow)})`,
     )
-    ui.write(`U:              ${amount(state.unstakingTokens)} hGRAM`)
+    ui.write(`unstaking_tokens: ${amount(state.unstakingTokens)} hGRAM`)
 
     if (balance >= fees.drawBudget) {
         ui.write('The float covers the draw budget. The Jackpot would refuse this message. Nothing to do.')

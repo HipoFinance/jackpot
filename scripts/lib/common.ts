@@ -295,11 +295,11 @@ export async function readPool(provider: NetworkProvider, jackpot: JackpotContra
 
 /** Prints W, T and W - T, the pool every recovery draws on. */
 export function printPool(ui: UIProvider, pool: Pool) {
-    ui.write(`Jackpot wallet W:      ${amount(pool.wallet)} hGRAM`)
-    ui.write(`Counted as T:          ${amount(pool.held)} hGRAM (of which incoming ${amount(pool.incoming)})`)
-    ui.write(`Outside T (W - T):     ${amount(pool.outside)} hGRAM`)
-    ui.write(`Unstaking at Hipo:     ${amount(pool.unstaking)} hGRAM (in neither W nor T)`)
-    ui.write('  (a prize or burn still in transit also shows in W - T; the lower of two reads is used)')
+    ui.write(`Jackpot's hGRAM wallet: ${amount(pool.wallet)} hGRAM`)
+    ui.write(`Counted (held_tokens):  ${amount(pool.held)} hGRAM (of which incoming ${amount(pool.incoming)})`)
+    ui.write(`Untracked hGRAM:        ${amount(pool.outside)} hGRAM`)
+    ui.write(`Unstaking at Hipo:     ${amount(pool.unstaking)} hGRAM (in neither the wallet nor held_tokens)`)
+    ui.write('  (a prize or burn still in transit also shows as untracked; the lower of two reads is used)')
 }
 
 /**

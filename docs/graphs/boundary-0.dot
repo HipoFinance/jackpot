@@ -1,0 +1,14 @@
+digraph {
+  graph [ rankdir=TB nodesep=0.5 ranksep=0.55 pad="0.3,0.1" bgcolor=transparent fontname="Arial" ]
+  node [ shape=box style="rounded,filled" fontname="Arial" fontsize=13 margin="0.14,0.08" ]
+  edge [ fontname="Arial" fontsize=11 arrowsize=0.7 ]
+  "keeper" [ label="keeper" class="n-person" ]
+  "jackpot" [ label="Jackpot" class="n-jackpot" ]
+  "treasury" [ label="Hipo treasury" class="n-hipo" ]
+  "jackpotHgram" [ label="Jackpot's\nhGRAM wallet" class="n-hgram" ]
+  "keeper" -> "jackpot" [ label="1\lop::poke\l" class="e-msg" ]
+  "jackpot" -> "treasury" [ label="2\lop::provide_current_quote\lpoke context in custom_payload\l" class="e-msg" ]
+  "treasury" -> "jackpot" [ label="3\lop::take_current_quote\lrate: 1.000620\l" class="e-msg" ]
+  "jackpot" -> "jackpotHgram" [ label="4\lop::unstake_tokens\ltokens: 7.495\l" class="e-token" ]
+  "jackpot" -> "keeper" [ label="5\lop::gas_excess\l" class="e-gas" ]
+}

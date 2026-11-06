@@ -61,6 +61,10 @@ anyone can **sweep**, bringing the cost of closing the tree with the message (`g
 `withdrawFor`, `closeSubtree`, `upgradeCode`). Each prints the message and asks before it sends anything. See
 [`docs/architecture.md`](docs/architecture.md).
 
+`npm run graphs` runs the message-graph story in the sandbox and writes `docs/graphs/` (DOT and light and dark SVG) and
+[`docs/message-graphs.md`](docs/message-graphs.md), one numbered graph per step of a deposit, a boundary, a draw, a
+withdrawal and the end; `npm test` runs the same story and fails when the committed graphs differ from it (`SKIP_GRAPHS=1` skips that).
+
 > **Terminology.** GRAM is the network coin (rebranded from TON) and hGRAM is Hipo's jetton. The
 > blockchain itself is still called TON.
 

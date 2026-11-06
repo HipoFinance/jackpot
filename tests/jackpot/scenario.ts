@@ -297,3 +297,33 @@ export async function setUnstaking(env: Env, amount: bigint) {
     state.state.data = nb.endCell()
     await env.blockchain.setShardAccount(env.jackpot.address, acc)
 }
+
+// Deploys every node over the positions below n by a forged update from its parent (a sum of 0), with its balance set
+// to the storage reserve and nothing spare, and sets the Jackpot's next_position to n. Returns the nodes.
+export async function buildTree(env: Env, n: number, reserve = toNano('0.15')) {
+    const { nodeAt } = await import('./setup')
+    await setNextPosition(env, BigInt(n))
+    const span = [64, 4096, 262144, 16777216]
+    const list: { level: number; index: number }[] = []
+    for (let level = 1; level <= 4; level++) {
+        for (let i = 0; i < Math.ceil(n / span[level - 1]); i++) list.push({ level, index: i })
+    }
+    for (const { level, index } of list) {
+        const node = nodeAt(env, level, BigInt(index))
+        const parent = level === 4 ? env.jackpot.address : nodeAt(env, level + 1, BigInt(index >> 6)).address
+        const body = beginCell()
+            .storeUint(JackpotOp.update, 32)
+            .storeUint(0, 64)
+            .storeUint(0, 32)
+            .storeUint(BigInt(index) << BigInt(6 * level), 32)
+            .storeInt(0, 128)
+            .storeBit(false)
+            .endCell()
+        await env.blockchain.sendMessage({
+            ...messageFrom(parent, node.address, toNano('1'), body, false),
+            init: node.init,
+        })
+        await setBalance(env, node.address, reserve)
+    }
+    return list
+}

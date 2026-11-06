@@ -1,0 +1,14 @@
+digraph {
+  graph [ rankdir=TB nodesep=0.5 ranksep=0.55 pad="0.3,0.1" bgcolor=transparent fontname="Arial" ]
+  node [ shape=box style="rounded,filled" fontname="Arial" fontsize=13 margin="0.14,0.08" ]
+  edge [ fontname="Arial" fontsize=11 arrowsize=0.7 ]
+  "jackpotHgram" [ label="Jackpot's\nhGRAM wallet" class="n-hgram" ]
+  "parent" [ label="Hipo parent" class="n-hipo" ]
+  "treasury" [ label="Hipo treasury" class="n-hipo" ]
+  "jackpot" [ label="Jackpot" class="n-jackpot" ]
+  "jackpotHgram" -> "parent" [ label="6\lop::proxy_reserve_tokens\ltokens: 7.495\l" class="e-msg" ]
+  "parent" -> "treasury" [ label="7\lop::reserve_tokens\ltokens: 7.495\l" class="e-msg" ]
+  "treasury" -> "parent" [ label="8\lop::proxy_tokens_burned\ltokens: 7.495\l" class="e-msg" ]
+  "parent" -> "jackpotHgram" [ label="9\lop::tokens_burned\ltokens: 7.495\l" class="e-token" ]
+  "jackpotHgram" -> "jackpot" [ label="10\lop::withdrawal_notification\ltokens: 7.495\lGRAM: 7.5\l" class="e-token" ]
+}

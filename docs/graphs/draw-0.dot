@@ -1,0 +1,17 @@
+digraph {
+  graph [ rankdir=TB nodesep=0.5 ranksep=0.55 pad="0.3,0.1" bgcolor=transparent fontname="Arial" ]
+  node [ shape=box style="rounded,filled" fontname="Arial" fontsize=13 margin="0.14,0.08" ]
+  edge [ fontname="Arial" fontsize=11 arrowsize=0.7 ]
+  "keeper" [ label="keeper" class="n-person" ]
+  "jackpot" [ label="Jackpot" class="n-jackpot" ]
+  "node4" [ label="node level 4" class="n-node" ]
+  "node3" [ label="node level 3" class="n-node" ]
+  "node2" [ label="node level 2" class="n-node" ]
+  "node1" [ label="node level 1" class="n-node" ]
+  "keeper" -> "jackpot" [ label="1\lop::submit_randomness\l" class="e-msg" ]
+  "jackpot" -> "node4" [ label="2, 3, 4\lop::descend\lprizes 1, 2, 3, try 1\l" class="e-msg" ]
+  "jackpot" -> "keeper" [ label="5\lop::gas_excess\l" class="e-gas" ]
+  "node4" -> "node3" [ label="6, 7, 8\lop::descend\lprizes 1, 2, 3, try 1\l" class="e-msg" ]
+  "node3" -> "node2" [ label="9, 10, 11\lop::descend\lprizes 1, 2, 3, try 1\l" class="e-msg" ]
+  "node2" -> "node1" [ label="12, 13, 14\lop::descend\lprizes 1, 2, 3, try 1\l" class="e-msg" ]
+}

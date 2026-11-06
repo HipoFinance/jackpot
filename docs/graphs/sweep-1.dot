@@ -1,0 +1,18 @@
+digraph {
+  graph [ rankdir=TB nodesep=0.5 ranksep=0.55 pad="0.3,0.1" bgcolor=transparent fontname="Arial" ]
+  node [ shape=box style="rounded,filled" fontname="Arial" fontsize=13 margin="0.14,0.08" ]
+  edge [ fontname="Arial" fontsize=11 arrowsize=0.7 ]
+  "jackpot" [ label="Jackpot" class="n-jackpot" ]
+  "node4" [ label="node level 4" class="n-node" ]
+  "node3" [ label="node level 3" class="n-node" ]
+  "node2" [ label="node level 2" class="n-node" ]
+  "node1" [ label="node level 1" class="n-node" ]
+  "jackpot" -> "node4" [ label="3\lop::close_node\lnext_position: 3\lthe node deletes itself\l" class="e-msg" ]
+  "node4" -> "node3" [ label="6\lop::close_node\lnext_position: 3\lthe node deletes itself\l" class="e-msg" ]
+  "node4" -> "jackpot" [ label="7\lop::gas_excess\l" class="e-gas" ]
+  "node3" -> "node2" [ label="10\lop::close_node\lnext_position: 3\lthe node deletes itself\l" class="e-msg" ]
+  "node3" -> "jackpot" [ label="11\lop::gas_excess\l" class="e-gas" ]
+  "node2" -> "node1" [ label="12\lop::close_node\lnext_position: 3\lthe node deletes itself\l" class="e-msg" ]
+  "node2" -> "jackpot" [ label="13\lop::gas_excess\l" class="e-gas" ]
+  "node1" -> "jackpot" [ label="14\lop::gas_excess\l" class="e-gas" ]
+}

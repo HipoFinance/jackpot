@@ -12,7 +12,7 @@ export async function run(provider: NetworkProvider) {
     const [coins, tokens] = await jackpot.getQuote()
     ui.write(`Rate fell flag: ${String(state.falling)}`)
     ui.write(`Stored quote:   ${String(coins)} nano-GRAM / ${String(tokens)} nano-hGRAM`)
-    ui.write(`Needs covering: ${String(state.principal)} nano-GRAM of principal (P)`)
+    ui.write(`Needs covering: ${String(state.principal)} nano-GRAM of principal`)
 
     await warnIfNotRole(provider, jackpot, 'governor')
     const value = await askAmount(provider, 'Enter the GRAM to send', '0.1')

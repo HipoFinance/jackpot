@@ -4,6 +4,19 @@ What changed in Hipo Jackpot, newest first.
 
 ## Unreleased
 
+- Verification tests for the criteria that were open (`tests/Verification.spec.ts`): the boundary rule at the exact
+  threshold, 1,000 pokes, a placed boundary, the deposit, burn and `w` chains, every bounceable message's `extra_flags`,
+  the Failures table row by row, a bounced `deposit_booked`, the rate in exact fractions, the end of the tree (the excess,
+  a node with a sum, `withdraw_surplus`, the order, the split to the nano-GRAM) and the value returned. The property run
+  also asserts the data's full-width bits bound. `tools/lintNames.mjs` (in `npm run lint`) fails on a lone T, I, O, F, U,
+  P, L or G in contracts, wrappers, the docs' prose and the scripts' output; the scripts and docs were renamed to match.
+  `npm test` now runs the message-graph story. Still open: the long runs and `migrate`.
+- Message graphs (spec §13): `tests/story/story.spec.ts` runs one story against the amended contracts and Hipo's real
+  contracts, `scripts/graphs/` turns its transactions into DOT (`dot.ts`), renders light and dark SVG with
+  `@hpcc-js/wasm-graphviz` 1.13.0 (`render.ts`) and writes `docs/message-graphs.md` (`markdown.ts`, `captions.ts`).
+  `npm run graphs` writes `docs/graphs/` and the page; `npm test` runs the story too (about a minute) and fails on a
+  difference (`SKIP_GRAPHS=1` skips it). The prototype's Python is not kept; labels carry no
+  GRAM value, `query_id` or lt, so they do not move with gas prices.
 - R1 from the re-check: a move chosen on the value left now keeps its forward fields (it could be chosen and then sent
   without them, leaving the hGRAM untracked at the successor); the refund guards judge the value left; the governor's
   move comment says "moved" only with a successor; `closeSubtree` refuses a frozen node; the dry run compares the halted

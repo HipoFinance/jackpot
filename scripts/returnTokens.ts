@@ -32,7 +32,7 @@ export async function run(provider: NetworkProvider) {
     ui.write(
         inFlight
             ? `Available for this recovery: ${amount(available)} hGRAM (the incoming count)`
-            : `Available for this recovery: ${amount(available)} hGRAM (W - T)`,
+            : `Available for this recovery: ${amount(available)} hGRAM (untracked hGRAM)`,
     )
 
     // askAddress refuses an address that is not on the basechain
@@ -59,11 +59,11 @@ export async function run(provider: NetworkProvider) {
             `to:          ${owner.toString()}`,
             `amount:      ${amount(tokens)} hGRAM`,
             `in flight:   ${String(inFlight)}`,
-            `available:   ${amount(available)} hGRAM (W - T = ${amount(pool.outside)}, incoming ${amount(pool.incoming)})`,
+            `available:   ${amount(available)} hGRAM (untracked ${amount(pool.outside)}, incoming ${amount(pool.incoming)})`,
         ],
         {
             bodyNotes: [
-                `checked against ${inFlight ? 'the incoming count' : 'W - T'} = ${amount(available)} hGRAM`,
+                `checked against ${inFlight ? 'the incoming count' : 'the untracked hGRAM'} = ${amount(available)} hGRAM`,
                 `this order consumes ${amount(tokens)} hGRAM of it`,
                 'valid only if no other recovery order is pending: rerun this script with "v" just before signing',
             ],

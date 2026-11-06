@@ -208,7 +208,7 @@ submits for waits, and the next boundary skips it.
 The Jackpot sends hGRAM (prizes, burn, withdrawals, refunds) and **does not wait to hear that it arrived**. It keeps
 no record of a payout. Almost always the recipient's wallet takes it. In the rare case that it does not, the hGRAM comes
 back to the Jackpot's wallet, outside `held_tokens` and counted nowhere; the governor sends it on with `return_tokens`.
-`scripts/showState.ts` prints it as untracked (W - T).
+`scripts/showState.ts` prints it as untracked (the wallet's balance less `held_tokens`).
 
 Every bounceable message the Jackpot and its wallets send sets `extra_flags = 3`, which asks for a **full-body
 bounce**: `new_bounce_body#fffffffe`, with the whole original body as a ref. So a bounce of `prepare_deposit`,
@@ -394,10 +394,10 @@ A change must keep all of these.
 
 ## Recovery operations and the verify mode
 
-`returnTokens` gives out hGRAM from one pool: the Jackpot wallet's balance W less `held_tokens` T (what the Jackpot
+`returnTokens` gives out hGRAM from one pool: the Jackpot wallet's balance less `held_tokens` (what the Jackpot
 counts as its own), or, with `in_flight`, from the incoming count. Because the Jackpot keeps no record of its payouts,
-a prize or burn still on its way also shows in W - T. W and T are read twice, about 10 seconds apart, and the smaller
-W - T is used; a recovery should wait until nothing is in transit. A wallet that does not exist yet counts as W = 0.
+a prize or burn still on its way also shows as untracked. The wallet's balance and `held_tokens` are read twice, about 10 seconds apart, and the smaller
+untracked figure is used; a recovery should wait until nothing is in transit. A wallet that does not exist yet counts as a balance of 0.
 
 When the governor is a multisig, a printed order (`b`) states what it was checked against and what it consumes, and is
 valid only if no other recovery order is pending. Signers should run the same script with `v` at the first prompt
@@ -455,7 +455,7 @@ Wallet and node code cannot be upgraded.
   - the top node's `committed + added - removed` must equal `tickets` once settled (`get_node_data`,
     `get_jackpot_state`). A difference means an update was lost.
   - `unstaking_tokens > 0` past two rounds: check the wallet, then `scripts/settleUnstake.ts`.
-  - hGRAM outside `held_tokens` (W - T): a payout that came back, to return with `scripts/returnTokens.ts`.
+  - hGRAM outside `held_tokens` (the untracked hGRAM): a payout that came back, to return with `scripts/returnTokens.ts`.
   - the fees are sized at 400 nano-GRAM per gas unit; mainnet config 21 is 66.67. Re-measure if the price rises.
 - **The tree:** watch `next_position`. At 16,777,216 positions new wallets get their tokens back, and existing wallets,
   withdrawals and draws go on.

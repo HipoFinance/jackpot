@@ -1,0 +1,9 @@
+digraph {
+  graph [ rankdir=TB nodesep=0.5 ranksep=0.55 pad="0.3,0.1" bgcolor=transparent fontname="Arial" ]
+  node [ shape=box style="rounded,filled" fontname="Arial" fontsize=13 margin="0.14,0.08" ]
+  edge [ fontname="Arial" fontsize=11 arrowsize=0.7 ]
+  "governor" [ label="governor" class="n-person" ]
+  "jackpot" [ label="Jackpot" class="n-jackpot" ]
+  "governor" -> "jackpot" [ label="1\lop::retire\l" class="e-msg" ]
+  "governor" -> "jackpot" [ label="2\lop::set_successor\lsuccessor: new Jackpot (successor)\ldeposit fee: 0.6017 GRAM\l" class="e-msg" ]
+}

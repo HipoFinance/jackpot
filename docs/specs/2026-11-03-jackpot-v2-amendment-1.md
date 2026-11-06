@@ -1470,205 +1470,268 @@ The v2 criteria hold except those listed as removed at the top.
 
 **Boundaries and the draw**
 
-- [ ] **The rule.** In the sandbox, a poke's reply is a boundary exactly when the rate has risen by `rise_min` over the
+- [x] **The rule.** In the sandbox, a poke's reply is a boundary exactly when the rate has risen by `rise_min` over the
       boundary rate, `min_gap` has passed since the last boundary, and neither the falling flag nor `halted` is set. A
       rise one part per million short, a reply one second early, a falling reply and a halted Jackpot each give no
       boundary, and the reply still stores its rate.
-- [ ] **Pokes.** A thousand pokes with no qualifying rise change nothing but the stored rate; each costs only its
+      <!-- evidence: Verification "The rule, at the threshold" (49 ppm: no boundary; exactly 50 ppm: boundary; halted: rate stored, no boundary); Boundaries "First boundary…" (the reply one second early); Attacks "falling rate…" -->
+- [x] **Pokes.** A thousand pokes with no qualifying rise change nothing but the stored rate; each costs only its
       sender's gas, and the Jackpot's balance does not fall.
-- [ ] **No hidden reward.** A poke whose reply is a boundary returns its poker the same GRAM, within 0.002 GRAM, as one
+      <!-- evidence: Verification "Pokes" (1,000 pokes: only the stored rate, the Jackpot’s balance never falls after the first poke, which pays the storage rent of the time jump) -->
+- [x] **No hidden reward.** A poke whose reply is a boundary returns its poker the same GRAM, within 0.002 GRAM, as one
       whose reply is not. The float falls by the boundary's measured gas, plus `fee::unstake` when it unstakes, and never
       by more than `fee::boundary_max` plus `fee::unstake`.
-- [ ] **Low float.** At a boundary with the float below `fee::unstake`, `u` is 0, the pot is set aside whole, and nothing
+      <!-- evidence: Gas.spec "No hidden reward…" and "fee::boundary_max (gas units) covers the worst measured boundary…" -->
+- [x] **Low float.** At a boundary with the float below `fee::unstake`, `u` is 0, the pot is set aside whole, and nothing
       throws.
-- [ ] **Placing a boundary gains nothing.** A `gift_coins` of `rise_min` × Hipo's coins after `min_gap` makes the next
+      <!-- evidence: Boundaries "Low float…" -->
+- [x] **Placing a boundary gains nothing.** A `gift_coins` of `rise_min` × Hipo's coins after `min_gap` makes the next
       poke a boundary; so does a poke between two loans' parts of one round's reward. Over many seeds, every player's
       mean result, the gifter's or the poker's included, is the same with and without the placed boundary, within
       sampling error, apart from the gift itself.
-- [ ] **The pot is fixed before the seed.** At a boundary, `reserved_tokens` rises by the pot computed at the reply's
+      <!-- evidence: Verification "Placing a boundary gains nothing" (every player’s share of the pots equal in exact fractions with and without the placed boundary; the sampled mean of the placed draw at PLACED_SEEDS, 6 by default, a long run raises it) -->
+- [x] **The pot is fixed before the seed.** At a boundary, `reserved_tokens` rises by the pot computed at the reply's
       rate, the `boundary_log` records that rate and pot, and `R` is the first round at or after the boundary time + 60.
       No message after it, a deposit, a withdrawal or a poke, changes the reserved pot, the prizes or the snapshot.
-- [ ] **Exact snapshot.** A deposit booked in the transaction before the boundary reply can win that draw; one booked
+      <!-- evidence: Boundaries "The pot is fixed before the seed; exact snapshot"; Rules2 "one that books and leaves after the boundary changes nothing in the draw" -->
+- [x] **Exact snapshot.** A deposit booked in the transaction before the boundary reply can win that draw; one booked
       in the transaction after cannot.
-- [ ] **The seed mixes in `mc_hash`.** The boundary stores the root hash of the `PREVMCBLOCKS` entry with the highest
+      <!-- evidence: Flows "a deposit booked before a boundary is in that draw, one booked after it is not" -->
+- [x] **The seed mixes in `mc_hash`.** The boundary stores the root hash of the `PREVMCBLOCKS` entry with the highest
       seqno and logs both; with entries given in any order in the sandbox, the logged seqno is the highest one present.
       With the same drand signature and two different `mc_hash` values, the seed and every `k(i,j)` differ, and the
       seed equals `sha256(signature ‖ mc_hash)` to the bit. A skip stores a fresh `mc_hash` with its new `R`.
-- [ ] **Winners recomputed.** In the property run, each winner equals the owner of the `k(i,j)`-th ticket of the
+      <!-- evidence: Boundaries "The seed mixes in mc_hash…" and "Skip…" -->
+- [x] **Winners recomputed.** In the property run, each winner equals the owner of the `k(i,j)`-th ticket of the
       snapshot, recomputed off chain from the logs alone: the drand signature and the `mc_hash` the boundary logged.
-- [ ] **The seed-informed exit is closed.** With the seed public, a player who burns after seeing that they lost gives
+      <!-- evidence: Property.spec (checkDraw in tests/jackpot/sequences.ts); 6 sequences in the last full run -->
+- [x] **The seed-informed exit is closed.** With the seed public, a player who burns after seeing that they lost gives
       up only their own chance: in the two-player example (500,000 GRAM each), the honest player's expected gain per
       draw over many seeds is the same, within sampling error, whether or not the other burns after a losing seed.
+      <!-- evidence: Acceptance "The seed-informed exit is closed" (scaled to 500 GRAM each, 12 seeds, the honest player's prizes identical seed by seed) -->
 - [ ] **Deposits always pay the normal price.** A deposit while a draw waits pays the normal formula, wins nothing in the
       waiting draw, joins the next snapshot, and over at least 1,000 seeds its mean prize minus its price is at most 0
       within sampling error, as v2's sniper test, at `v` of 0.01, 1, 100 and 10,000 times `P`.
+      <!-- not ticked: ran at 10 seeds (SNIPER_SEEDS=10), not 1,000; the exact-arithmetic part and the formula are checked (Acceptance "Deposits always pay the normal price", "A deposit while a draw waits…") -->
 - [ ] **No undercharge after a withdrawal.** In the audit's example (W 900,000, H 100,000; W withdraws all; D deposits
       100,000), D books 99,691 to within rounding, and H's mean prize over many seeds is 279.0 GRAM within sampling
       error.
-- [ ] **Timing.** A test for each row of the timing table, with the reward landing before or after the poke, shows the
+      <!-- not ticked: ran at 30 seeds (HAL_SEEDS=30), scaled by 1/1000, not many seeds at full size (Acceptance "No undercharge after a withdrawal") -->
+- [x] **Timing.** A test for each row of the timing table, with the reward landing before or after the poke, shows the
       expected value given there, within sampling error; leaving after the reward and before the poke equals leaving
       just before it, in exact fractions.
-- [ ] **Skip.** With a draw waiting at the next boundary: its snapshot, tag and reserved pot are unchanged, `R` moves to
+      <!-- evidence: Timing.spec, one test for each of the six rows -->
+- [x] **Skip.** With a draw waiting at the next boundary: its snapshot, tag and reserved pot are unchanged, `R` moves to
       the new boundary's round, the yield since its own boundary stays in `free_tokens`, and a deposit booked meanwhile
       wins nothing in that draw but shares the pot fixed at the first boundary after it ends. Nothing is lost, `carried`
       is unchanged, and each pot is burned once.
-- [ ] **Outage.** drand silent across two boundaries, with deposits and withdrawals meanwhile: all pay; on return the
+      <!-- evidence: Boundaries "Skip…"; Flows "a skip keeps the draw, and the next boundary after it pays the pot…"; Acceptance "Outage" -->
+- [x] **Outage.** drand silent across two boundaries, with deposits and withdrawals meanwhile: all pay; on return the
       waiting draw pays its reserved pot; the next boundary pays the rest to a snapshot that holds the new deposits; a
       round from before the latest boundary is refused.
+      <!-- evidence: Acceptance "Outage" -->
 - [ ] **Cut-off.** A submit at `last_boundary + min_gap − S` throws with no state change, and one a second earlier
       succeeds. A draw submitted at the last allowed second finishes all its searches before the earliest next boundary.
       A boundary with a slot still open (a node made stuck by hand) rolls it over, and a `hit` delivered after it pays
       nothing.
-- [ ] **Submit.** Junk throws and changes nothing; a second submitter fails at the state check; the first is paid
+      <!-- not verifiable here: a draw's searches finishing before the next boundary cannot be shown in the sandbox, which has no message latency; the cut-off, the rollover of an open slot and the late hit are covered (Boundaries "Cut-off…"; Flows "a slot that is still searching at the next boundary rolls over"; Acceptance "Boundary mid-search") -->
+- [x] **Submit.** Junk throws and changes nothing; a second submitter fails at the state check; the first is paid
       `submit_reward` once; the submit sends no quote.
-- [ ] **Settings.** `set_rise_min` and `set_min_gap` refuse values out of bounds and anyone but the governor, at deploy
+      <!-- evidence: Boundaries "Submit…"; Flows "a boundary sends nothing but the quote chain…" -->
+- [x] **Settings.** `set_rise_min` and `set_min_gap` refuse values out of bounds and anyone but the governor, at deploy
       too. A new `min_gap` set while a draw resolves does not move its earliest next boundary: the boundary that applies
       it checks its own rule with the old value. `clear_falling` resets the boundary rate.
-- [ ] **Rhythm.** With `min_gap` at 2.5 rounds, 30 rounds of rewards and pokes give exactly 10 boundaries, one every
+      <!-- evidence: Boundaries "Settings…", "clear_falling resets the boundary rate"; Attacks "governor setters and deploy checks…" -->
+- [x] **Rhythm.** With `min_gap` at 2.5 rounds, 30 rounds of rewards and pokes give exactly 10 boundaries, one every
       third round.
+      <!-- evidence: Boundaries "Rhythm…" -->
 - [ ] **Hands-free.** 50 rounds run with `poke` after each reward and `submit_randomness` as the only messages besides
       the treasury's replies and the reward steps: one boundary and three prizes each, nothing else sent by anyone.
-- [ ] **First boundary.** After deploy, no reply is a boundary before `min_gap`, and the first reward after it makes one.
+      <!-- not ticked: ran 8 rounds (Soak, HANDS_FREE_ROUNDS=8) and 12 (Boundaries "Hands-free…"), not 50 -->
+- [x] **First boundary.** After deploy, no reply is a boundary before `min_gap`, and the first reward after it makes one.
       A deploy with a zero stored rate, a zero boundary rate, or settings out of bounds is refused.
+      <!-- evidence: Boundaries "First boundary…" (the zero boundary rate is covered through the zero stored rate: the deploy data sets both from one quote) -->
 
 **No records**
 
 - [ ] **Fixed storage.** In a sandbox run of at least 1,000 mixed flows (every message kind in this document), after every
       transaction the Jackpot's data has the same number of cells as at deploy, `content` aside, and no more bits than
       with every `Coins` field at full width. `schema.tlb` has no `HashmapE` in the Jackpot's storage.
-- [ ] **Property, extended.** v2's property run, with rewards in parts, gifts, pokes, boundaries and skips in place of
+      <!-- not ticked: the full-width bits bound is now asserted after every chain (tests/jackpot/sequences.ts: the non-Coins bits are constant, 16 Coins fields, never above full width) with the cell count and the schema check (Environment "Fixed storage…"); still about 100 flows (6 property sequences), not 1,000 -->
+- [x] **Property, extended.** v2's property run, with rewards in parts, gifts, pokes, boundaries and skips in place of
       the clock, also checks after every transaction that `tickets = principal`, that untracked hGRAM (wallet balance −
       `held_tokens`) is at least 0 and equals the sum of the failures the run injected, and that the treasury receives
       `provide_current_quote` only after a `poke`.
-- [ ] **Sandbox version.** The sandbox emulator runs global version 12 or later, with its config 8 set to match mainnet
+      <!-- evidence: Property.spec (tests/jackpot/sequences.ts) -->
+- [x] **Sandbox version.** The sandbox emulator runs global version 12 or later, with its config 8 set to match mainnet
       (version 16 when read on 2026-11-03), and a message sent with `extra_flags = 3` bounces as `new_bounce_body`. If the
       emulator does not support it, the build stops and reports; no test is weakened to pass.
-- [ ] **`PREVMCBLOCKS` works**, first build: in the sandbox at the configured global version, the boundary reads a
+      <!-- evidence: Environment "Sandbox version…" -->
+- [x] **`PREVMCBLOCKS` works**, first build: in the sandbox at the configured global version, the boundary reads a
       non-zero root hash from `PREVMCBLOCKS`, and the sandbox can set it per transaction for the tests above. If not, the
       build stops and reports.
+      <!-- evidence: Environment "PREVMCBLOCKS works…" -->
 - [ ] **Jetton metadata.** `get_jetton_data`'s content reads name "Hipo Jackpot GRAM", symbol `jGRAM`, 9 decimals and
       the description above; `deployJackpot.ts` stops when a well-known jetton already uses the symbol.
+      <!-- not verifiable here: name, symbol, decimals and description are tested (Composable "Jetton metadata…"); the `deployJackpot.ts` symbol check needs an indexer and is not run in the sandbox -->
 - [ ] **Failures.** Each row of the Failures table runs in the sandbox and ends as the table says. Every row marked
       "itself" finishes with no message from the governor. After the stated recovery, the owner holds what they would
       have held without the failure, within 1 nano-hGRAM per step, and the invariants hold throughout. Poke bounces use a
       treasury stub that throws; frozen wallets, frozen nodes and frozen hGRAM wallets are set by hand.
-- [ ] **Bounce formats.** Every bounceable message the Jackpot and the wallet send carries `extra_flags = 3`. Their
+      <!-- not ticked: one test per producible row in Verification "Failures, row by row" (poke bounce, no reply, prepare_deposit bounce, deposit_ready fails, deposit_booked bounces, burn_notification fails, refund unpaid, `w` to a frozen wallet, unstake_tokens bounce, deposit_cancelled/close_wallet/take_wallet_address bounce), Retire "Stragglers…" (close_node), Foreign (tokens); not produced in the sandbox: the undo whose refund send fails, prepare_deposit with a frozen wallet’s debt and no bounce, a payout’s first and second hop failing, a refund or burn to the burner failing, a payout after the Hipo migration, hGRAM left in an old wallet -->
+- [x] **Bounce formats.** Every bounceable message the Jackpot and the wallet send carries `extra_flags = 3`. Their
       handlers act on a `0xfffffffe` bounce. The Jackpot ignores a `0xffffffff` one, keeping its value. The wallet
       restores the amount from an old-format bounce of `burn_notification` exactly as from a new one, lowers `pending`
       on an old-format bounce of a non-busy `deposit_ready`, and ignores any other.
-- [ ] **Forged bounce.** An ordinary message, without the bounced flag, whose body is a `new_bounce_body` wrapping a
+      <!-- evidence: Verification "Bounce formats" (every bounceable message of a flow with prepare_deposit, deposit_booked, deposit_cancelled, provide_current_quote, unstake_tokens, take_wallet_address, burn_notification, close_wallet, burn, and the foreign, jetton and NFT transfers: ihr field 3); Attacks "bounce formats…"; Rules "a bounced burn_notification…" -->
+- [x] **Forged bounce.** An ordinary message, without the bounced flag, whose body is a `new_bounce_body` wrapping a
       made-up `prepare_deposit` (or `deposit_booked`, or `burn_notification` to a wallet) throws: no refund, no change of
       any counter or balance, and its GRAM goes back to the sender.
-- [ ] **Bounced `deposit_booked`.** After the undo, the wallet gets `deposit_cancelled` and its `pending` returns to what
+      <!-- evidence: Attacks "forged bounce…" -->
+- [x] **Bounced `deposit_booked`.** After the undo, the wallet gets `deposit_cancelled` and its `pending` returns to what
       it was before the deposit; a new wallet is not left opening and can take the next deposit. The refund is
       `paid_tokens` for `booked_principal` at the stored rate when the bounce arrives, and the entry price, and any rise
       since the booking, stay in `free_tokens`.
-- [ ] **Bounce value.** `prepare_deposit` and `deposit_booked` each carry at least `fee::bounce_floor` (update + cancel +
+      <!-- evidence: Verification "Bounced deposit_booked" (a held deposit_booked bounced by hand: deposit_cancelled to the wallet, pending 0, a new wallet not left opening, the next deposit books); Races "a bounced deposit_booked, made by hand…" -->
+- [x] **Bounce value.** `prepare_deposit` and `deposit_booked` each carry at least `fee::bounce_floor` (update + cancel +
       refund + two handlers + forwarding); a test forces each to bounce at the minimum deposit fee, and a hand-made bounce of
       `deposit_booked` carrying exactly the floor at 400 nano-GRAM per gas, with an 8-cell, 1,023-bit payload, is undone.
-- [ ] **Forged messages.** `take_current_quote` from any address but the treasury, `deposit_ready` and
+      <!-- evidence: Races "Bounce value…" (exactly the floor, 400 nano-GRAM per gas, 8 cells of 1,023 bits) and the frozen-wallet tests at the minimum deposit fee -->
+- [x] **Forged messages.** `take_current_quote` from any address but the treasury, `deposit_ready` and
       `burn_notification` from any address but the wallet they name, `close_node` from anyone but the node's parent or
       the Jackpot, and `gas_excess` from anyone change no state and send nothing. A thousand tiny `close_node` messages
       from a stranger to a live node leave the node's balance where it was: each ends at the sender check, and a node
       never calls `accept_message` for a close.
-- [ ] **A poke's quote bounce** refunds the poker and changes nothing else.
+      <!-- evidence: Rules "a forged hit, miss and lost…", "update and descend from a stranger…", "a quote from a stranger…", "a deposit_ready from the wrong sender…"; Attacks "forged messages…", "a thousand-fold tiny close_node…"; Retire "A close_node from anyone but the node's parent…" -->
+- [x] **A poke's quote bounce** refunds the poker and changes nothing else.
+      <!-- evidence: Attacks "a poke's quote bounce refunds the poker and changes nothing else" -->
 
 **The rate**
 
-- [ ] **Chains.** A deposit's chain is, message for message, the transfer, its notification, `prepare_deposit`,
+- [x] **Chains.** A deposit's chain is, message for message, the transfer, its notification, `prepare_deposit`,
       `deposit_ready`, `deposit_booked`; a withdrawal's is `burn`, `burn_notification`, the payout. Neither sends a quote.
-- [ ] **A poke's reply stores its rate**; a reply at a lower rate than the stored one raises the falling flag.
-- [ ] **The rate cancels with a pot.** With a stored pot above 0 at both rates, `booked_principal` changes by at most
+      <!-- evidence: Verification "Chains" (the deposit, burn and `w` chains asserted message by message: op, sender, receiver, order; no quote) -->
+- [x] **A poke's reply stores its rate**; a reply at a lower rate than the stored one raises the falling flag.
+      <!-- evidence: Attacks "falling rate…"; Rules "a quote from a stranger is ignored…" -->
+- [x] **The rate cancels with a pot.** With a stored pot above 0 at both rates, `booked_principal` changes by at most
       `2 + booked_principal / free_tokens` nano-GRAM, rounded up, when the stored rate is set anywhere from half to twice
       the true one; and over many seeds the deposit's expected prize minus its price is the same at every stored rate,
       within sampling error. The rounding term grows with the deposit's share of `free_tokens`, and a deposit that large
       owns most of the pot it pays into, so it gains nothing from it.
-- [ ] **An old rate only costs the depositor.** With the stored pot at 0 and the stored rate below Hipo's, a deposit
+      <!-- evidence: Verification "The rate cancels (exact fractions)" (bigint, scaled 10^30: booked_principal within 2 + booked/free, the gain equal to that rounding); Acceptance "The rate cancels with a pot". The expected value is shown in exact fractions, not sampled over seeds -->
+- [x] **An old rate only costs the depositor.** With the stored pot at 0 and the stored rate below Hipo's, a deposit
       books `deposit_value` at the stored rate, and the difference stays in `free_tokens`.
-- [ ] **A fall not yet seen** (set by hand in the sandbox treasury): a withdrawal pays at most its pro-rata share; the
+      <!-- evidence: Acceptance "An old rate only costs the depositor" -->
+- [x] **A fall not yet seen** (set by hand in the sandbox treasury): a withdrawal pays at most its pro-rata share; the
       next poke raises the falling flag; after it, bookings are refused with `rate_falling` and withdrawals pay pro rata.
-- [ ] **Refill at a stale rate**, after a fall set by hand, unstakes at most `float_high` worth of hGRAM, as the accepted
+      <!-- evidence: Acceptance "A fall not yet seen"; Attacks "falling rate…" -->
+- [x] **Refill at a stale rate**, after a fall set by hand, unstakes at most `float_high` worth of hGRAM, as the accepted
       limit says; with the falling flag up it unstakes nothing.
-- [ ] **`settle_unstake`.** With `credit = true` it lowers `unstaking_tokens` and raises `held_tokens` by `amount`; with
+      <!-- evidence: Acceptance "Refill at a stale rate"; Soak "refill throws at float >= fee::draw_budget, and unstakes nothing while the flag is up" -->
+- [x] **`settle_unstake`.** With `credit = true` it lowers `unstaking_tokens` and raises `held_tokens` by `amount`; with
       `credit = false` it lowers `unstaking_tokens` only; both refuse `amount > unstaking_tokens` and anyone but the
       governor. A stuck `unstaking_tokens` cleared with `credit = false` lets `sweep` run.
+      <!-- evidence: Retire "sweep requires unstaking_tokens = 0; settle_unstake with credit = false clears a stuck count and lets it run" -->
 
 **Closing the tree**
 
-- [ ] **The cascade, on `sweep`'s funding.** With every node's balance set to exactly its storage reserve, no spare,
+- [x] **The cascade, on `sweep`'s funding.** With every node's balance set to exactly its storage reserve, no spare,
       `sweep` with 5,000 positions ever assigned deletes every node over positions below `next_position`; no other
       address receives `close_node`; no node's reserve pays any gas; and the Jackpot gets back everything the sweep sent
       for the close and every reserve, less only the cascade's real gas and forwarding.
-- [ ] **Refusals.** `sweep` is refused while retired is false, `principal > 0`, `incoming_tokens > 0`,
+      <!-- evidence: Retire "The cascade, on sweep's funding" at n = 65, 4097 and 5000 -->
+- [x] **Refusals.** `sweep` is refused while retired is false, `principal > 0`, `incoming_tokens > 0`,
       `unstaking_tokens > 0`, a draw resolves, or it was already swept, and when it brings even 1 nano-GRAM less than
       `fee::sweep + close_cost(next_position)`. A sweep that brings more returns exactly the excess to its sender, and
       the float is the same before and after, apart from the burn payout's own fee. A node with any non-zero child sum,
       set by hand, refuses `close_node`, keeps its subtree, and the rest of the tree still closes.
-- [ ] **No players.** `retire` and `sweep` with `next_position = 0`: `close_cost(0) = 0`, no `close_node` is sent, and no
+      <!-- evidence: Retire "Refusals…" twice, "A sweep that brings less than…", "End to end" (422); Verification "The end of the tree" (a sweep with 1 GRAM more costs the sender exactly the same; a node with a non-zero sum refuses and the rest of the tree closes) -->
+- [x] **No players.** `retire` and `sweep` with `next_position = 0`: `close_cost(0) = 0`, no `close_node` is sent, and no
       GRAM is left at the undeployed top node's address. `close_subtree` refuses any node whose first position is at or
       past `next_position`.
-- [ ] **`swept`.** After a sweep, `swept` is set; a second `sweep` is refused with 422; `close_subtree` works only after
+      <!-- evidence: Retire "No players…" and "Stragglers…" (`close_subtree` past `next_position`) -->
+- [x] **`swept`.** After a sweep, `swept` is set; a second `sweep` is refused with 422; `close_subtree` works only after
       it (421 before); `withdraw_surplus` then leaves 1 GRAM.
-- [ ] **Waiting draw at the end.** `sweep` in state waiting with `tickets = 0` ends the draw, puts its prizes back, burns
+      <!-- evidence: Retire "End to end…" (422), "Stragglers…" (421); Verification "swept: after the sweep, withdraw_surplus leaves exactly 1 GRAM" -->
+- [x] **Waiting draw at the end.** `sweep` in state waiting with `tickets = 0` ends the draw, puts its prizes back, burns
       everything and closes the tree, with no search sent.
-- [ ] **Order.** An `update` sent just before the sweep reaches every node on its path before `close_node`.
-- [ ] **Gas bounds.** On the new node code, a level-1 close and a 64-child close each use at most `gas_1` and `gas_inner`,
+      <!-- evidence: Retire "Waiting draw at the end…" -->
+- [x] **Order.** An `update` sent just before the sweep reaches every node on its path before `close_node`.
+      <!-- evidence: Verification "Order" (a burn and a sweep in one queue: at each of the four nodes the update’s lt is below the close’s and every node is gone) -->
+- [x] **Gas bounds.** On the new node code, a level-1 close and a 64-child close each use at most `gas_1` and `gas_inner`,
       with at least 1.5 times headroom: measured gas × 1.5 ≤ the constant. The constants fit 65 actions and the 1,000,000
       gas limit. `GETFORWARDFEE` is called with counts at least the real `close_node`'s.
-- [ ] **Split.** Each node keeps `term − fwd` and gives each existing child its share of the rest in proportion to
+      <!-- evidence: Retire "Gas bounds…" -->
+- [x] **Split.** Each node keeps `term − fwd` and gives each existing child its share of the rest in proportion to
       `subtree_cost(child)`, to the nano-GRAM, forwarding fee included, so each child gets at least its cost times the
       margin. `close_cost(n)` equals the top node's `subtree_cost` times the margin, priced at the sandbox's `GETGASFEE`
       and `GETFORWARDFEE`. With node reserves at 0 spare, the whole tree closes, no node's reserve pays any gas, and no
       node is left behind at `n` = 65, 4,097 and 5,000, the partly filled last subtrees included; the same holds with
       every node's real gas raised 10% over its measure.
-- [ ] **Stragglers.** A frozen node, and a node whose value was made too small by hand, stay with their subtrees: the
+      <!-- evidence: Retire "Split…" twice; Verification "Split, to the nano-GRAM" (shares recomputed from the config’s gas (21) and forwarding (25) prices at n = 65, 4,097 and 5,000: each arrives as computed less one constant forwarding; close_cost equals the top cost times the margin) -->
+- [x] **Stragglers.** A frozen node, and a node whose value was made too small by hand, stay with their subtrees: the
       short node does nothing and keeps the value, sends nothing and is not deleted, so no child is left under a missing
       parent. `close_subtree` with `subtree_cost` times the margin then closes them, a level-2 node's leaves included; it
       is refused with less, and before the sweep. `scripts/closeSubtree.ts` offers only the highest nodes still
       standing.
+      <!-- evidence: Retire "Stragglers…", "closeSubtree offers only the highest nodes still standing", "a frozen node counts as standing…" -->
 
 **Composable**
 
-- [ ] **Deposit with options**, sent by a contract for a beneficiary: the beneficiary receives, from their jGRAM wallet, a
+- [x] **Deposit with options**, sent by a contract for a beneficiary: the beneficiary receives, from their jGRAM wallet, a
       `transfer_notification` with the caller's `query_id`, `amount = booked_principal`, `sender` = the depositor, the
       payload bit for bit, and the asked value. The response destination receives `gas_excess` with the same `query_id`.
-- [ ] **Refusals.** For each reason code, the response destination receives `deposit_tokens` whole, with the caller's
+      <!-- evidence: Composable "Deposit with options…" -->
+- [x] **Refusals.** For each reason code, the response destination receives `deposit_tokens` whole, with the caller's
       `query_id` and `deposit_refused(reason, payload)`, or for a default deposit 1 nano-GRAM and the reason's comment.
       `principal`, `tickets` and `incoming_tokens` end as before the deposit.
-- [ ] **Two deposits at once to a new wallet:** the second is refused with `wallet_busy` and refunded, and no message
+      <!-- evidence: Composable "Refusals…" (all reasons but two); Races "Two deposits, new wallet" for `wallet_busy`; Rules "capacity…" for `tree_full` -->
+- [x] **Two deposits at once to a new wallet:** the second is refused with `wallet_busy` and refunded, and no message
       bounces.
-- [ ] **Withdrawal by `burn`.** A standard `burn` with no `custom_payload` pays the owner. With `withdraw_options`, the
+      <!-- evidence: Races "Two deposits, new wallet…" -->
+- [x] **Withdrawal by `burn`.** A standard `burn` with no `custom_payload` pays the owner. With `withdraw_options`, the
       owner's hGRAM wallet sends a `transfer_notification` with the caller's `query_id`, `paid_tokens`, `sender` = the
       Jackpot and the payload bit for bit, and `gas_excess` with the rest to the burn's `response_destination`. No
       message reaches the Jackpot after its `send_tokens`. A payout short of value for its forward fields goes without
       them. A `burn` from anyone but the owner and the Jackpot throws.
-- [ ] **Prizes.** Each winner's hGRAM wallet sends a `transfer_notification` of exactly `fee::prize_notify` (0.01 GRAM)
+      <!-- evidence: Composable "Withdrawal by burn…" twice; Attacks "a burn is paid in the step that receives it…" -->
+- [x] **Prizes.** Each winner's hGRAM wallet sends a `transfer_notification` of exactly `fee::prize_notify` (0.01 GRAM)
       with the comment `Hipo Jackpot prize: draw <tag>, <place>`. A test contract as winner parses it within that gas.
       `fee::draw_budget` includes `3 · fee::prize_notify` and `fee::boundary_max`, and the griefing-bound test still
       holds.
-- [ ] **TEP-89.** `take_wallet_address` equals `get_wallet_address` for a basechain owner, is `addr_none` for a
+      <!-- evidence: Composable "Prizes…"; Rules2 "The griefing bound"; Gas "fee::draw_budget includes…" -->
+- [x] **TEP-89.** `take_wallet_address` equals `get_wallet_address` for a basechain owner, is `addr_none` for a
       masterchain one, and includes the owner only when asked.
-- [ ] **Payload cap.** An inner payload of 8 cells passes; 9 are refused with `bad_options` on a deposit and throw at the
+      <!-- evidence: Composable "TEP-89…" -->
+- [x] **Payload cap.** An inner payload of 8 cells passes; 9 are refused with `bad_options` on a deposit and throw at the
       wallet on a `burn`. At the cap, the Jackpot's balance does not fall in any user chain.
-- [ ] **Same `query_id`.** Two deposits and two withdrawals in flight with one `query_id` all complete correctly.
+      <!-- evidence: Composable "Payload cap…", "F7…" -->
+- [x] **Same `query_id`.** Two deposits and two withdrawals in flight with one `query_id` all complete correctly.
+      <!-- evidence: Hardening "Fix 1: one query_id, many messages" (four tests) -->
 
 **Foreign tokens and Hipo upgrades**
 
-- [ ] **A return.** A foreign jetton sent with `fee::foreign_return` comes back to its `sender` in full, with the
+- [x] **A return.** A foreign jetton sent with `fee::foreign_return` comes back to its `sender` in full, with the
       comment, `response_destination` = the sender. The Jackpot's balance after the transaction equals its balance before
       the message, to the nano-GRAM, its log's fee included, and every counter is unchanged.
-- [ ] **A fake.** A `transfer_notification` from a contract that is no jetton wallet gets only a message paid by its own
+      <!-- evidence: Foreign "A return…" -->
+- [x] **A fake.** A `transfer_notification` from a contract that is no jetton wallet gets only a message paid by its own
       value; the Jackpot's balance equals its balance before the message, and every counter is unchanged.
-- [ ] **A short value.** A foreign jetton sent with less than `fee::foreign_return` stays with the Jackpot; the log is
+      <!-- evidence: Foreign "A fake…", "A fake wallet looping…" -->
+- [x] **A short value.** A foreign jetton sent with less than `fee::foreign_return` stays with the Jackpot; the log is
       written only when the value covers its fee; the Jackpot's balance does not fall. `rescue_jetton` from the governor
       then sends it on; from anyone else it is refused.
-- [ ] **A bounced return.** A return refused by the foreign wallet changes no state, and the token is recovered with
+      <!-- evidence: Foreign "A short value…" -->
+- [x] **A bounced return.** A return refused by the foreign wallet changes no state, and the token is recovered with
       `rescue_jetton`.
-- [ ] **The hGRAM wallet is refused.** `rescue_jetton` naming the Jackpot's current hGRAM wallet throws, matched by
+      <!-- evidence: Foreign "A bounced return…" -->
+- [x] **The hGRAM wallet is refused.** `rescue_jetton` naming the Jackpot's current hGRAM wallet throws, matched by
       parsed workchain and hash, and so does any address that is not a basechain `addr_std`; an old hGRAM wallet can be
       named.
-- [ ] **NFTs.** An NFT sent with `fee::foreign_return` goes back to `prev_owner`; one sent with less, with an
+      <!-- evidence: Foreign "The hGRAM wallet is refused…" -->
+- [x] **NFTs.** An NFT sent with `fee::foreign_return` goes back to `prev_owner`; one sent with less, with an
       `addr_none` `prev_owner`, or with the Jackpot as `prev_owner`, is held, and `rescue_nft` sends it on.
+      <!-- evidence: Foreign "NFTs…" -->
 - [ ] **Hipo upgrades.** `set_hipo_wallet` and `set_treasury` are refused while not halted and for any address that is
       not a basechain `addr_std` without anycast. After both, for a `k = 1` change, deposits arrive through the new
       wallet, withdrawals pay from it, pokes ask the new treasury, each setter writes its log, and a notification from
@@ -1677,55 +1740,68 @@ The v2 criteria hold except those listed as removed at the top.
       right after it are priced at the new rate, and every player's share of the pot is the same as before it. A payout
       sent before the move lands fails, and `return_tokens` from the new wallet recovers it in full. No jGRAM wallet or
       node data or code refers to any Hipo address or code.
+      <!-- not ticked: the setters, their logs, the repoint and the foreign return of the old wallet are tested (Foreign "set_hipo_wallet and set_treasury…"); the `k ≠ 1` migration upgrade is not built (`migrate` belongs to a future upgrade), so that part and "no jGRAM wallet or node refers to a Hipo address" are not tested -->
 - [ ] **Nothing in flight at a migration.** A `k ≠ 1` Hipo migration upgrade with a deposit in flight (`incoming_tokens > 0`, a
       `prepare_deposit` held by a frozen wallet) or an unstake out (`unstaking_tokens > 0`) is refused and changes
       nothing; after `return_tokens(…, true)` and `settle_unstake` clear them, it succeeds.
+      <!-- not ticked: `migrate` is not built; nothing to test -->
 
 **Comments**
 
-- [ ] `w` and `W` withdraw everything; the payout carries `Hipo Jackpot withdrawal`; the wallet closes. A `w` from an
+- [x] `w` and `W` withdraw everything; the payout carries `Hipo Jackpot withdrawal`; the wallet closes. A `w` from an
       address with no wallet returns its GRAM less fees and leaves no account. A `w` below the fee, and any other
       comment, throw with 423; an empty comment is taken as a top-up.
+      <!-- evidence: Composable "Comments"; Verification "`w` with an empty comment" (a top-up, no message sent, no counter changes) -->
 
 **Retire and the end**
 
-- [ ] After `retire`: new deposits, and those whose `deposit_ready` arrives later, are refused with `retired` and
+- [x] After `retire`: new deposits, and those whose `deposit_ready` arrives later, are refused with `retired` and
       refunded; boundaries and draws run and pay; withdrawals and `w` work; mintable is false; no message clears
       `retired`.
-- [ ] `withdraw_for` with 100 owners, each message with its StateInit, stays under 850,000 gas and the action limit, and
+      <!-- evidence: Retire "After retire…" -->
+- [x] `withdraw_for` with 100 owners, each message with its StateInit, stays under 850,000 gas and the action limit, and
       pays each owner to themselves; 101 owners are refused. It is refused before `retire` and from anyone but the
       governor.
-- [ ] **End to end:** `retire`, the next boundary and its draw pay the pot to players, `withdraw_for` for all, `sweep`.
+      <!-- evidence: Retire "withdraw_for with 100 owners…" (832,620 gas at the last measure) -->
+- [x] **End to end:** `retire`, the next boundary and its draw pay the pot to players, `withdraw_for` for all, `sweep`.
       Then `held_tokens` is 0, the burner got exactly what was left, `principal` is 0, every node is gone, and their
       balances are back at the Jackpot.
+      <!-- evidence: Retire "End to end…" -->
 
 **Migration**
 
-- [ ] With two Jackpots in the sandbox, `withdraw_for(to_successor)` books each owner in the new one under their own
+- [x] With two Jackpots in the sandbox, `withdraw_for(to_successor)` books each owner in the new one under their own
       address with `booked_principal ≥ min_principal`. A move the new Jackpot refuses returns hGRAM to the owner, never
       to the old Jackpot or the governor. An owner's own move works, and falls back to paying the owner with no successor
       or too little value.
-- [ ] `set_successor` is refused before `retire`, for the Jackpot itself, and for a masterchain address.
+      <!-- evidence: Retire "withdraw_for(to_successor) books each owner…", "An owner's move with too little value…", "F1…", "R1…" -->
+- [x] `set_successor` is refused before `retire`, for the Jackpot itself, and for a masterchain address.
+      <!-- evidence: Retire "set_successor is refused before retire…" -->
 
 **Logs**
 
-- [ ] Every log in the property run is an external out message to `addr_none` whose body starts with the tag of a
+- [x] Every log in the property run is an external out message to `addr_none` whose body starts with the tag of a
       constructor under Logs, `crc32("jackpot::<name>")`, and parses with that constructor to the end.
       `abi/jackpot.xml` lists every one as `<ext_out>`.
+      <!-- evidence: Logs.spec; Property.spec (every log parsed strictly) -->
 
 **Names and graphs**
 
-- [ ] Outside code and formula blocks, `docs/architecture.md`, the README and every script's output use the names. A
+- [x] Outside code and formula blocks, `docs/architecture.md`, the README and every script's output use the names. A
       script lists any lone `T`, `I`, `O`, `F`, `U`, `P`, `L`, `G` used as a quantity there, and finds none.
-- [ ] `npm run graphs` writes `docs/graphs/<chapter>.dot`, `-light.svg`, `-dark.svg` and `docs/message-graphs.md`, for
+      <!-- evidence: tools/lintNames.mjs, part of `npm run lint`: no lone T, I, O, F, U, P, L or G in contracts/, wrappers/, the prose of docs/architecture.md and README.md, or the text the scripts print -->
+- [x] `npm run graphs` writes `docs/graphs/<chapter>.dot`, `-light.svg`, `-dark.svg` and `docs/message-graphs.md`, for
       every chapter listed under Message graphs. GitHub shows the dark graphs in its dark theme. `npm test` fails when a
       committed `.dot` differs from what the story builds.
+      <!-- evidence: `npm run graphs` (run once) writes the .dot, -light.svg, -dark.svg and docs/message-graphs.md; tests/story/story.spec.ts runs in `npm test` (about 60 s) and fails on a differing .dot; what GitHub shows in its dark theme is not checked here -->
 
 **Gas and review**
 
 - [ ] v2's "Gas returned" holds for a deposit with options, a refusal, a `burn`, a `w`, a poke, one owner of
       `withdraw_for`, and a move.
+      <!-- not ticked: covered for a deposit and a burn (Flows "gas returned…") and for `w`, a poke, a submit, a refill and TEP-89 (Verification "Gas returned"); not for a refusal, a deposit with options, one owner of `withdraw_for` or a move -->
 - [ ] Two money audits (one to prove it correct, one to make it lose money) and a code review pass on the code.
+      <!-- not verifiable here: run by the coordinator outside the test suite (two money audits and a code review); not checked here -->
 
 ## Risks & rollback
 
