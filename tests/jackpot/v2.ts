@@ -23,8 +23,8 @@ export async function compileJackpotV2(): Promise<Cell> {
             if (path.endsWith('contracts/jackpot.fc')) {
                 return patch(
                     source,
-                    '() migrate(int old_draw_id, int old_draw_state) impure method_id {\n    load_data();',
-                    '() migrate(int old_draw_id, int old_draw_state) impure method_id {\n' +
+                    '() migrate(int old_tag, int old_draw_state) impure method_id {\n    load_data();',
+                    '() migrate(int old_tag, int old_draw_state) impure method_id {\n' +
                         '    slice old = get_data().begin_parse();\n' +
                         '    int old_version = old~load_uint(8);\n' +
                         '    throw_unless(413, (old_version == 1) | (old_version == 2));\n' +

@@ -23,6 +23,12 @@ builder store_log(builder b, builder log) inline {
         : b.store_maybe_ref(log.end_cell());
 }
 
+;; The field that was ihr_fee and is extra_flags since global version 12: 3 asks for a full-body bounce, and every
+;; bounceable message the Jackpot and its wallets send asks for it.
+builder store_ihr_field(builder b, int bounceable?) inline {
+    return bounceable? ? b.store_uint(1, 4).store_uint(3, 8) : b.store_uint(0, 4);
+}
+
 () send_msg(int bounceable?, builder dst, builder state_init, builder body, int coins, int mode) impure inline_ref {
     ;; int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool
     ;;   src:MsgAddress dest:MsgAddressInt
@@ -35,45 +41,27 @@ builder store_log(builder b, builder log) inline {
         .store_uint(bounceable? ? 0x18 : 0x10, 6) ;; 011000 or 010000
         .store_builder(dst)
         .store_coins(coins)
-        .store_uint(0, 1 + 4 + 4 + 64 + 32)
+        .store_uint(0, 1) ;; no extra currencies
+        .store_ihr_field(bounceable?)
+        .store_uint(0, 4 + 64 + 32)
         .store_state_init(state_init)
         .store_body(body)
         .end_cell();
     send_raw_message(msg, mode);
 }
 
-() emit_log(int topic, builder log) impure inline_ref {
-    ;; addr_extern$01 len:(## 9) external_address:(bits len) = MsgAddressExt;
-    ;; ext_out_msg_info$11 src:MsgAddress dest:MsgAddressExt
-    ;;   created_lt:uint64 created_at:uint32 = CommonMsgInfoRelaxed;
-    ;; message$_ {X:Type} info:CommonMsgInfoRelaxed
-    ;;   init:(Maybe (Either StateInit ^StateInit))
-    ;;   body:(Either X ^X) = MessageRelaxed X;
+;; 16 in the handlers whose failed action phase must bounce the message; it rides on every action, logs included
+global int act_flag;
+
+() emit_log(int op, builder fields) impure inline_ref {
+    ;; ext_out_msg_info$11 src:addr_none dest:addr_none created_lt:uint64 created_at:uint32 = CommonMsgInfoRelaxed;
+    ;; the body starts with a 32-bit op, as explorers decode logs
     cell msg = begin_cell()
-        .store_uint(0x31, 2 + 2 + 2) ;; 110001
-        .store_uint(256, 9)
-        .store_uint(topic, 256)
+        .store_uint(0x30, 2 + 2 + 2) ;; 110000
         .store_uint(0, 64 + 32 + 1)
-        .store_log(log)
+        .store_log(begin_cell().store_uint(op, 32).store_builder(fields))
         .end_cell();
-    send_raw_message(msg, send::regular);
-}
-
-(int, int, int, int) get_election_config() inline {
-    ;; _ validators_elected_for:uint32 elections_start_before:uint32
-    ;;   elections_end_before:uint32 stake_held_for:uint32
-    ;;   = ConfigParam 15;
-    slice cs = config_param(config::election).begin_parse();
-    return ( cs~load_uint(32), cs~load_uint(32), cs~load_uint(32), cs~load_uint(32) );
-}
-
-(int, int) get_vset_times(int i) inline_ref {
-    ;; validators_ext#12 utime_since:uint32 utime_until:uint32
-    ;;   total:(## 16) main:(## 16) { main <= total } { main >= 1 }
-    ;;   total_weight:uint64 list:(HashmapE 16 ValidatorDescr) = ValidatorSet;
-    slice cs = config_param(i).begin_parse();
-    throw_unless(err::unexpected_validator_set_format, cs~load_uint(8) == 0x12);
-    return ( cs~load_uint(32), cs~load_uint(32) );
+    send_raw_message(msg, send::regular + act_flag);
 }
 
 builder create_state_init(cell code, cell data) inline {
@@ -118,7 +106,7 @@ cell create_wallet_data(builder owner, slice parent) inline {
 
 ;; The address hash of a contract from its code's hash and depth and its init data: the representation
 ;; hash of the StateInit cell `00110` (code and data present, nothing else) with those two refs, computed
-;; directly so that a node or a range needs only the hash and depth of another contract's code, not the
+;; directly so that a node needs only the hash and depth of another contract's code, not the
 ;; code itself. Tests check it against @ton/core's contractAddress.
 int sha256_builder(builder b) asm "1 PUSHINT" "HASHEXT_SHA256";
 
@@ -134,28 +122,21 @@ int state_init_hash(int code_hash, int code_depth, cell data) inline {
         .sha256_builder();
 }
 
-;; A range's initial data, which with the range code fixes its address: (jackpot, b, node_hash), b the
-;; booking index and node_hash the address hash of its level-1 node, so that even a range that is not set
-;; up knows the only sender of check. The owner and length are not part of it, so that nobody can deploy a
-;; range at a booking's address ahead of the Jackpot with different contents; the one-time setup that
-;; carries them is accepted only from the Jackpot.
-cell create_range_data(slice jackpot, int b, int node_hash) inline {
+;; A jGRAM wallet's initial data, which with the wallet code fixes its address: (jackpot, owner). The balance,
+;; the position and the pending count are added by the first message, which only the Jackpot can send.
+cell create_jwallet_data(slice jackpot, slice owner) inline {
     return begin_cell()
         .store_slice(jackpot)
-        .store_uint(b, 32)
-        .store_uint(node_hash, 256)
+        .store_slice(owner)
         .end_cell();
 }
 
-;; A node's initial data: (jackpot, level, index), and the hash and depth of the range code, so that a
-;; level-1 node can compute its ranges' addresses. A node computes other nodes' addresses from its own code.
-cell create_node_data(slice jackpot, int level, int index, int range_hash, int range_depth) inline {
+;; A node's initial data: (jackpot, level, index). A node computes other nodes' addresses from its own code.
+cell create_node_data(slice jackpot, int level, int index) inline {
     return begin_cell()
         .store_slice(jackpot)
         .store_uint(level, 8)
         .store_uint(index, 32)
-        .store_uint(range_hash, 256)
-        .store_uint(range_depth, 16)
         .end_cell();
 }
 
@@ -163,4 +144,113 @@ cell create_node_data(slice jackpot, int level, int index, int range_hash, int r
 int is_base_addr?(slice src, int addr) inline {
     ( int wc, int hash ) = parse_std_addr(src);
     return (wc == chain::base) & (hash == addr);
+}
+
+;; True when `a` is a plain basechain address: addr_std, no anycast, workchain 0.
+int base_addr?(slice a) inline {
+    if a.slice_bits() != 267 {
+        return false;
+    }
+    return a.preload_uint(11) == 0x400;
+}
+
+;; The cells of a cell tree, counted with a bound: CDATASIZE throws when there are more than `n`. It is impure, or the
+;; compiler drops the call, whose result nobody reads, and the cap is never enforced.
+int payload_cells(cell c, int n) impure asm "CDATASIZE" "DROP" "DROP";
+
+;; True when the payload has at most max_payload_cells cells. Costs bounded gas.
+int payload_fits?(cell c) inline_ref {
+    int fits? = true;
+    try {
+        payload_cells(c, max_payload_cells);
+    } catch (_, _) {
+        fits? = false;
+    }
+    return fits?;
+}
+
+;; A TEP-74 text comment: a 32-bit zero and the text.
+cell comment_cell(slice text) inline {
+    return begin_cell().store_uint(0, 32).store_slice(text).end_cell();
+}
+
+;; n in decimal.
+builder store_decimal(builder b, int n) inline_ref {
+    int len = 1;
+    int t = n;
+    while t >= 10 {
+        t /= 10;
+        len += 1;
+    }
+    int i = len;
+    while i > 0 {
+        i -= 1;
+        int p = 1;
+        repeat (i) {
+            p *= 10;
+        }
+        b = b.store_uint(48 + (n / p) % 10, 8);
+    }
+    return b;
+}
+
+;; The op of a full-body bounce, new_bounce_body#fffffffe, and of the old one.
+const int bounce::new = 0xfffffffe;
+const int bounce::old = 0xffffffff;
+
+;; The 6 leading bits of an internal message flags: bit 0 of the incoming `flags` is the bounced flag.
+int bounced?(int flags) inline {
+    return flags & 1;
+}
+
+;;
+;; closing the tree: what it costs, shared by the Jackpot (sweep, close_subtree) and the nodes
+;;
+
+int get_gas_fee(int gas_used, int is_mc) asm "GETGASFEE";
+int get_forward_fee(int cells, int bits, int is_mc) asm "GETFORWARDFEE";
+
+;; The forwarding of one close_node (op, query_id, next_position: 128 bits in the body, no StateInit), counted with
+;; more cells and bits than the real message has, so it is never underestimated.
+int close_forward_fee() inline {
+    return get_forward_fee(2, 1023, 0);
+}
+
+;; One node's term: its gas bound at the current price and the forwarding of its close_node.
+int node_term(int level) inline {
+    return get_gas_fee(level == 1 ? close::gas_1 : close::gas_inner, 0) + close_forward_fee();
+}
+
+;; The unscaled cost of closing node (level, index) and every node under it when positions 0 .. n - 1 exist:
+;; at each level l' <= level, max(0, ceil(span / 64^l')) existing nodes, each at its term. Node (level, index) covers
+;; positions [index * 64^level, (index + 1) * 64^level).
+int subtree_cost_with(int level, int index, int n, int t1, int ti) inline {
+    int base = index << (tree::bits * level);
+    int top = min(n, (index + 1) << (tree::bits * level));
+    int span = max(top - base, 0);
+    int cost = ((span + 63) >> tree::bits) * t1;
+    int l = 2;
+    while l <= level {
+        int sh = tree::bits * l;
+        cost += ((span + (1 << sh) - 1) >> sh) * ti;
+        l += 1;
+    }
+    return cost;
+}
+
+int subtree_cost(int level, int index, int n) inline_ref {
+    return subtree_cost_with(level, index, n, node_term(1), node_term(2));
+}
+
+;; The cascade's funding: the top node's subtree cost times the margin, rounded up. 0 when no position was ever assigned.
+int close_cost(int n) inline_ref {
+    if n == 0 {
+        return 0;
+    }
+    return (subtree_cost(tree::levels, 0, n) * close::margin_num + close::margin_den - 1) / close::margin_den;
+}
+
+;; The same for one node closed by close_subtree.
+int close_cost_at(int level, int index, int n) inline_ref {
+    return (subtree_cost(level, index, n) * close::margin_num + close::margin_den - 1) / close::margin_den;
 }

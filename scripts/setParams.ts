@@ -3,7 +3,7 @@ import { Sender } from '@ton/core'
 import { amount, askAmount, askInteger, confirmSend, openJackpot, warnIfNotRole, done } from './lib/common'
 
 // Sets one governor parameter: burn share, smallest pot, burn batch or minimum deposit. Run it again for
-// the next one. The contract refuses a burn share above 2000 basis points and a minimum deposit below 1.
+// the next one; the rise minimum and the minimum gap have their own scripts (setRiseMin, setMinGap). The contract refuses a burn share above 2000 basis points and a minimum deposit below 1.
 export async function run(provider: NetworkProvider) {
     const ui = provider.ui()
     const jackpot = await openJackpot(provider)

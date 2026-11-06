@@ -1,0 +1,339 @@
+;; A jGRAM wallet: one per player, however many times they deposit. It holds the player's principal (1 jGRAM
+;; is 1 GRAM of principal, in nano-GRAM), the player's position in the tree, and `pending`, the number of
+;; deposits in flight plus a full withdrawal not yet closed or bounced. It is a jetton wallet that cannot send: the
+;; only ways to change the balance are a booking (deposit_booked) and a burn, and both go through the Jackpot.
+;;
+;; The address follows from (jackpot, owner) alone. The first prepare adds the rest to the data. The code is
+;; fixed: wallets cannot be upgraded, and the Jackpot keeps the code in full, never as a library cell.
+;;
+;; A wallet with a balance always has a position, and a wallet with no position and `pending` above 0 is
+;; "opening": its first booking is under way, and a second prepare_deposit is answered busy until it ends.
+;; When the balance and `pending` are both 0 the Jackpot closes the wallet and its GRAM returns to the owner.
+
+#include "imports/utils.fc";
+
+global slice jackpot;
+global slice owner;
+global int set_up?;
+global int balance;
+global int has_position?;
+global int position;
+global int pending;
+
+() load_data() impure inline {
+    slice ds = get_data().begin_parse();
+    jackpot = ds~load_msg_addr();
+    owner = ds~load_msg_addr();
+    ;; the init data, which fixes the address, ends here; the first prepare adds the rest
+    set_up? = ds.slice_bits() > 0;
+    if set_up? {
+        balance = ds~load_coins();
+        has_position? = ds~load_int(1);
+        position = ds~load_uint(32);
+        pending = ds~load_uint(32);
+    } else {
+        balance = 0;
+        has_position? = false;
+        position = 0;
+        pending = 0;
+    }
+    ds.end_parse();
+}
+
+() save_data() impure inline {
+    begin_cell()
+        .store_slice(jackpot)
+        .store_slice(owner)
+        .store_coins(balance)
+        .store_int(has_position?, 1)
+        .store_uint(position, 32)
+        .store_uint(pending, 32)
+        .end_cell()
+        .set_data();
+}
+
+int opening?() inline {
+    return (~ has_position?) & (pending > 0);
+}
+
+;; The wallet is finished: all its GRAM goes to the owner in the message that deletes the account.
+() close_self() impure inline_ref {
+    builder body = begin_cell()
+        .store_uint(op::gas_excess, 32)
+        .store_uint(0, 64);
+    send_msg(false, owner.to_builder(), null(), body, 0, send::unreserved_balance + send::destroy_if_zero);
+}
+
+;; A prepare_deposit from the Jackpot, carrying the wallet's StateInit the first time. While an earlier first booking
+;; is under way it answers busy and changes nothing. The answer carries the deposit's context back, bounceable, and
+;; if it cannot be sent the prepare bounces.
+() prepare_deposit(slice src, slice s) impure inline {
+    int query_id = s~load_uint(64);
+    cell context = s~load_ref();
+    s.end_parse();
+
+    throw_unless(err::access_denied, equal_slice_bits(src, jackpot));
+
+    int busy? = opening?();
+    ifnot busy? {
+        set_up? = true;
+        pending += 1;
+    }
+
+    builder body = begin_cell()
+        .store_uint(op::deposit_ready, 32)
+        .store_uint(query_id, 64)
+        .store_int(busy?, 1)
+        .store_int(has_position?, 1);
+    if has_position? {
+        body = body.store_uint(position, 32);
+    }
+    send_msg(true, jackpot.to_builder(), null(), body.store_ref(context), 0, send::remaining_value + send::bounce_if_failed);
+}
+
+;; A booking: the principal joins the balance, and the position is the one the Jackpot booked it at. Nothing throws.
+() deposit_booked(slice src, slice s) impure inline {
+    int query_id = s~load_uint(64);
+    int c = s~load_coins();
+    int b = s~load_uint(32);
+    slice reply = s~load_ref().begin_parse();
+    s.end_parse();
+
+    throw_unless(err::access_denied, equal_slice_bits(src, jackpot));
+
+    balance += c;
+    pending = max(pending - 1, 0);
+    has_position? = true;
+    position = b;
+
+    ;; the reserve is topped up to its target first, then the notification and the rest of the value
+    raw_reserve(fee::wallet_storage, reserve::at_most);
+    slice depositor = reply~load_msg_addr();
+    slice response = reply~load_msg_addr();
+    int fwd = reply~load_coins();
+    cell payload = reply~load_maybe_ref();
+    if fwd > 0 {
+        builder note = begin_cell()
+            .store_uint(op::transfer_notification, 32)
+            .store_uint(query_id, 64)
+            .store_coins(c)
+            .store_slice(depositor);
+        note = payload.null?() ? note.store_uint(0, 1) : note.store_uint(1, 1).store_ref(payload);
+        send_msg(false, owner.to_builder(), null(), note, fwd, send::pay_gas_separately + send::ignore_errors);
+    }
+    builder excess = begin_cell()
+        .store_uint(op::gas_excess, 32)
+        .store_uint(query_id, 64);
+    send_msg(false, response.to_builder(), null(), excess, 0, send::unreserved_balance + send::ignore_errors);
+}
+
+;; A deposit that ended without a booking, or whose deposit_ready bounced.
+() release_one() impure inline_ref {
+    pending = max(pending - 1, 0);
+    if (balance == 0) & (pending == 0) {
+        close_self();
+    }
+}
+
+() deposit_cancelled(slice src, slice s) impure inline {
+    s~load_uint(64);
+    s.end_parse();
+
+    throw_unless(err::access_denied, equal_slice_bits(src, jackpot));
+    release_one();
+}
+
+() close_wallet(slice src, slice s) impure inline {
+    s~load_uint(64);
+    s.end_parse();
+
+    throw_unless(err::access_denied, equal_slice_bits(src, jackpot));
+    ;; the close that answers a full withdrawal: that withdrawal raised pending, and this lowers it again
+    pending = max(pending - 1, 0);
+    if (balance == 0) & (pending == 0) {
+        close_self();
+    }
+}
+
+;; TEP-74 burn. From the owner: x = 0 withdraws the whole balance; a partial withdrawal takes at least 1 GRAM of
+;; principal, so that the hGRAM paid for it is never 0. From the Jackpot (a `w` or withdraw_for): all of it, and it
+;; never throws. The wallet does not close here: if it were gone, a bounce of burn_notification would have nowhere
+;; to restore to. A withdrawal that empties the balance counts as a message in flight (pending + 1), so that a
+;; release of some other deposit cannot close the wallet before the Jackpot has heard of the withdrawal; the
+;; Jackpot's close_wallet lowers it again.
+() burn(slice src, slice s) impure inline {
+    int query_id = s~load_uint(64);
+    int x = s~load_coins();
+    slice response = s~load_msg_addr();
+    cell options = s~load_maybe_ref();
+    s.end_parse();
+
+    int from_jackpot? = equal_slice_bits(src, jackpot);
+    int incoming = get_incoming_value().pair_first();
+
+    if from_jackpot? {
+        if balance == 0 {
+            ;; nothing to take: the value goes to the owner, and a wallet with nothing pending goes away
+            if pending == 0 {
+                close_self();
+            } else {
+                raw_reserve(fee::wallet_storage, reserve::at_most);
+                builder excess = begin_cell().store_uint(op::gas_excess, 32).store_uint(query_id, 64);
+                send_msg(false, owner.to_builder(), null(), excess, 0, send::unreserved_balance + send::ignore_errors);
+            }
+            return ();
+        }
+        x = balance;
+    } else {
+        throw_unless(err::not_set_up, set_up?);
+        throw_unless(err::access_denied, equal_slice_bits(src, owner));
+        int needed = fee::withdraw;
+        if ~ options.null?() {
+            slice os = options.begin_parse();
+            throw_unless(err::invalid_parameters, os~load_uint(32) == op::withdraw_options);
+            os~load_int(1);
+            needed += os~load_coins();
+            cell payload = os~load_maybe_ref();
+            os.end_parse();
+            ifnot payload.null?() {
+                needed += fee::payload;
+                throw_unless(err::invalid_parameters, payload_fits?(payload));
+            }
+        }
+        throw_unless(err::insufficient_fee, incoming >= needed);
+        throw_unless(err::invalid_parameters, response.addr_none?() | base_addr?(response));
+        ifnot x {
+            x = balance;
+        }
+        throw_unless(err::invalid_parameters, x > 0);
+        throw_unless(err::insufficient_funds, x <= balance);
+        throw_unless(err::invalid_parameters, (x == balance) | (x >= min_partial_withdrawal));
+    }
+
+    balance -= x;
+    int last? = balance == 0;
+    if last? {
+        pending += 1;
+    }
+
+    ;; x and last in the fields a bounce returns
+    builder body = begin_cell()
+        .store_uint(op::burn_notification, 32)
+        .store_uint(query_id, 64)
+        .store_coins(x)
+        .store_slice(owner)
+        .store_slice(response)
+        .store_int(last?, 1)
+        .store_uint(position, 32)
+        .store_maybe_ref(options);
+    send_msg(true, jackpot.to_builder(), null(), body, 0, send::remaining_value + send::bounce_if_failed);
+}
+
+;; Never throws. A bounced burn_notification restores the balance (and the pending count a full withdrawal raised)
+;; and sends what came back to the owner. A bounced deposit_ready that had raised pending counts as a release. The
+;; new format carries the whole original body; the old one only its first 256 bits.
+() on_bounce(slice s) impure inline {
+    int format = s~load_uint(32);
+    slice o = s;
+    int new? = format == bounce::new;
+    if new? {
+        o = s~load_ref().begin_parse();
+    } else {
+        ifnot format == bounce::old {
+            return ();
+        }
+    }
+    int op = o~load_uint(32);
+    int query_id = o~load_uint(64);
+
+    if op == op::burn_notification {
+        int x = o~load_coins();
+        int last? = false;
+        if new? {
+            o~load_msg_addr();
+            o~load_msg_addr();
+            last? = o~load_int(1);
+        }
+        ;; the old format keeps no `last`: pending stays as it is, one too high at worst, and no principal is lost
+        balance += x;
+        if last? {
+            pending = max(pending - 1, 0);
+        }
+        raw_reserve(fee::wallet_storage, reserve::at_most);
+        builder excess = begin_cell().store_uint(op::gas_excess, 32).store_uint(query_id, 64);
+        send_msg(false, owner.to_builder(), null(), excess, 0, send::unreserved_balance + send::ignore_errors);
+        return ();
+    }
+    if op == op::deposit_ready {
+        ;; busy comes first in the body, so that even the old format holds it
+        ifnot o~load_int(1) {
+            release_one();
+        }
+    }
+}
+
+() recv_internal(cell in_msg_full, slice s) impure {
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    slice src = cs~load_msg_addr();
+
+    if flags & 1 {
+        load_data();
+        if set_up? & equal_slice_bits(src, jackpot) {
+            on_bounce(s);
+        }
+        return save_data();
+    }
+
+    if s.slice_bits() < 32 {
+        return (); ;; plain GRAM: anyone may top up the storage reserve
+    }
+
+    int op = s~load_uint(32);
+    if op == op::top_up {
+        return ();
+    }
+
+    load_data();
+    if op == op::prepare_deposit {
+        prepare_deposit(src, s);
+        return save_data();
+    }
+    if op == op::deposit_booked {
+        deposit_booked(src, s);
+        return save_data();
+    }
+    if op == op::deposit_cancelled {
+        deposit_cancelled(src, s);
+        return save_data();
+    }
+    if op == op::close_wallet {
+        close_wallet(src, s);
+        return save_data();
+    }
+    if op == op::burn {
+        burn(src, s);
+        return save_data();
+    }
+    if op == op::send_tokens {
+        throw(err::not_transferable);
+    }
+
+    throw(err::invalid_op);
+}
+
+;;
+;; get methods
+;;
+
+;; TEP-74: ( balance, owner, jetton master, wallet code )
+var get_wallet_data() method_id {
+    load_data();
+    return ( balance, owner, jackpot, my_code() );
+}
+
+;; ( jackpot, owner, set_up, balance, has_position, position, pending )
+var get_wallet_state() method_id {
+    load_data();
+    return ( jackpot, owner, set_up?, balance, has_position?, position, pending );
+}

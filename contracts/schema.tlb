@@ -1,9 +1,16 @@
-// Hipo Jackpot: every message the Jackpot, its node contracts and its range contracts send or accept.
+// Hipo Jackpot v2, amendment 1: every message the Jackpot, its jGRAM wallets and its node contracts send or
+// accept, their storage, and their logs. The design is docs/specs/2026-10-31-jackpot-v2.md as amended by
+// docs/specs/2026-11-03-jackpot-v2-amendment-1.md.
 //
-// Op codes are crc32("jackpot::<constructor name>"), so they cannot collide with Hipo's. Hipo's own
-// messages (deposit_coins, provide_current_quote, take_current_quote, send_tokens, transfer_notification,
-// gas_excess, top_up) are listed at the end with Hipo's codes; their layout is Hipo's
-// (HipoFinance/contract, contracts/schema.tlb).
+// Op codes are crc32("jackpot::<constructor name>"), so they cannot collide with Hipo's. The TEP ones keep their
+// codes. Hipo's own messages (provide_current_quote, take_current_quote, send_tokens, transfer_notification,
+// unstake_tokens, withdrawal_notification, gas_excess, top_up) are listed near the end with Hipo's codes; their
+// layout is Hipo's (HipoFinance/contract, contracts/schema.tlb).
+//
+// Every bounceable message the Jackpot and its wallets send asks for a full-body bounce: the bounce is
+// new_bounce_body#fffffffe original_body:^Cell original_info:^BouncedMessageInfo value_and_gas:^Cell. The
+// receiver reads the whole original body from the ref. The old bounce, #ffffffff and the first 256 bits, is read
+// by the wallet only.
 
 // Standard types.
 
@@ -25,131 +32,228 @@ addr_var$11 anycast:(Maybe Anycast) addr_len:(## 9) workchain_id:int32 address:(
 _ _:MsgAddressInt = MsgAddress;
 _ _:MsgAddressExt = MsgAddress;
 
-// Jackpot storage. version = 1; the deploy data has version = 0, which the first message checks
-// (b_share <= 2000, min_deposit >= 1) and rewrites as version 1.
+// Jackpot storage. version = 1; the deploy data has version = 0, which the first message accepts and rewrites as
+// version 1. Nothing in it is a record: no dictionary of quotes, payouts or claims.
 
 _ b_share:uint16 min_pot:Coins burn_batch:Coins min_deposit:Coins = Params;
-_ round_since:uint32 rate_coins:uint128 rate_tokens:uint128 = LastStart;
-// n, K_next, L_lo, L_hi
-_ next_booking:uint32 k_next:uint32 l_lo:Coins l_hi:Coins = Tree;
-_ burn_owed:Coins carried:Coins params:^Params last_start:^LastStart tree:^Tree = Extra;
-_ query_id:uint64 drand_round:uint64 randomness_time:uint32 p0:Coins p1:Coins p2:Coins = DrawMisc;
-// slots: bits 0..2 = slot i open; bits 8+8i .. 15+8i = attempt of slot i. e = E, eligible = draw_L.
-_ state:uint2 draw_id:uint32 e:uint32 eligible:Coins seed:uint256 slots:uint32 misc:^DrawMisc = Draw;
+// the boundary: its time and rate, and the two rules that make the next one. A boundary is made when the rate
+// rose by rise_min parts per million since boundary_coins/boundary_tokens and min_gap seconds have passed.
+// next_min_gap != 0 is a set_min_gap that takes over at the next boundary.
+_ last_boundary:uint32 boundary_coins:uint128 boundary_tokens:uint128 rise_min:uint32 min_gap:uint32
+    next_min_gap:uint32 last_unstake:uint32 = Boundary;
+// burn_owed, carried, unstaking (U), next_position (n), tag (the snapshot counter)
+_ burn_owed:Coins carried:Coins unstaking:Coins next_position:uint32 tag:uint32 params:^Params
+    boundary:^Boundary content:^Cell = Extra;
+_ p0:Coins p1:Coins p2:Coins = DrawMisc;
+// state: 0 none, 1 waiting, 2 resolving. No quoting state: the pot is fixed at the boundary.
+// snapshot_tickets = draw_L. seed = sha256 of the signature and mc_hash once a submit is accepted, else 0.
+// slots: bits 0..2 = slot i open; bits 8+8i .. 15+8i = attempt of slot i.
+// mc_hash = root hash of the newest masterchain block the last boundary saw.
+_ state:uint2 snapshot_tickets:Coins seed:uint256 slots:uint32 mc_hash:uint256 misc:^DrawMisc = Draw;
 _ parent:MsgAddress wallet_code:^Cell = Hipo;
 _ burner:MsgAddress governor:MsgAddress halter:MsgAddress = Roles;
-// wallet = addr_none in the init data: derived from the Jackpot's own address on the first message
-_ treasury:MsgAddress wallet:MsgAddress range_code:^Cell node_code:^Cell hipo:^Hipo roles:^Roles = Addresses;
+// wallet = addr_none in the init data: derived from the Jackpot's own address on the first message.
+// jetton_wallet_code and node_code are in full, never library cells.
+_ treasury:MsgAddress wallet:MsgAddress jetton_wallet_code:^Cell node_code:^Cell hipo:^Hipo roles:^Roles
+    = Addresses;
+// retired: no new deposits. successor: where a withdrawal with to_successor goes, addr_none if none.
+// successor_deposit_fee: the GRAM a move to the successor must carry for its deposit. swept: the end is done.
+_ retired:Bool successor:MsgAddress successor_deposit_fee:Coins swept:Bool = Retirement;
 
-// pending: query_id -> PendingDeposit. cap = floor(coins·TT/TC) at the quote stored at the deposit.
-_ owner:MsgAddress coins:Coins cap:Coins created_at:uint32 = PendingDeposit;
-// quotes: query_id -> QuoteRecord
-booking$00 owner:MsgAddress tokens:Coins = QuoteKind;
-withdrawal$01 owner:MsgAddress b:uint32 amount:Coins = QuoteKind;
-draw$10 = QuoteKind;
-refresh$11 = QuoteKind;
-_ created_at:uint32 kind:QuoteKind = QuoteRecord;
-// payouts: query_id -> PayoutRecord; kind 0 = other, 1 = burn, 2 = prize
-_ kind:uint2 recipient:MsgAddress amount:Coins = PayoutRecord;
-// claimable: slice_hash (the cell representation hash) of the owner's address slice -> Claim. A prize claim waits while the rate has fallen.
-_ owner:MsgAddress prize:Coins other:Coins = Claim;
-_ pending:(HashmapE 64 PendingDeposit) quotes:(HashmapE 64 QuoteRecord)
-    payouts:(HashmapE 64 PayoutRecord) claimable:(HashmapE 256 Claim) = Books;
-
-_ version:uint8 total_tokens:Coins in_flight:Coins set_aside:Coins principal:Coins
+// held_tokens = hGRAM the Jackpot holds by its own count; incoming_tokens = deposits received, not yet booked or
+// returned; reserved_tokens = prizes of the open draw and burn owed; principal = GRAM owed to players;
+// tickets = live tickets, always equal to principal. quote_* = the stored rate, from the last poke's reply.
+_ version:uint8 held_tokens:Coins incoming_tokens:Coins reserved_tokens:Coins principal:Coins tickets:Coins
     quote_coins:uint128 quote_tokens:uint128 query_counter:uint32 halted:Bool falling:Bool
-    extra:^Extra draw:^Draw addresses:^Addresses books:^Books = JackpotStorage;
+    extra:^Extra draw:^Draw addresses:^Addresses retirement:^Retirement = JackpotStorage;
 
-// Range storage. The init data, which with the code fixes the address, is the first three fields;
-// node = the address hash of node(1, floor(b / 64)). The setup appends the booking ref; a range that was
-// never set up is the init data alone, with no ref and no flag bit (the code tests for the ref).
-
-_ jackpot:MsgAddress b:uint32 node:uint256 = RangeInitData;
-_ owner:MsgAddress length:Coins live:Coins = Booking;
-_ jackpot:MsgAddress b:uint32 node:uint256 booking:^Booking = RangeStorage;
+// jGRAM wallet storage. The init data, which with the code fixes the address, is the first two fields;
+// the first prepare_deposit adds the rest. A wallet with a balance always has a position. pending = deposits in
+// flight, plus a full withdrawal the Jackpot has not yet closed or bounced; a wallet with no position and
+// pending > 0 is "opening" and answers busy to a second prepare_deposit.
+_ jackpot:MsgAddress owner:MsgAddress = WalletInitData;
+_ jackpot:MsgAddress owner:MsgAddress balance:Coins has_position:Bool position:uint32 pending:uint32
+    = WalletStorage;
 
 // Node storage. The init data fixes the address; the first update from the parent adds the rest.
 // An array holds one Coins per child, 64 of them: 8 chunk sums, then 2 refs of 4 chunks of 8 values.
-// committed[c] - held[c] = the live tickets below child c once the held updates are folded in.
+// committed = the snapshot; committed + added - removed = the truth. A level-1 node also holds the owner
+// address hash of each of its 64 positions, 3 to a leaf cell, in a tree of 4-ref cells three deep.
 
-_ jackpot:MsgAddress level:uint8 index:uint32 range_code_hash:uint256 range_code_depth:uint16 = NodeInitData;
+_ jackpot:MsgAddress level:uint8 index:uint32 = NodeInitData;
 _ v0:Coins v1:Coins v2:Coins v3:Coins v4:Coins v5:Coins v6:Coins v7:Coins = Chunk;
 _ sums:Chunk h0:^[ ^Chunk ^Chunk ^Chunk ^Chunk ] h1:^[ ^Chunk ^Chunk ^Chunk ^Chunk ] = NodeArray;
+_ owner0:bits256 owner1:bits256 owner2:bits256 = OwnerLeaf;
 // parent = the address hash of node(level + 1, floor(index / 64)); 0 for the top node, whose parent is
-// the Jackpot. pending_draw = the draw the held updates belong to, 0 when none.
-_ init:NodeInitData parent:uint256 pending_draw:uint32 committed:^NodeArray held:^NodeArray = NodeStorage;
+// the Jackpot. tag = the latest snapshot the node has folded. owners is present at level 1 only.
+_ init:NodeInitData parent:uint256 tag:uint32 committed:^NodeArray added:^NodeArray removed:^NodeArray
+    owners:^Cell = NodeStorage;
 
 // The position of slot i, attempt j: hash exactly these 272 bits with sha256, read the hash as a uint256,
-// and take it mod draw_L.
+// and take it mod snapshot_tickets. seed = sha256(signature, mc_hash).
 
 _ seed:uint256 slot:uint8 attempt:uint8 = PositionPreimage;
 
-// Entry messages (internal, to the Jackpot unless noted). Each must carry at least its fee
-// (get_jackpot_fees), or it is refused before anything changes.
+// Poke. Anyone, with at least the poke fee (get_jackpot_fees). The Jackpot asks the treasury for its rate and
+// makes a boundary if the reply says the rate rose enough and the gap has passed. The rest of the value goes back
+// to the poker.
+poke#5444df0f query_id:uint64 = InternalMsgBody;
+// the context the Jackpot puts in the quote request's custom_payload: tag 3, the time, the poker
+_ tag:(## 4) { tag = 3 } time:uint32 poker:MsgAddress = PokeContext;
 
-// value = coins to stake + fee; the depositor must be on the basechain; refused before the first quote
-deposit#7c6bacac query_id:uint64 = InternalMsgBody;
-// hGRAM deposit: Hipo's send_tokens to the Jackpot with forward_ton_amount >= the hGRAM deposit fee
+// Deposit. The player sends hGRAM to the Jackpot (Hipo's send_tokens, recipient = the Jackpot) with
+// forward_ton_amount >= the deposit fee (get_jackpot_fees), plus fwd and fee::payload when the options ask for
+// them, and optionally this forward payload, inline or in a ref. Without options the price limit is 1%: the
+// deposit is refused if c < v - v / 100. beneficiary and response_destination: addr_none means the depositor;
+// otherwise a basechain address other than the Jackpot. forward_ton_amount and forward_payload ride on the
+// transfer_notification the beneficiary's wallet sends the beneficiary.
+deposit_options#8785a274 min_c:Coins beneficiary:MsgAddress response_destination:MsgAddress
+    forward_ton_amount:Coins forward_payload:(Maybe ^Cell) = DepositOptions;
+// The refund of a deposit that came with options carries this as its forward payload, so that a contract that
+// deposited can tell why. payload = the deposit's own forward_payload, absent when the options could not be read.
+// reason: 1 halted, 2 retired, 3 rate_falling, 4 below_min_deposit, 5 price, 6 wallet_busy, 7 tree_full,
+// 8 bad_options, 9 low_value, 10 wallet_unavailable. A deposit without options is refunded with a text comment.
+deposit_refused#a763e68f reason:uint8 payload:(Maybe ^Cell) = DepositRefused;
 
-// to a range, from its owner. amount = 0 withdraws the whole live part; a partial amount is at least
-// 1 GRAM of principal. value >= the withdraw fee, plus get_surcharge(b, amount) in a draw's window from a
-// range the draw can pick; anything above both is returned.
-withdraw#35528864 query_id:uint64 amount:Coins = InternalMsgBody;
+// Each step of a deposit is one transaction. The context travels in a ref through the wallet and back, so the
+// Jackpot keeps no record of the deposit.
+_ query_id:uint64 tokens:Coins has_options:Bool min_c:has_options?Coins
+    forward_ton_amount:Coins forward_payload:(Maybe ^Cell) parties:^[ beneficiary:MsgAddress
+    depositor:MsgAddress response_destination:MsgAddress ] = DepositContext;
+// Jackpot -> wallet, bounceable, with the wallet's StateInit; bounces if the wallet is frozen
+prepare_deposit#4ac19f29 query_id:uint64 context:^DepositContext = InternalMsgBody;
+// wallet -> Jackpot, bounceable, +16, mode 64. busy = the wallet is opening and took nothing: the Jackpot
+// refunds. A bounced deposit_ready with busy = 0 counts as a release at the wallet.
+deposit_ready#c8682b07 query_id:uint64 busy:Bool has_position:Bool b:has_position?uint32
+    context:^DepositContext = InternalMsgBody;
+// Jackpot -> wallet: the booking. balance += c, pending -= 1, the position is b; the wallet then sends the
+// transfer_notification of the beneficiary (when forward_ton_amount > 0) and the gas_excess of the response
+// destination. reply = depositor, response_destination, forward_ton_amount, forward_payload.
+deposit_booked#42e3c02d query_id:uint64 c:Coins b:uint32
+    reply:^[ depositor:MsgAddress response_destination:MsgAddress forward_ton_amount:Coins
+    forward_payload:(Maybe ^Cell) ] = InternalMsgBody;
+// Jackpot -> wallet: the deposit ended without a booking (refused, or the deposit_ready had nothing to book)
+deposit_cancelled#a3d4c7cf query_id:uint64 = InternalMsgBody;
+// Jackpot -> wallet: after a full withdrawal; deletes the wallet if balance = 0 and pending = 0
+close_wallet#0cba59a9 query_id:uint64 = InternalMsgBody;
 
-start_draw#b9af1e01 query_id:uint64 = InternalMsgBody;
+// Withdrawal is a TEP-74 burn, sent to the wallet by its owner. amount = 0 withdraws the whole balance (and
+// needs a balance above 0); a partial amount is at least 1 GRAM of principal. value >= the withdraw fee (plus
+// forward_ton_amount in the options, plus fee::payload with a payload); the rest is returned. The tokens come
+// back by the Jackpot's send_tokens, at the stored rate; a withdrawal is paid even while halted, retired or the
+// rate has fallen, at w = min(x * TT / TC, F * x / P).
+// to_successor: the Jackpot sends the tokens to the successor, as a deposit for the owner, when one is set.
+withdraw_options#63a28f24 to_successor:Bool forward_ton_amount:Coins forward_payload:(Maybe ^Cell)
+    = WithdrawOptions;
+burn#595f07bc query_id:uint64 amount:Coins response_destination:MsgAddress custom_payload:(Maybe ^WithdrawOptions)
+    = InternalMsgBody;
+// wallet -> Jackpot, bounceable, mode 64, +16. last = the withdrawal emptied the wallet: the wallet then counts it
+// as in flight until the Jackpot's close_wallet. A bounce restores the balance from the first fields.
+burn_notification#7bdd97de query_id:uint64 amount:Coins owner:MsgAddress response_destination:MsgAddress
+    last:Bool b:uint32 options:(Maybe ^WithdrawOptions) = InternalMsgBody;
+
+// A plain message to the Jackpot with the text comment "w" (or "W"), a basechain sender and at least the
+// comment-withdraw fee: the Jackpot burns the sender's whole balance for them, deploying the wallet if need be.
+// An empty comment is a top-up; any other text is refused with bad_comment.
+// The same burn, sent by the Jackpot to the wallet (custom_payload = withdraw_options with forward_ton_amount 1
+// and the comment "Hipo Jackpot withdrawal"), serves `w` and withdraw_for. It never throws at the wallet.
+
+// TEP-89. Anyone; the reply is not stateful.
+provide_wallet_address#2c76b973 query_id:uint64 owner_address:MsgAddress include_address:Bool
+    = InternalMsgBody;
+take_wallet_address#d1735400 query_id:uint64 wallet_address:MsgAddress owner_address:(Maybe ^MsgAddress)
+    = InternalMsgBody;
+
+// Draw entry messages, to the Jackpot. Each must carry at least its fee (get_jackpot_fees).
 // signature: exactly 48 bytes, a compressed G1 point; witness: drand.fc's layout,
-// q0:uint132 r0:bits384 ^[q1:uint132 r1:bits384]
+// q0:uint132 r0:bits384 ^[q1:uint132 r1:bits384]. Accepted only for the drand round that follows the boundary
+// by drand_delay (60 s), while the draw waits, until submit_cutoff (1800 s) before the earliest next boundary.
 submit_randomness#52cc77c3 query_id:uint64 signature:^Cell witness:^Cell = InternalMsgBody;
-// the Jackpot computes the position; what the message carries above the fee rides down the tree
-locate#100ffec7 query_id:uint64 slot:uint8 = InternalMsgBody;
-requote#fa418de9 query_id:uint64 target:uint64 = InternalMsgBody;
-expire#ff25ead2 query_id:uint64 slot:uint8 = InternalMsgBody;
-claim#e53d2340 query_id:uint64 = InternalMsgBody;
+// anyone, when the float is below what a draw needs, in state none or waiting; no quote: u is computed at the
+// stored rate
+refill#a16904fa query_id:uint64 = InternalMsgBody;
 
-// Between the Jackpot, its nodes and its ranges.
+// Between the Jackpot and its nodes.
 
-// bounceable; query_id = b and length first, so that a bounce carries what undoes the booking
-range_setup#e82ed41c query_id:uint64 length:Coins owner:MsgAddress = InternalMsgBody;
-// amount comes first so that a bounce carries it back; sent = what the owner sent the range
-withdrawn#32e2541b query_id:uint64 amount:Coins b:uint32 owner:MsgAddress sent:Coins = InternalMsgBody;
-// down the tree, from each parent to the child holding b; tag = the Jackpot's draw_id
-update#4bb1957e query_id:uint64 tag:uint32 deferred:Bool b:uint32 delta:int128 = InternalMsgBody;
+// down the tree, from each parent to the child holding b; tag = the Jackpot's snapshot counter. owner
+// (the address hash) is present on a new position's first update, which also opens the nodes below it.
+update#4bb1957e query_id:uint64 tag:uint32 b:uint32 delta:int128 owner:(Maybe bits256) = InternalMsgBody;
 // down the tree to the position k; offset = k's offset inside the receiving node
-descend#3b4030a5 query_id:uint64 draw:uint32 slot:uint8 attempt:uint8 k:uint128 offset:uint128
+descend#3b4030a5 query_id:uint64 tag:uint32 slot:uint8 attempt:uint8 k:uint128 offset:uint128
     = InternalMsgBody;
-// from the level-1 node to the range; offset = k's offset inside the range
-check#7eda5174 query_id:uint64 draw:uint32 slot:uint8 attempt:uint8 k:uint128 offset:uint128
+// from the level-1 node, which holds the owners: the ticket k is live in the snapshot
+hit#5c850e0e query_id:uint64 tag:uint32 slot:uint8 attempt:uint8 k:uint128 b:uint32 owner:MsgAddress
     = InternalMsgBody;
-hit#5c850e0e query_id:uint64 draw:uint32 slot:uint8 attempt:uint8 k:uint128 b:uint32 owner:MsgAddress
-    = InternalMsgBody;
-miss#847501f7 query_id:uint64 draw:uint32 slot:uint8 attempt:uint8 k:uint128 b:uint32 = InternalMsgBody;
+miss#847501f7 query_id:uint64 tag:uint32 slot:uint8 attempt:uint8 k:uint128 b:uint32 = InternalMsgBody;
 // from a node whose children add up to no more than the offset: cannot happen while the sums agree
-lost#a6208f83 query_id:uint64 draw:uint32 slot:uint8 attempt:uint8 k:uint128 level:uint8 index:uint32
+lost#a6208f83 query_id:uint64 tag:uint32 slot:uint8 attempt:uint8 k:uint128 level:uint8 index:uint32
     = InternalMsgBody;
+// the end of the tree, from the top down. Only the parent (the Jackpot for the top node) may send it, and the node
+// never calls accept_message: its value is the funding. A node whose children do not all sum to 0 ignores it. Else
+// it keeps term - fwd (its gas bound at the current price, less the forwarding its parent already paid), and if the
+// value covers that and the unscaled sum of its children's subtree costs it gives each child that exists (first
+// position below next_position) its share of the rest in proportion to that child's subtree cost, mode 0, and
+// deletes itself, sending its balance to the Jackpot with a gas_excess. Short, it does nothing and keeps the value.
+close_node#07e3e272 query_id:uint64 next_position:uint32 = InternalMsgBody;
 
 // Governance. From the governor, except set_halted, which the halter may send with halted = true.
 
 upgrade_code#1870f697 query_id:uint64 new_code:^Cell = InternalMsgBody;
+// halted only; basechain addr_std without anycast; logs hipo_wallet. Only for a change that keeps one token worth the
+// same (k = 1): a migration with another k is done by the migration upgrade.
 set_hipo_wallet#8ceea056 query_id:uint64 parent:MsgAddress wallet:MsgAddress wallet_code:^Cell
     = InternalMsgBody;
-resolve_pending#0827b963 query_id:uint64 target:uint64 tokens:Coins = InternalMsgBody;
-return_tokens#842c3822 query_id:uint64 owner:MsgAddress amount:Coins = InternalMsgBody;
-settle_failed_payout#f6b46a38 query_id:uint64 target:uint64 = InternalMsgBody;
+// halted only; basechain addr_std without anycast; logs treasury
+set_treasury#f0be6c1c query_id:uint64 treasury:MsgAddress = InternalMsgBody;
+// a TEP-74 transfer from a jetton wallet the Jackpot owns, on the governor's value; refused for the Jackpot's hGRAM
+// wallet (matched by parsed workchain and hash); both addresses basechain addr_std
+rescue_jetton#a24305cd query_id:uint64 jetton_wallet:MsgAddress amount:Coins destination:MsgAddress
+    = InternalMsgBody;
+// a TEP-62 transfer of an NFT item the Jackpot owns, on the governor's value
+rescue_nft#d672136a query_id:uint64 nft:MsgAddress destination:MsgAddress = InternalMsgBody;
+// hGRAM that reached the Jackpot's wallet without a notification, or was held there. in_flight = 0: the tokens
+// enter the count here; 1: they are still counted as incoming and leave that count.
+return_tokens#842c3822 query_id:uint64 owner:MsgAddress amount:Coins in_flight:Bool = InternalMsgBody;
+// after checking at Hipo by hand; 0 < amount <= unstaking_tokens. credit = 1 (a rollback whose hGRAM is back in the
+// wallet): unstaking_tokens -= amount, held_tokens += amount. credit = 0 (the GRAM arrived but its notification was
+// missed): unstaking_tokens -= amount only.
+settle_unstake#81d4ed7a query_id:uint64 amount:Coins credit:Bool = InternalMsgBody;
 set_burn_share#df23bdaf query_id:uint64 burn_share:uint16 = InternalMsgBody;
 set_min_pot#19ee5cbe query_id:uint64 min_pot:Coins = InternalMsgBody;
 set_burn_batch#c82e7221 query_id:uint64 burn_batch:Coins = InternalMsgBody;
 set_min_deposit#0cf62e2f query_id:uint64 min_deposit:Coins = InternalMsgBody;
+// 1 <= rise_min <= 10000 parts per million; takes effect at once
+set_rise_min#a13346fa query_id:uint64 rise_min:uint32 = InternalMsgBody;
+// 3600 <= min_gap <= 2592000 seconds; takes effect at the next boundary
+set_min_gap#996900dc query_id:uint64 min_gap:uint32 = InternalMsgBody;
+set_content#eb4dbc1b query_id:uint64 content:^Cell = InternalMsgBody;
 set_halter#271f8ef1 query_id:uint64 halter:MsgAddress = InternalMsgBody;
 set_halted#d3cb3ba0 query_id:uint64 halted:Bool = InternalMsgBody;
+// also resets the boundary rate to the stored one
 clear_falling#df19084f query_id:uint64 = InternalMsgBody;
 withdraw_surplus#9a30705b query_id:uint64 = InternalMsgBody;
 
+// Retirement. retire stops deposits for good; withdrawals go on.
+retire#f6e41c95 query_id:uint64 = InternalMsgBody;
+// only after retire; addr_none removes the successor. successor_deposit_fee is what a move must carry on top
+// of its tokens: a to_successor withdrawal moves only when its value covers it.
+set_successor#efd50f41 query_id:uint64 successor:MsgAddress successor_deposit_fee:Coins = InternalMsgBody;
+// only after retire, at most 100 owners; owners = address hashes, 3 to a cell, chained by the last ref.
+// The governor pays: n * the comment-withdraw fee (plus the successor fee with to_successor) + one handler;
+// each owner's wallet gets a burn of everything it holds.
+withdraw_for#2742c19b query_id:uint64 to_successor:Bool owners:^Cell = InternalMsgBody;
+// anyone, with fee::sweep + close_cost(next_position), when retired, no principal, no incoming tokens, no unstaking
+// tokens and no draw resolving: a waiting draw ends, the hGRAM goes to the burner, and the tree closes from the top on
+// the sender's value (the float changes by 0 for the close). With next_position = 0 no close_node is sent.
+sweep#ca7fef55 query_id:uint64 = InternalMsgBody;
+// after the sweep only, from the governor, with close_cost of that subtree: restarts the close at one node the
+// cascade left behind (the highest ones standing); 1 <= level <= 4; the node's first position must be below
+// next_position
+close_subtree#4cf9e825 query_id:uint64 level:uint8 index:uint32 = InternalMsgBody;
+
 // Hipo's messages, as the Jackpot uses them.
 
-// to the treasury: owner = addr_none (the Jackpot), an explicit coins, value = coins + the forward
-deposit_coins#3d3761a6 query_id:uint64 owner:MsgAddress coins:Coins ownership_assigned_amount:Coins
-    referrer:MsgAddress = InternalMsgBody;
-// to the treasury, with no custom_payload: the reply is matched by query_id
+// to the treasury; the reply is matched by the context in custom_payload (PokeContext)
 provide_current_quote#ad83913f query_id:uint64 custom_payload:(Maybe ^Cell) = InternalMsgBody;
 take_current_quote#0a420458 query_id:uint64 total_coins:uint128 total_tokens:uint128
     custom_payload:(Maybe ^Cell) = InternalMsgBody;
@@ -157,30 +261,59 @@ take_current_quote#0a420458 query_id:uint64 total_coins:uint128 total_tokens:uin
 send_tokens#0f8a7ea5 query_id:uint64 amount:Coins recipient:MsgAddress return_excess:MsgAddress
     custom_payload:(Maybe ^Cell) forward_ton_amount:Coins forward_payload:(Either Cell ^Cell)
     = InternalMsgBody;
-// from the Jackpot's wallet; sender = the Jackpot itself on a mint, the player on a transfer
+// from the Jackpot's wallet; sender = the Jackpot itself on a mint (ignored), the player on a transfer
 transfer_notification#7362d09c query_id:uint64 amount:Coins sender:MsgAddress
     forward_payload:(Either Cell ^Cell) = InternalMsgBody;
-// confirms a payout only when it comes from the recipient's own hGRAM wallet; also the body of a refund
+// to the Jackpot's wallet, bounceable, in mode auto (no custom_payload), with the unstake fee from the float.
+// The op is the same as burn's, the layout is Hipo's.
+unstake_tokens#595f07bc query_id:uint64 amount:Coins return_excess:MsgAddress custom_payload:(Maybe ^Cell)
+    = InternalMsgBody;
+// from the Jackpot's wallet once Hipo burned the tokens, now or rounds later; matched by sender only
+withdrawal_notification#f0fa223b query_id:uint64 amount:Coins coins:Coins = InternalMsgBody;
+// the body of a refund and of the excess a user chain returns to its owner
 gas_excess#d53276db query_id:uint64 = InternalMsgBody;
-// also what a level-1 node sends back to the Jackpot: the rest of an update's value
 top_up#5372158c query_id:uint64 = InternalMsgBody;
 
-// Logs: external-out messages to addr_extern of 256 bits holding the topic. A log that does not fit
-// inline is sent in a ref.
+// Logs: external-out messages from the Jackpot to addr_none, whose body starts with a 32-bit op,
+// crc32("jackpot::<name>"), as explorers decode them. A log that does not fit in 654 bits is sent in a ref.
 
-booking_log$_ owner:MsgAddress b:uint32 principal:Coins tokens:Coins = Log 1;
-// the payment of a withdrawal, at the quote's reply
-withdrawal_log$_ owner:MsgAddress b:uint32 principal:Coins tokens:Coins = Log 2;
-// e = 0 and pot = 0 when the start only moved the period; carried is the value before the start
-draw_start_log$_ draw_id:uint32 round_since:uint32 e:uint32 eligible:Coins next_cutoff:uint32 pot:Coins
-    burn:Coins carried:Coins ^[p0:Coins p1:Coins p2:Coins drand_round:uint64] = Log 3;
-randomness_log$_ draw_id:uint32 drand_round:uint64 seed:uint256 = Log 4;
-// result: 0 hit, 1 miss, 2 rolled over after A misses, 3 expired, 4 returned (a hit while the rate has
-// fallen: the prize went back into F), 5 lost (b is then the node's index); owner = addr_none unless a hit
-// or returned
-slot_log$_ draw_id:uint32 slot:uint8 attempt:uint8 result:uint8 k:uint128 b:uint32 amount:Coins
-    owner:MsgAddress = Log 5;
-// the update of a withdrawal leaving for the tree, when the Jackpot handles `withdrawn`
-withdrawn_log$_ owner:MsgAddress b:uint32 principal:Coins deferred:Bool = Log 6;
-// a range setup that bounced: the booking undone; tokens wait outside T for return_tokens
-setup_failed_log$_ b:uint32 principal:Coins tokens:Coins = Log 7;
+// a deposit booked: owner = the beneficiary, depositor = who sent the hGRAM
+booking#3b7e3b47 owner:MsgAddress depositor:MsgAddress b:uint32 principal:Coins tokens:Coins = ExtOutMsgBody;
+// the payment of a withdrawal, at the stored rate. last = the wallet is emptied, moved = sent to the successor.
+// quote_coins and quote_tokens: the rate it was paid at.
+withdrawal#9cef1f7e owner:MsgAddress b:uint32 principal:Coins tokens:Coins last:Bool moved:Bool
+    quote_coins:uint128 quote_tokens:uint128 = ExtOutMsgBody;
+// a deposit refused at deposit_ready; the tokens go back. value = v, principal = the c it would have booked,
+// reason as in deposit_refused
+refused#a9f1b394 owner:MsgAddress tokens:Coins value:Coins principal:Coins reason:uint8 = ExtOutMsgBody;
+// a deposit_booked that bounced: the booking undone; the tokens it was worth go back
+booking_undone#ac38ff53 b:uint32 principal:Coins tokens:Coins = ExtOutMsgBody;
+// a boundary. pot = before the unstake; unstaked = the unstake taken from it; carried = before the boundary.
+// The ref is absent when the boundary set no pot aside (no tickets, or a pot below min_pot).
+boundary#cb9aaaba tag:uint32 time:uint32 quote_coins:uint128 quote_tokens:uint128 snapshot_tickets:Coins
+    pot:Coins burn:Coins carried:Coins unstaked:Coins
+    prizes:(Maybe ^[ p0:Coins p1:Coins p2:Coins drand_round:uint64 mc_seqno:uint32 mc_hash:uint256 ])
+    = ExtOutMsgBody;
+// a boundary that found a draw still waiting: the draw keeps its snapshot, its tag and its pot. Alarm on any.
+skip#7bf99681 tag:uint32 time:uint32 quote_coins:uint128 quote_tokens:uint128 reserved:Coins
+    drand_round:uint64 mc_seqno:uint32 mc_hash:uint256 = ExtOutMsgBody;
+randomness#a02c7ffb tag:uint32 drand_round:uint64 seed:uint256 = ExtOutMsgBody;
+// result: 0 hit, 1 miss, 2 rolled over after A misses, 3 expired (rolled over at a boundary with the search
+// still out), 4 returned (a hit while the rate has fallen: the prize went back into F), 5 lost (b is then the
+// node's index); owner = addr_none unless a hit or returned
+slot#9d87edd2 tag:uint32 slot:uint8 attempt:uint8 result:uint8 k:uint128 b:uint32 amount:Coins
+    owner:MsgAddress = ExtOutMsgBody;
+unstake#a5fc9f67 amount:Coins unstaking:Coins float:Coins = ExtOutMsgBody;
+// hGRAM that left the Jackpot's count with no one to answer for it. cause 1: a refund that could not be paid for.
+untracked#f4763a43 cause:uint8 tokens:Coins = ExtOutMsgBody;
+// rise_min, min_gap and the min_gap that takes over at the next boundary (0 for none)
+settings#1c421ecd rise_min:uint32 min_gap:uint32 next_min_gap:uint32 = ExtOutMsgBody;
+retired#a6a4f6b3 = ExtOutMsgBody;
+successor#5de56438 successor:MsgAddress successor_deposit_fee:Coins = ExtOutMsgBody;
+// the end: tokens sent to the burner, and the number of positions the tree close counts to
+swept#e9b4624d tokens:Coins next_position:uint32 = ExtOutMsgBody;
+hipo_wallet#064510fb parent:MsgAddress wallet:MsgAddress = ExtOutMsgBody;
+treasury#5025a5bc treasury:MsgAddress = ExtOutMsgBody;
+// a foreign jetton (amount) or NFT (amount 0) sent back to `sender` (sent = 1) or held for a rescue (sent = 0, written
+// only when the incoming value covers the log); sender is addr_none for a mint
+foreign_return#63eaf860 from:MsgAddress sender:MsgAddress amount:Coins sent:Bool = ExtOutMsgBody;

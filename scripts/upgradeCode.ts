@@ -7,7 +7,7 @@ import { dryRunUpgrade } from './lib/upgradeDryRun'
 
 // Upgrades the Jackpot's code. The old code calls the new code's `migrate` (a method_id, ending in throw(0))
 // in the same transaction (set_c3); if it cannot read the layout the transaction throws and the old code
-// stays. Range and node code are fixed and cannot be upgraded.
+// stays. Wallet and node code are fixed and cannot be upgraded.
 //
 // Before anything is sent: the contracts folder must be clean, the upgrade is replayed in a sandbox on a copy
 // of the live account, and the operator types back the code hash from the audit record.
@@ -34,7 +34,7 @@ export async function run(provider: NetworkProvider) {
     console.info('==============')
     console.info('1. Rebase this repo, and check that the commit below is the audited one')
     console.info('2. Check migrate in jackpot.fc before proceeding: a method_id named migrate, ending in throw(0)')
-    console.info('3. The Jackpot must be halted, with the draw idle and no open quotes or pending deposits')
+    console.info('3. The Jackpot must be halted, with no draw resolving (one waiting is fine)')
     console.info('==============')
     console.info('Git commit:             %s', head)
     console.info('Stored layout version:  %s', String(version))

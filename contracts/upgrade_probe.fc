@@ -6,7 +6,7 @@
 () recv_internal() impure {
 }
 
-() migrate(int old_draw_id, int old_draw_state) impure method_id {
+() migrate(int old_tag, int old_draw_state) impure method_id {
     slice ds = get_data().begin_parse();
     throw_unless(413, ds~load_uint(8) == 1);
     set_data(begin_cell().store_uint(2, 8).store_slice(ds).end_cell());

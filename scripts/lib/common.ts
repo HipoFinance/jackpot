@@ -1,12 +1,11 @@
 import { Address, beginCell, Cell, fromNano, OpenedContract, Sender, toNano } from '@ton/core'
 import { NetworkProvider, UIProvider } from '@ton/blueprint'
-import { DrawState, Jackpot, PayoutKind } from '../../wrappers/Jackpot'
+import { DrawState, Jackpot } from '../../wrappers/Jackpot'
 
 // Shared by the scripts. Blueprint 0.45 finds scripts recursively, so the files in this folder also appear in
 // the `npx blueprint run` menu; choosing one only throws "Function run is missing", which is harmless.
 
 export type JackpotContract = OpenedContract<Jackpot>
-export type Books = Awaited<ReturnType<Jackpot['getBooks']>>
 
 /** Refuses an address that is not on the basechain: Hipo's wallet refuses to pay to any other chain. */
 export function basechain(address: Address, what: string): Address {
@@ -196,6 +195,43 @@ export async function readTreasuryRoles(provider: NetworkProvider, treasury: Add
     return { halter: stack.readAddress(), governor: stack.readAddress() }
 }
 
+/** The treasury's rate (total_coins, total_tokens), the first two fields of get_treasury_state, read on chain. */
+export async function readTreasuryRate(provider: NetworkProvider, treasury: Address) {
+    const { stack } = await provider.provider(treasury).get('get_treasury_state', [])
+    return { coins: stack.readBigNumber(), tokens: stack.readBigNumber() }
+}
+
+interface JettonList {
+    jettons?: { metadata?: { symbol?: string } }[]
+}
+
+/**
+ * Asks an indexer's jetton list whether a jetton already uses a symbol: true, false, or null when the list could
+ * not be read (the caller then asks the person). Reads tonapi's list in pages of 1000, at most 20 pages.
+ */
+export async function symbolInUse(provider: NetworkProvider, symbol: string): Promise<boolean | null> {
+    const base = provider.network() === 'mainnet' ? 'https://tonapi.io' : 'https://testnet.tonapi.io'
+    try {
+        for (let page = 0; page < 20; page++) {
+            const response = await fetch(`${base}/v2/jettons?limit=1000&offset=${String(page * 1000)}`)
+            if (!response.ok) {
+                return null
+            }
+            const body = (await response.json()) as JettonList
+            const jettons = body.jettons ?? []
+            if (jettons.some((j) => j.metadata?.symbol?.toLowerCase() === symbol.toLowerCase())) {
+                return true
+            }
+            if (jettons.length < 1000) {
+                return false
+            }
+        }
+        return null
+    } catch {
+        return null
+    }
+}
+
 export interface Pool {
     /** The Jackpot's hGRAM wallet balance, W; 0 while the wallet does not exist yet. */
     wallet: bigint
@@ -203,9 +239,10 @@ export interface Pool {
     held: bigint
     /** W - T: hGRAM in the wallet that the Jackpot does not count. Every recovery draws on it. */
     outside: bigint
-    /** The sum of the amounts of all open payout records. */
-    payoutsTotal: bigint
-    books: Books
+    /** Deposits received and not yet booked or returned; they are inside T. */
+    incoming: bigint
+    /** hGRAM sent to Hipo to unstake and not yet reported back; outside both W and T. */
+    unstaking: bigint
     halted: boolean
     drawState: number
 }
@@ -223,9 +260,10 @@ export async function readWalletBalance(provider: NetworkProvider, wallet: Addre
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 /**
- * Reads W, T and W - T, the books and the draw state, one call at a time. With `twice` (the default) W and T
- * are read a second time about 10 s later and the smaller W - T is used: payouts in transit and mints before
- * their notification inflate it for a few seconds.
+ * Reads W, T and W - T and the draw state, one call at a time. With `twice` (the default) W and T are read a
+ * second time about 10 s later and the smaller W - T is used: prizes and burns in transit, and mints before
+ * their notification, inflate it for a few seconds. The Jackpot keeps no record of payouts, so nothing else
+ * says that an hGRAM transfer is still on its way.
  */
 export async function readPool(provider: NetworkProvider, jackpot: JackpotContract, twice = true): Promise<Pool> {
     const addresses = await jackpot.getAddresses()
@@ -239,82 +277,29 @@ export async function readPool(provider: NetworkProvider, jackpot: JackpotContra
         provider.ui().write('Reading the pool twice, 10 seconds apart...')
         await sleep(10_000)
         const second = await readOnce()
-        if (second.wallet - second.state.totalTokens < first.wallet - first.state.totalTokens) {
+        if (second.wallet - second.state.heldTokens < first.wallet - first.state.heldTokens) {
             first = second
         }
     }
     const draw = await jackpot.getDrawState()
-    const books = await jackpot.getBooks()
-    let payoutsTotal = 0n
-    for (const p of books.payouts.values()) {
-        payoutsTotal += p.amount
-    }
     return {
         wallet: first.wallet,
-        held: first.state.totalTokens,
-        outside: first.wallet - first.state.totalTokens,
-        payoutsTotal,
-        books,
+        held: first.state.heldTokens,
+        outside: first.wallet - first.state.heldTokens,
+        incoming: first.state.incomingTokens,
+        unstaking: first.state.unstakingTokens,
         halted: first.state.halted,
         drawState: draw.state,
     }
 }
 
-/** Prints W, T, W - T and every open payout and pending record, which all draw on the same outside pool. */
+/** Prints W, T and W - T, the pool every recovery draws on. */
 export function printPool(ui: UIProvider, pool: Pool) {
     ui.write(`Jackpot wallet W:      ${amount(pool.wallet)} hGRAM`)
-    ui.write(`Counted as T:          ${amount(pool.held)} hGRAM`)
+    ui.write(`Counted as T:          ${amount(pool.held)} hGRAM (of which incoming ${amount(pool.incoming)})`)
     ui.write(`Outside T (W - T):     ${amount(pool.outside)} hGRAM`)
-    for (const [id, p] of pool.books.pending) {
-        ui.write(
-            `  pending ${id.toString()}: ${p.owner.toString()} coins ${amount(p.coins)} cap ${amount(p.cap)} at ${String(p.createdAt)}`,
-        )
-    }
-    for (const [id, p] of pool.books.payouts) {
-        ui.write(
-            `  payout ${id.toString()}: ${payoutKindName(p.kind)} ${amount(p.amount)} hGRAM to ${p.recipient.toString()}`,
-        )
-    }
-    ui.write(`Open payouts in all:    ${amount(pool.payoutsTotal)} hGRAM`)
-    ui.write('  (open payouts, pending deposits and returns all draw on the same outside pool)')
-}
-
-/**
- * What a hand recovery may take: W - T less the open payouts, which may still be in transit. The operator
- * can exclude a payout only by typing its id after checking that it was delivered; each one is shown.
- * Returns the available amount and the excluded ids.
- */
-export async function availableOutside(provider: NetworkProvider, pool: Pool) {
-    const ui = provider.ui()
-    let available = pool.outside - pool.payoutsTotal
-    const excluded: bigint[] = []
-    if (pool.books.payouts.size > 0) {
-        const answer = await ui.input(
-            'Open payouts count against the pool. To leave out payouts you have checked were DELIVERED, ' +
-                'type their ids separated by commas (empty: none)',
-        )
-        for (const part of answer
-            .split(',')
-            .map((x) => x.trim())
-            .filter((x) => x !== '')) {
-            const id = BigInt(part)
-            const record = pool.books.payouts.get(id)
-            if (record == null) {
-                throw new Error(`There is no open payout ${part}`)
-            }
-            // a repeated id would count its amount twice and let more out than the pool holds
-            if (excluded.includes(id)) {
-                throw new Error(`Payout ${part} was typed twice`)
-            }
-            ui.write(
-                `  excluded payout ${id.toString()}: ${payoutKindName(record.kind)} ${amount(record.amount)} hGRAM ` +
-                    `to ${record.recipient.toString()}`,
-            )
-            available += record.amount
-            excluded.push(id)
-        }
-    }
-    return { available, excluded }
+    ui.write(`Unstaking at Hipo:     ${amount(pool.unstaking)} hGRAM (in neither W nor T)`)
+    ui.write('  (a prize or burn still in transit also shows in W - T; the lower of two reads is used)')
 }
 
 /**
@@ -350,74 +335,12 @@ export function conclude(ui: UIProvider, problems: string[], verifyOnly: boolean
     return true
 }
 
-export function payoutKindName(kind: number) {
-    return (Object.keys(PayoutKind) as (keyof typeof PayoutKind)[]).find((k) => PayoutKind[k] === kind) ?? String(kind)
-}
-
-/** Throws unless the draw is idle and there are no quotes and no pending deposits. */
-export function requireQuiet(pool: Pool, what: string, alsoPayouts = false) {
-    if (pool.drawState !== DrawState.idle) {
-        throw new Error(`${what}: the draw is not idle`)
-    }
-    if (pool.books.quotes.size > 0 || pool.books.pending.size > 0) {
-        throw new Error(`${what}: quotes or pending deposits are open`)
-    }
-    if (alsoPayouts && pool.books.payouts.size > 0) {
-        throw new Error(`${what}: payouts are open`)
-    }
-}
-
-interface ToncenterTx {
-    account?: string
-    description?: { aborted?: boolean }
-    in_msg?: { source?: string | null; message_content?: { body?: string } }
-}
-
 /**
- * Checks on chain that the transfer of a payout bounced at the recipient's wallet: the transaction is at the
- * recipient's wallet, was aborted, and was a receive_tokens from the Jackpot's wallet with the payout's query
- * id. A success gas_excess that never arrived is NOT evidence of a failure: Hipo sends it with ignore_errors.
- * The transaction is read from toncenter's v3 API; confirm it on an explorer as well.
+ * Throws unless no draw is resolving. A draw that is waiting is quiet: a halted Jackpot or a silent drand leaves
+ * it waiting for good, and no search is in flight.
  */
-export async function verifyBouncedReceive(
-    provider: NetworkProvider,
-    hash: string,
-    recipientWallet: Address,
-    jackpotWallet: Address,
-    queryId: bigint,
-): Promise<string[]> {
-    const base = provider.network() === 'mainnet' ? 'https://toncenter.com' : 'https://testnet.toncenter.com'
-    const response = await fetch(`${base}/api/v3/transactions?hash=${encodeURIComponent(hash)}&limit=1`)
-    if (!response.ok) {
-        throw new Error(`toncenter answered ${String(response.status)}`)
+export function requireQuiet(pool: Pool, what: string) {
+    if (pool.drawState === DrawState.resolving) {
+        throw new Error(`${what}: a draw is resolving`)
     }
-    const body = (await response.json()) as { transactions?: ToncenterTx[] }
-    const tx = body.transactions?.[0]
-    if (tx == null) {
-        throw new Error('No such transaction found')
-    }
-    const problems: string[] = []
-    if (tx.account == null || !Address.parse(tx.account).equals(recipientWallet)) {
-        problems.push(`the transaction is not at the recipient's wallet ${recipientWallet.toString()}`)
-    }
-    if (tx.description?.aborted !== true) {
-        problems.push('the transaction did not abort, so the transfer did not bounce')
-    }
-    if (tx.in_msg?.source == null || !Address.parse(tx.in_msg.source).equals(jackpotWallet)) {
-        problems.push("the message did not come from the Jackpot's wallet")
-    }
-    try {
-        const s = Cell.fromBase64(tx.in_msg?.message_content?.body ?? '').beginParse()
-        const op = s.loadUint(32)
-        const id = s.loadUintBig(64)
-        if (op !== 0x178d4519) {
-            problems.push(`the message is not a receive_tokens (op ${op.toString(16)})`)
-        }
-        if (id !== queryId) {
-            problems.push(`the query id is ${id.toString()}, not ${queryId.toString()}`)
-        }
-    } catch {
-        problems.push('the message body could not be read')
-    }
-    return problems
 }

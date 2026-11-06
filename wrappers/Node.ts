@@ -4,18 +4,11 @@ export interface NodeConfig {
     jackpot: Address
     level: number
     index: bigint
-    rangeCode: Cell
 }
 
-// The init data that fixes a node's address: (jackpot, level, index, range code hash and depth).
+// The init data that fixes a node's address: (jackpot, level, index).
 export function nodeConfigToCell(config: NodeConfig): Cell {
-    return beginCell()
-        .storeAddress(config.jackpot)
-        .storeUint(config.level, 8)
-        .storeUint(config.index, 32)
-        .storeBuffer(config.rangeCode.hash())
-        .storeUint(config.rangeCode.depth(), 16)
-        .endCell()
+    return beginCell().storeAddress(config.jackpot).storeUint(config.level, 8).storeUint(config.index, 32).endCell()
 }
 
 export interface NodeData {
@@ -23,9 +16,11 @@ export interface NodeData {
     level: number
     index: bigint
     initialized: boolean
-    pendingDraw: bigint
+    tag: bigint
     committed: bigint[] // 64 sums, empty before the first update
-    held: bigint[] // 64 withdrawals held back for pendingDraw
+    added: bigint[]
+    removed: bigint[]
+    owners: bigint[] // 64 owner address hashes, level 1 only
 }
 
 function readInts(t: TupleReader): bigint[] {
@@ -57,9 +52,11 @@ export class Node implements Contract {
             level: stack.readNumber(),
             index: stack.readBigNumber(),
             initialized: stack.readBoolean(),
-            pendingDraw: stack.readBigNumber(),
+            tag: stack.readBigNumber(),
             committed: readInts(stack.readTuple()),
-            held: readInts(stack.readTuple()),
+            added: readInts(stack.readTuple()),
+            removed: readInts(stack.readTuple()),
+            owners: readInts(stack.readTuple()),
         }
     }
 

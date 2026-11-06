@@ -1,9 +1,10 @@
 import { NetworkProvider } from '@ton/blueprint'
+import { floatHigh } from '../wrappers/Jackpot'
 import { amount, askAmount, confirmSend, openJackpot, readPool, requireQuiet, warnIfNotRole, done } from './lib/common'
 
-// Sends the Jackpot's GRAM above its storage float to the governor: surcharges and what the keeper's
-// messages left over. The float is 10 GRAM plus the node float.
-const storageFloat = 10_000_000_000n
+// Sends the Jackpot's GRAM above its float to the governor: what the user chains and the draws left over.
+// The float is G_hi (15 GRAM) plus the node float; the contract keeps the same amount.
+const storageFloat = floatHigh
 
 export async function run(provider: NetworkProvider) {
     const ui = provider.ui()
@@ -14,14 +15,16 @@ export async function run(provider: NetworkProvider) {
     const keep = storageFloat + state.nodeFloat
     const surplus = balance > keep ? balance - keep : 0n
     ui.write(`Jackpot balance:   ${amount(balance)} GRAM`)
-    ui.write(`Kept:              ${amount(keep)} GRAM (10 GRAM storage + ${amount(state.nodeFloat)} node float)`)
+    ui.write(
+        `Kept:              ${amount(keep)} GRAM (${amount(storageFloat)} GRAM float + ${amount(state.nodeFloat)} node float)`,
+    )
     ui.write(`Will be withdrawn: ${amount(surplus)} GRAM`)
 
     // Money in flight draws on the float, so nothing may be open.
     requireQuiet(await readPool(provider, jackpot, false), 'Not withdrawing')
-    if (state.nextBooking === 0n) {
+    if (state.nextPosition === 0n) {
         ui.write(
-            'WARNING: there is no booking yet. The first node of each level (1.28 GRAM) is still to be paid, ' +
+            'WARNING: there is no deposit yet. The first node of each level (0.68 GRAM) is still to be paid, ' +
                 'and would come out of the float.',
         )
     }

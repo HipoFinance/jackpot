@@ -1,44 +1,52 @@
-/* eslint-disable @typescript-eslint/no-non-null-assertion -- tests read state they just made */
-// Random sequences of everything a player, Hipo and the keeper do, run against the real Hipo contracts,
-// with the Jackpot's solvency checked after every transaction that touches it or its hGRAM wallet.
-// Used by tests/Property.spec.ts (the long run) and tests/Acceptance.spec.ts (a short one).
-import { BlockchainSnapshot, BlockchainTransaction } from '@ton/sandbox'
-import { Address, beginCell, Cell, toNano } from '@ton/core'
+/* eslint-disable @typescript-eslint/no-non-null-assertion, @typescript-eslint/no-unnecessary-condition -- test harness code that reads state it just made */
+// Random sequences of everything a player, Hipo and the keeper do, run in the sandbox against the real Hipo
+// contracts and the test build of the Jackpot (tests/jackpot/testbuild.ts, so that every draw has a round).
+// After every chain of transactions the invariants of the amendment's "Property, extended" criterion are checked,
+// and every draw's slots are recomputed from the logs alone: the drand signature of the round and the mc_hash the
+// boundary logged (the "Winners recomputed" criterion). Used by tests/Property.spec.ts.
+import {
+    BlockchainSnapshot,
+    BlockchainTransaction,
+    SandboxContract,
+    TreasuryContract,
+    createEmptyShardAccount,
+} from '@ton/sandbox'
+import { Address, Cell, Message, beginCell, toNano } from '@ton/core'
+import { createHash } from 'crypto'
 import {
     BookingLog,
-    DrawStartLog,
     DrawState,
     JackpotOp,
+    LogMessage,
     LogTopic,
+    RandomnessLog,
+    SkipLog,
     SlotLog,
     SlotResult,
     WithdrawalLog,
-    WithdrawnLog,
     attemptsPerSlot,
     logsOf,
-    treeLevels,
+    parseLogStrict,
+    submitCutoff,
 } from '../../wrappers/Jackpot'
-import { roundTime } from '../../wrappers/drand'
-import { getConfig } from '../hipo/chain'
-import { Env, nodeAt, quicknet } from './setup'
 import {
-    Counters,
-    Player,
-    Run,
-    counters,
-    deliver,
-    depositCoinsBody,
-    failed,
-    jackpotWallet,
-    msg,
-    opBody,
-    positionOf,
-    sendTokensBody,
-    setupAt,
-    solvencyError,
-    submitBody,
-    walletTokens,
-} from './adversary'
+    Env,
+    depositHgram,
+    expectSolvent,
+    hgramOf,
+    makeBoundary,
+    mintHgram,
+    nodeAt,
+    opOf,
+    poke,
+    setupJackpot,
+    start,
+    submitTest,
+    walletAt,
+    withdraw,
+} from './setup'
+import { atJackpot, deliver, submitMessage } from './scenario'
+import { testSignature } from './testbuild'
 
 // mulberry32: small, fast and seedable.
 export function rng(seed: number) {
@@ -52,389 +60,549 @@ export function rng(seed: number) {
     }
     return {
         next,
-        int: (lo: number, hi: number) => lo + Math.floor(next() * (hi - lo + 1)),
-        big: (lo: bigint, hi: bigint) => lo + (BigInt(Math.floor(next() * 2 ** 52)) * (hi - lo + 1n)) / 2n ** 52n,
-        pick: <T>(xs: T[]) => xs[Math.floor(next() * xs.length)],
+        int: (n: number) => Math.floor(next() * n),
+        pick: <T>(xs: T[]): T => xs[Math.floor(next() * xs.length)],
     }
 }
 
-// Drand rounds in time order; a sequence uses them one draw after another.
-export const drandRounds = [...quicknet].sort((a, b) => a.round - b.round).map((r) => r.round)
+export class SequenceFailure extends Error {}
 
 export interface World {
     env: Env
-    players: Player[]
-    jackpotWallet: Address
-    walletOf: Map<string, Address>
+    players: SandboxContract<TreasuryContract>[]
     snapshot: BlockchainSnapshot
+    // the number of cells of the Jackpot's data at deploy, content aside: it must never change
+    dataCells: number
+    // counts the per-transaction checks when the stepper is installed
+    mid: { count: number }
+}
+
+// The cells of a cell tree (shared cells counted once), with the content cell left out.
+function cellsOf(root: Cell, skip: Cell) {
+    const seen = new Set<string>()
+    const skipHash = skip.hash().toString('hex')
+    const walk = (c: Cell) => {
+        const h = c.hash().toString('hex')
+        if (seen.has(h) || h === skipHash) return
+        seen.add(h)
+        c.refs.forEach(walk)
+    }
+    walk(root)
+    return seen.size
+}
+
+async function dataCells(env: Env) {
+    const c = await env.blockchain.getContract(env.jackpot.address)
+    if (c.accountState?.type !== 'active') throw new Error('the Jackpot is not active')
+    const content = (await env.jackpot.getJettonData()).content
+    return cellsOf(c.accountState.state.data!, content)
+}
+
+// The per-transaction mode: every chain is run one transaction at a time, and after each transaction the
+// solvency invariants are checked: free_tokens >= 0, free_tokens·TC >= principal·TT at the stored rate,
+// tickets = principal, and the real wallet >= held_tokens.
+function installStepper(env: Env, mid: { count: number }) {
+    const qm = (
+        env.blockchain as unknown as {
+            defaultQueueManager: {
+                runQueue: (params?: unknown) => Promise<unknown>
+                runQueueIter: (lock: boolean, params?: unknown) => AsyncIterable<BlockchainTransaction>
+            }
+        }
+    ).defaultQueueManager
+    qm.runQueue = async (params?: unknown) => {
+        const transactions: BlockchainTransaction[] = []
+        for await (const tx of qm.runQueueIter(true, params)) {
+            transactions.push(tx)
+            await midCheck(env, mid, tx)
+        }
+        ;(env.blockchain as unknown as { onTransactions?: (t: unknown) => void }).onTransactions?.(transactions)
+        return {
+            transactions,
+            events: transactions.flatMap((t) => t.events),
+            externals: transactions.flatMap((t) => t.externals),
+        }
+    }
+}
+
+async function midCheck(env: Env, mid: { count: number }, tx: BlockchainTransaction) {
+    mid.count++
+    try {
+        await expectSolvent(env)
+        const s = await env.jackpot.getJackpotState()
+        if (s.heldTokens < 0n || s.incomingTokens < 0n || s.reservedTokens < 0n)
+            throw new Error('a counter is negative')
+    } catch (e) {
+        throw new SequenceFailure(`after transaction ${String(tx.lt)} (op ${String(opOf(tx))}): ${String(e)}`)
+    }
 }
 
 export async function makeWorld(): Promise<World> {
-    // start an hour before the oldest recorded drand round, so every fixture round can be drawn for
-    const env = await setupAt(roundTime(drandRounds[0]) - 3600, {
-        // small thresholds, so that draws and burns happen in short sequences
-        config: { minPot: 1000n, burnBatch: toNano('0.05') },
+    const env = await setupJackpot({
+        testBuild: true,
+        time: start,
+        config: { minGap: 3600, minDeposit: toNano('1') },
     })
-    const players: Player[] = []
-    for (let i = 0; i < 4; i++) players.push(await env.blockchain.treasury(`player-${i.toString()}`))
-    const walletOf = new Map<string, Address>()
-    for (const p of [...players, env.burner])
-        walletOf.set(p.address.toString(), await env.hipo.walletAddress(p.address))
-    const world: World = {
-        env,
-        players,
-        jackpotWallet: await jackpotWallet(env),
-        walletOf,
-        snapshot: env.blockchain.snapshot(),
-    }
-    return world
+    const players: SandboxContract<TreasuryContract>[] = []
+    for (let i = 0; i < 4; i++) players.push(await env.blockchain.treasury(`p${i.toString()}`))
+    // everyone holds hGRAM from the start, so a deposit is one chain
+    for (const p of players) await mintHgram(env, p, toNano('800'))
+    // any pot sets a draw aside, so that the sequences reach the searches
+    await env.jackpot.sendSetMinPot(env.governor.getSender(), { value: toNano('0.05'), minPot: 1n })
+    const mid = { count: 0 }
+    if (process.env.PROPERTY_EACH_TX) installStepper(env, mid)
+    return { env, players, snapshot: env.blockchain.snapshot(), dataCells: await dataCells(env), mid }
 }
 
-interface RangeView {
-    owner: Address
-    b: bigint
-    length: bigint
-    live: bigint
-}
-
-export interface SequenceResult {
-    seed: number
-    ops: string[]
+export interface Result {
     transactions: number
     draws: number
     withdrawals: number
     winners: number
     misses: number
+    rollovers: number
+    interleaved: number
+    stuck: number
+    boundaries: number
+    skips: number
+    pokes: number
+    bounces: number
+    untracked: number
+    logs: number
+    midChecks: number
 }
 
-export class SequenceFailure extends Error {
-    constructor(
-        readonly seed: number,
-        readonly ops: string[],
-        message: string,
-    ) {
-        super(`seed ${seed.toString()}: ${message}\n  ops: ${ops.join(' → ')}`)
-    }
+interface Pos {
+    owner: string
+    bal: bigint
 }
 
-// The range at position k among the given ranges in order of b, each holding `live` positions, and k's
-// offset in it.
-export function rangeAtPosition(ranges: { b: bigint; live: bigint }[], k: bigint) {
-    let offset = k
-    for (const r of [...ranges].sort((x, y) => (x.b < y.b ? -1 : 1))) {
-        if (offset < r.live) return { b: r.b, offset }
-        offset -= r.live
-    }
-    return undefined
+interface Chain {
+    externals: LogMessage[]
+    transactions: unknown[]
 }
 
-// One sequence from the world's snapshot. Throws SequenceFailure, naming the seed, on any violation.
-export async function runSequence(world: World, seed: number, maxOps = 10): Promise<SequenceResult> {
+const sha256 = (b: Buffer) => createHash('sha256').update(b).digest()
+const word = (n: bigint) => Buffer.from(n.toString(16).padStart(64, '0'), 'hex')
+const logTopics = new Set<number>(Object.values(LogTopic))
+
+export async function runSequence(world: World, seed: number, steps = 16): Promise<Result> {
     const { env, players } = world
     await env.blockchain.loadFrom(world.snapshot)
-    env.bookings = []
+    env.blockchain.now = start
+    env.bookings.length = 0
     const r = rng(seed)
-    const ops: string[] = []
-    const ranges: RangeView[] = []
-    const principal = new Map<string, bigint>()
-    const withdrawn = new Map<string, { tokens: bigint; count: bigint }>()
-    let txCount = 0
-    let draws = 0
-    let withdrawals = 0
-    let winners = 0
-    let misses = 0
-    let roundIndex = 0
-    const key = (a: Address) => a.toString()
-
-    const fail = (message: string): never => {
-        throw new SequenceFailure(seed, ops, message)
+    const log: string[] = []
+    const result: Result = {
+        transactions: 0,
+        draws: 0,
+        withdrawals: 0,
+        winners: 0,
+        misses: 0,
+        rollovers: 0,
+        interleaved: 0,
+        stuck: 0,
+        boundaries: 0,
+        skips: 0,
+        pokes: 0,
+        bounces: 0,
+        untracked: 0,
+        logs: 0,
+        midChecks: 0,
     }
 
-    const watched = new Set([env.jackpot.address.toString(), world.jackpotWallet.toString()])
-    const after = async (tx: BlockchainTransaction) => {
-        txCount++
-        const address = new Address(0, Buffer.from(tx.address.toString(16).padStart(64, '0'), 'hex')).toString()
-        if (!watched.has(address)) return
-        const error = await solvencyError(env, world.jackpotWallet)
-        if (error != null) fail(`after a transaction on ${address}: ${error}`)
+    const pos = new Map<number, Pos>() // the model: every position's balance
+    let snap: { b: number; owner: string; tickets: bigint }[] = []
+    let removed = new Map<number, bigint>()
+    let tag = 0n
+    let untracked = 0n // hGRAM sent to the Jackpot with no notification: the failures the run injected
+
+    const fail = (what: string): never => {
+        throw new SequenceFailure(`seed ${seed.toString()}: ${what}\n  ops: ${log.join(' | ')}`)
     }
 
-    const run = async (from: Address, to: Address, value: bigint, body: Cell, what: string) => {
-        const result = await deliver(env.blockchain, msg(from, to, value, body), { after })
-        const bad = failed(result.transactions)
-        if (bad.length > 0) fail(`${what}: ${bad.length.toString()} failed transaction(s)`)
-        absorb(result)
-        return result
+    const begin = () => new Map([...pos].map(([b, p]) => [b, { ...p }]))
+    // Applies a chain's logs to the model; a boundary is detected by the tag moving, and the snapshot is what
+    // the model held before the chain. Every log must be an external out to addr_none that parses to the end.
+    const finish = async (what: string, before: Map<number, Pos>, res: Chain, pokeAllowed = false) => {
+        result.transactions += res.transactions.length
+        for (const m of res.externals) {
+            if (m.info.dest != null) fail(`${what}: a log with a destination`)
+            const t = parseLogStrict(m)
+            if (!logTopics.has(t.topic)) fail(`${what}: a log with an unknown tag`)
+            result.logs++
+        }
+        // the treasury is asked for a quote only after a poke
+        const asked = (res.transactions as BlockchainTransaction[]).filter(
+            (t) =>
+                t.inMessage?.info.dest?.toString() === env.hipo.treasury.address.toString() &&
+                opOf(t) === JackpotOp.provideCurrentQuote,
+        )
+        if (asked.length > 0 && !pokeAllowed) fail(`${what}: a quote was asked for outside a poke`)
+        const state = await env.jackpot.getJackpotState()
+        if (state.tag > tag) {
+            snap = [...before].sort((a, b) => a[0] - b[0]).map(([b, p]) => ({ b, owner: p.owner, tickets: p.bal }))
+            removed = new Map()
+            tag = state.tag
+            result.boundaries++
+            const total = snap.reduce((a, x) => a + x.tickets, 0n)
+            const draw = await env.jackpot.getDrawState()
+            if (draw.state === DrawState.waiting && draw.snapshotTickets !== total)
+                fail(`${what}: snapshot ${draw.snapshotTickets.toString()} != model ${total.toString()}`)
+        }
+        if (logsOf<SkipLog>(res.externals, LogTopic.skip).length > 0) result.skips++
+        for (const b of logsOf<BookingLog>(res.externals, LogTopic.booking)) {
+            const p = pos.get(Number(b.b)) ?? { owner: b.owner.toString(), bal: 0n }
+            p.bal += b.principal
+            pos.set(Number(b.b), p)
+        }
+        for (const w of logsOf<WithdrawalLog>(res.externals, LogTopic.withdrawal)) {
+            const p = pos.get(Number(w.b))!
+            p.bal -= w.principal
+            removed.set(Number(w.b), (removed.get(Number(w.b)) ?? 0n) + w.principal)
+            result.withdrawals++
+        }
+        for (const x of logsOf<SlotLog>(res.externals, LogTopic.slot)) {
+            if (x.result === SlotResult.expired || x.result === SlotResult.rolledOver) result.rollovers++
+        }
+        return res
+    }
+    const apply = async (what: string, run: () => Promise<Chain>, pokeAllowed = false) => {
+        log.push(what)
+        const before = begin()
+        return finish(what, before, await run(), pokeAllowed)
     }
 
-    // The amount each mint notification carried, by query_id: what Hipo actually minted for a GRAM deposit
-    const minted = new Map<bigint, bigint>()
-
-    const absorb = (result: Run) => {
-        for (const tx of result.transactions) {
-            const m = tx.inMessage
-            if (m?.info.type !== 'internal' || m.info.bounced || !m.info.dest.equals(env.jackpot.address)) continue
-            const body = m.body.beginParse()
-            if (body.remainingBits < 32 + 64 || body.loadUint(32) !== JackpotOp.transferNotification) continue
-            const id = body.loadUintBig(64)
-            const amount = body.loadCoins()
-            if (body.loadAddress().equals(env.jackpot.address)) minted.set(id, amount)
+    let checks = 0
+    const check = async (what: string, deep = false) => {
+        checks++
+        try {
+            await expectSolvent(env) // free >= 0, solvency at the stored rate, tickets = principal, held <= wallet
+        } catch (e) {
+            fail(`${what}: solvency: ${String(e)}`)
         }
-        for (const b of logsOf<BookingLog>(result.externals, LogTopic.booking)) {
-            ranges.push({ owner: b.owner, b: b.b, length: b.principal, live: b.principal })
-            env.bookings.push(b)
-            principal.set(key(b.owner), (principal.get(key(b.owner)) ?? 0n) + b.principal)
-        }
-        // the live parts change when the Jackpot handles `withdrawn`, which is when the tree's update leaves
-        for (const w of logsOf<WithdrawnLog>(result.externals, LogTopic.withdrawn)) {
-            const range = ranges.find((x) => x.b === w.b)!
-            range.live -= w.principal
-        }
-        for (const w of logsOf<WithdrawalLog>(result.externals, LogTopic.withdrawal)) {
-            const s = withdrawn.get(key(w.owner)) ?? { tokens: 0n, count: 0n }
-            withdrawn.set(key(w.owner), { tokens: s.tokens + w.tokens, count: s.count + 1n })
-            withdrawals++
-        }
-    }
-
-    // Each node's committed less held equals the live tickets below each child, and L_lo + L_hi all of
-    // them. Every booking of a sequence is below node(1, 0), so the nodes are node(ℓ, 0).
-    const checkTree = async () => {
-        if (ranges.length === 0) return
-        const total = ranges.reduce((a, x) => a + x.live, 0n)
-        const c = await counters(env)
-        if (c.lLo + c.lHi !== total) fail(`L_lo + L_hi = ${(c.lLo + c.lHi).toString()}, live ${total.toString()}`)
-        for (let level = 1; level <= treeLevels; level++) {
-            const node = await nodeAt(env, level, 0n).getNodeData()
-            for (let child = 0; child < 64; child++) {
-                const below =
-                    level === 1 ? (ranges.find((x) => x.b === BigInt(child))?.live ?? 0n) : child === 0 ? total : 0n
-                const net = node.committed[child] - node.held[child]
-                if (net !== below) {
-                    fail(
-                        `node(${level.toString()}, 0) child ${child.toString()}: ${net.toString()} ≠ live ${below.toString()}`,
-                    )
+        const s = await env.jackpot.getJackpotState()
+        if (s.incomingTokens !== 0n) fail(`${what}: incoming_tokens ${s.incomingTokens.toString()} after the chain`)
+        const sum = [...pos.values()].reduce((a, p) => a + p.bal, 0n)
+        if (s.principal !== sum)
+            fail(`${what}: principal ${s.principal.toString()} != sum of balances ${sum.toString()}`)
+        if (s.tickets !== s.principal) fail(`${what}: tickets != principal`)
+        // untracked hGRAM is what the run injected, to the nano-hGRAM
+        const gap = (await hgramOf(env, env.jackpot.address)) - s.heldTokens
+        if (gap !== untracked) fail(`${what}: untracked ${gap.toString()} != injected ${untracked.toString()}`)
+        // fixed storage: the same cells as at deploy, whatever came in
+        const cells = await dataCells(env)
+        if (cells !== world.dataCells)
+            fail(`${what}: the data has ${cells.toString()} cells, not ${world.dataCells.toString()}`)
+        // the tree: committed + added - removed of each position is its balance, and the top node is the principal
+        const nodeState = await env.blockchain.getContract(nodeAt(env, 1, 0n).address)
+        if (nodeState.accountState?.type === 'active') {
+            const leaf = await nodeAt(env, 1, 0n).getNodeData()
+            for (const [b, p] of pos) {
+                const c = b & 63
+                const v = leaf.committed[c] + leaf.added[c] - leaf.removed[c]
+                if (v !== p.bal) fail(`${what}: node(1,0)[${b.toString()}] = ${v.toString()} != ${p.bal.toString()}`)
+            }
+            // every node of the first branch: each entry of a node is the total of the node below it
+            for (let level = 2; level <= 4 && (deep || checks % 4 === 0); level++) {
+                const here = nodeAt(env, level, 0n)
+                if ((await env.blockchain.getContract(here.address)).accountState?.type !== 'active') continue
+                const data = await here.getNodeData()
+                for (let c = 0; c < 64; c++) {
+                    const entry = data.committed[c] + data.added[c] - data.removed[c]
+                    const below = nodeAt(env, level - 1, BigInt(c))
+                    let sumBelow = 0n
+                    if ((await env.blockchain.getContract(below.address)).accountState?.type === 'active') {
+                        const d = await below.getNodeData()
+                        sumBelow = d.committed.reduce((a, x, i) => a + x + d.added[i] - d.removed[i], 0n)
+                    }
+                    if (entry !== sumBelow)
+                        fail(
+                            `${what}: node(${level.toString()},0)[${c.toString()}] = ${entry.toString()} but the node below holds ${sumBelow.toString()}`,
+                        )
                 }
             }
+            const top = await nodeAt(env, 4, 0n).getNodeData()
+            const total =
+                top.committed.reduce((a, x) => a + x, 0n) +
+                top.added.reduce((a, x) => a + x, 0n) -
+                top.removed.reduce((a, x) => a + x, 0n)
+            if (total !== s.principal)
+                fail(`${what}: top node ${total.toString()} != principal ${s.principal.toString()}`)
+        }
+        // jGRAM: every open wallet agrees with the model
+        for (const pl of players) {
+            const st = await env.blockchain.getContract(walletAt(env, pl.address).address)
+            if (st.accountState?.type !== 'active') continue
+            const w = await walletAt(env, pl.address).getWalletState()
+            if (w.balance > 0n && !w.hasPosition) fail(`${what}: a balance with no position`)
+            if (w.hasPosition && w.balance !== (pos.get(Number(w.position))?.bal ?? -1n))
+                fail(`${what}: wallet ${w.balance.toString()} != model`)
         }
     }
 
-    const fees = env.fees
-    const hipoFee = toNano('0.1')
-
-    const gramDeposit = async (p: Player, gram: bigint) => {
-        ops.push(`gram(${p.address.toString().slice(-4)}, ${gram.toString()})`)
-        await run(p.address, env.jackpot.address, gram + fees.deposit, opBody(JackpotOp.deposit), 'GRAM deposit')
-    }
-
-    const hgramDeposit = async (p: Player, gram: bigint) => {
-        ops.push(`hgram(${p.address.toString().slice(-4)}, ${gram.toString()})`)
-        const wallet = world.walletOf.get(key(p.address))!
-        await run(
-            p.address,
-            env.hipo.treasury.address,
-            gram + hipoFee,
-            depositCoinsBody(0n, null, gram),
-            'mint at Hipo',
-        )
-        const tokens = await walletTokens(env.blockchain, wallet)
-        const amount = r.next() < 0.5 ? tokens : r.big(1n, tokens)
-        await run(
-            p.address,
-            wallet,
-            fees.hgramDeposit + toNano('0.1'),
-            sendTokensBody({
-                amount,
-                recipient: env.jackpot.address,
-                returnExcess: p.address,
-                forward: fees.hgramDeposit,
-            }),
-            'hGRAM deposit',
-        )
-    }
-
-    // With the surcharge it owes, when it falls in a draw's window from a range that draw can pick.
-    const withdraw = async (range: RangeView, x: bigint) => {
-        ops.push(`withdraw(${range.b.toString()}, ${x.toString()})`)
-        const rangeAddress = await env.jackpot.getRangeAddress(range.b)
-        const surcharge = await env.jackpot.getSurcharge(range.b, x === 0n ? range.live : x)
-        const body = beginCell().storeUint(JackpotOp.withdraw, 32).storeUint(0, 64).storeCoins(x).endCell()
-        await run(range.owner, rangeAddress, fees.withdraw + surcharge, body, 'withdraw')
-    }
-
-    const pickWithdrawal = async (range: RangeView) => {
-        if (range.live > toNano('2') && r.next() < 0.7) await withdraw(range, r.big(toNano('1'), range.live - 1n))
-        else await withdraw(range, 0n)
-    }
-
-    const raise = async (gram: bigint) => {
-        ops.push(`raise(${gram.toString()})`)
-        await env.hipo.raiseRate(gram)
-    }
-
-    const nextRound = async () => {
-        ops.push('round')
-        await env.hipo.nextValidationRound()
-    }
-
-    const draw = async () => {
-        if (roundIndex >= drandRounds.length) return
-        const round = drandRounds[roundIndex]
-        const at = roundTime(round) - 60
-        if (at < env.blockchain.now!) {
-            roundIndex++
-            return
+    // Recomputes every slot of a draw from the logs and the model, as of the snapshot: the seed is
+    // sha256(signature ‖ mc_hash), k(i,j) = sha256(seed ‖ i ‖ j) mod snapshot_tickets.
+    const checkDraw = (
+        what: string,
+        res: { externals: LogMessage[] },
+        round: number,
+        mcHash: bigint,
+        snapshotTickets: bigint,
+    ) => {
+        const total = snap.reduce((a, x) => a + x.tickets, 0n)
+        if (snapshotTickets !== total) fail(`${what}: the draw's snapshot differs from the model`)
+        const [rl] = logsOf<RandomnessLog>(res.externals, LogTopic.randomness)
+        const seedBytes = sha256(Buffer.concat([testSignature(round), word(mcHash)]))
+        if (rl == null) fail(`${what}: no randomness log`)
+        if (rl.seed !== BigInt('0x' + seedBytes.toString('hex')))
+            fail(`${what}: the logged seed is not sha256(signature ‖ mc_hash)`)
+        result.draws++
+        const slots = logsOf<SlotLog>(res.externals, LogTopic.slot)
+        for (let slot = 0; slot < 3; slot++) {
+            const mine = slots.filter((x) => x.slot === slot)
+            let j = 0
+            for (; j < attemptsPerSlot; j++) {
+                const k =
+                    BigInt('0x' + sha256(Buffer.concat([seedBytes, Buffer.from([slot, j])])).toString('hex')) % total
+                let rest = k
+                let hit: { b: number; owner: string } | undefined
+                for (const p of snap) {
+                    if (rest < p.tickets) {
+                        const live = p.tickets - (removed.get(p.b) ?? 0n)
+                        if (rest < live) hit = p
+                        break
+                    }
+                    rest -= p.tickets
+                }
+                const got = mine[j]
+                if (got == null) fail(`${what}: slot ${slot.toString()} attempt ${j.toString()} missing in the logs`)
+                if (got.position !== k) fail(`${what}: position ${got.position.toString()} != ${k.toString()}`)
+                if (hit) {
+                    if (got.result !== SlotResult.hit || got.owner?.toString() !== hit.owner)
+                        fail(`${what}: slot ${slot.toString()} winner differs`)
+                    result.winners++
+                    break
+                }
+                if (got.result !== SlotResult.miss)
+                    fail(`${what}: slot ${slot.toString()} attempt ${j.toString()} should miss`)
+                result.misses++
+            }
+            if (j === attemptsPerSlot && mine[j]?.result !== SlotResult.rolledOver)
+                fail(`${what}: slot ${slot.toString()} should roll over`)
         }
-        roundIndex++
-        ops.push(`draw(${round.toString()})`)
-        await env.hipo.nextValidationRound()
-        await env.hipo.raiseRate(r.big(toNano('0.01'), toNano('50')))
-        env.blockchain.now = at
-        const start = await run(
-            env.keeper.address,
-            env.jackpot.address,
-            fees.startDraw,
-            opBody(JackpotOp.startDraw),
-            'start_draw',
-        )
-        const started = logsOf<DrawStartLog>(start.externals, LogTopic.drawStart)
-        let state = await env.jackpot.getDrawState()
-        if (state.state !== DrawState.waiting) return
-        draws++
-        const log = started[0]
-        // the positions as of the start: the eligible ranges' live parts at that moment
-        const atStart = ranges.filter((x) => x.b < log.cutoff).map((x) => ({ b: x.b, live: x.live }))
-        const eligible = atStart.reduce((a, x) => a + x.live, 0n)
-        if (eligible !== log.eligible) fail(`draw_L ${log.eligible.toString()} ≠ eligible live ${eligible.toString()}`)
-        await run(
-            env.keeper.address,
-            env.jackpot.address,
-            fees.submitRandomness,
-            submitBody(round),
-            'submit_randomness',
-        )
-        state = await env.jackpot.getDrawState()
+    }
 
-        // players may leave in the window, the seed known: their updates are held back
-        const leavers = ranges.filter((x) => x.live > 0n && r.next() < 0.3)
-        for (const range of leavers) await pickWithdrawal(range)
+    const midStart = world.mid.count
+    const withdrawerOf = async () => {
+        const open: SandboxContract<TreasuryContract>[] = []
+        for (const pl of players) {
+            const st = await env.blockchain.getContract(walletAt(env, pl.address).address)
+            if (st.accountState?.type !== 'active') continue
+            if ((await walletAt(env, pl.address).getWalletState()).balance > 0n) open.push(pl)
+        }
+        return open.length ? r.pick(open) : undefined
+    }
+    const amountOf = (balance: bigint) => {
+        const full = r.next() < 0.4 || balance < toNano('3')
+        return full ? 0n : toNano('1') + BigInt(r.int(Number(balance / 10n ** 9n) - 1)) * 10n ** 9n
+    }
+    // a draw that is waiting, and whether a submit is still taken: now < last_boundary + min_gap - S
+    const waiting = async () => {
+        const d = await env.jackpot.getDrawState()
+        const b = await env.jackpot.getBoundary()
+        const now: number = env.blockchain.now ?? start
+        return { d, open: d.state === DrawState.waiting && now < b.lastBoundary + b.minGap - submitCutoff }
+    }
+    const freezeWallet = async (owner: Address) => {
+        const addr = walletAt(env, owner).address
+        const acc = (await env.blockchain.getContract(addr)).account
+        const state = acc.account!.storage.state
+        if (state.type !== 'active') return undefined
+        const init = beginCell().storeUint(6, 5).storeRef(state.state.code!).storeRef(state.state.data!).endCell()
+        await env.blockchain.setShardAccount(addr, {
+            ...acc,
+            account: {
+                ...acc.account!,
+                storage: {
+                    ...acc.account!.storage,
+                    state: { type: 'frozen', stateHash: BigInt('0x' + init.hash().toString('hex')) },
+                },
+            },
+        })
+        return { addr, acc }
+    }
 
-        const paid: SlotLog[] = []
-        for (let guard = 0; guard < 3 * attemptsPerSlot + 3; guard++) {
-            state = await env.jackpot.getDrawState()
-            if (state.openSlots === 0) break
-            const slot = [0, 1, 2].find((i) => (state.openSlots >> i) & 1)!
-            const result = await run(
-                env.keeper.address,
-                env.jackpot.address,
-                fees.locate,
-                opBody(JackpotOp.locate, [slot, 8]),
-                'locate',
+    for (let step = 0; step < steps; step++) {
+        let roll = r.next()
+        const w0 = await waiting()
+        // a draw that is waiting inside its window is submitted more often than chance would
+        if (w0.open && r.next() < 0.45) roll = 0.95
+        if (step < 2) roll = 0
+        const pl = r.pick(players)
+        const s = await env.jackpot.getJackpotState()
+        if (roll < 0.2) {
+            const held = await hgramOf(env, pl.address)
+            if (held < toNano('10')) continue
+            const t = toNano(String(5 + r.int(Number(held / 10n ** 9n) > 400 ? 400 : Number(held / 10n ** 9n) - 5)))
+            // a wallet frozen by hand: the full-body bounce brings the deposit back and the tokens return whole
+            const open =
+                (await env.blockchain.getContract(walletAt(env, pl.address).address)).accountState?.type === 'active'
+            if (open && r.next() < 0.3) {
+                const saved = await freezeWallet(pl.address)
+                if (saved != null) {
+                    const before = await hgramOf(env, pl.address)
+                    await apply(`deposit ${t.toString()} to a frozen wallet`, () =>
+                        depositHgram(env, pl, t, { minC: 0n }).then((x) => x.result),
+                    )
+                    if ((await hgramOf(env, pl.address)) !== before) fail('a bounced deposit did not return the tokens')
+                    await env.blockchain.setShardAccount(saved.addr, saved.acc)
+                    result.bounces++
+                    await check(log[log.length - 1])
+                    continue
+                }
+            }
+            await apply(`deposit ${t.toString()}`, () => depositHgram(env, pl, t, { minC: 0n }).then((x) => x.result))
+        } else if (roll < 0.34) {
+            const who = await withdrawerOf()
+            if (who == null) continue
+            const ws = await walletAt(env, who.address).getWalletState()
+            const x = amountOf(ws.balance)
+            await apply(`withdraw ${x.toString()}`, () => withdraw(env, who, x))
+        } else if (roll < 0.4) {
+            const who = await withdrawerOf()
+            if (who == null) continue
+            await apply('w', () =>
+                env.jackpot.sendComment(who.getSender(), { value: env.fees.commentWithdraw, text: 'w' }),
             )
-            paid.push(...logsOf<SlotLog>(result.externals, LogTopic.slot))
-        }
-        state = await env.jackpot.getDrawState()
-        if (state.state !== DrawState.idle) fail('draw did not resolve')
-
-        // every answer is about the k(i, j)-th eligible live ticket as of the start, recomputed here
-        for (const s of paid) {
-            if (s.result === SlotResult.lost) fail('a descent was lost')
-            if (s.result !== SlotResult.hit && s.result !== SlotResult.miss && s.result !== SlotResult.rolledOver)
-                continue
-            const k = positionOf(state.seed, s.slot, s.attempt, log.eligible)
-            if (s.position !== k)
-                fail(
-                    `slot ${s.slot.toString()} attempt ${s.attempt.toString()} at ${s.position.toString()}, not k = ${k.toString()}`,
-                )
-            const at = rangeAtPosition(atStart, k)
-            if (at == null) fail(`no eligible range holds position ${k.toString()}`)
-            if (s.b !== at!.b)
-                fail(`slot ${s.slot.toString()} answered by range ${s.b.toString()}, not ${at!.b.toString()}`)
-            const live = ranges.find((x) => x.b === at!.b)!.live
-            if (s.result === SlotResult.hit) {
-                winners++
-                if (at!.offset >= live) fail('a withdrawn ticket won')
-                if (s.amount !== log.prizes[s.slot]) fail(`slot ${s.slot.toString()} paid ${s.amount.toString()}`)
-                if (!s.owner!.equals(ranges.find((x) => x.b === at!.b)!.owner)) fail('a prize went to another owner')
+        } else if (roll < 0.5) {
+            // a reward in parts: a part lands, and a poke may come between the parts
+            if (s.principal > 0n) {
+                const [coins] = await env.hipo.quote()
+                const parts = 1 + r.int(2)
+                for (let part = 0; part < parts; part++) {
+                    const gram = (coins * BigInt(1 + r.int(4))) / 1000n
+                    await apply(`reward part ${gram.toString()}`, async () => {
+                        await env.hipo.raiseRate(gram)
+                        return { externals: [], transactions: [] }
+                    })
+                    if (r.next() < 0.5) {
+                        env.blockchain.now = (env.blockchain.now ?? start) + 10 + r.int(300)
+                        result.pokes++
+                        await apply('poke between the parts', () => poke(env), true)
+                    }
+                }
+            }
+        } else if (roll < 0.55) {
+            // a gift of coins to Hipo: a rise that no round brought
+            const [coins] = await env.hipo.quote()
+            const gram = (coins * BigInt(1 + r.int(30))) / 10000n
+            await apply(`gift ${gram.toString()}`, async () => {
+                await env.hipo.raiseRate(gram)
+                return { externals: [], transactions: [] }
+            })
+        } else if (roll < 0.67) {
+            env.blockchain.now = (env.blockchain.now ?? start) + 10 + r.int(2000)
+            result.pokes++
+            await apply('poke', () => poke(env), true)
+        } else if (roll < 0.8) {
+            // a boundary: min_gap later, a reward, a poke; with a draw waiting it is a skip
+            if (s.principal > 0n) {
+                result.pokes++
+                await apply('boundary', () => makeBoundary(env), true)
+            }
+        } else if (roll < 0.85) {
+            // hGRAM sent with no notification stays untracked
+            const held = await hgramOf(env, pl.address)
+            if (held < toNano('5')) continue
+            const t = toNano(String(1 + r.int(3)))
+            const wallet = await env.hipo.walletOf(pl.address)
+            await apply(`untracked ${t.toString()}`, () =>
+                wallet.sendSendTokens(pl.getSender(), {
+                    value: toNano('0.3'),
+                    tokens: t,
+                    recipient: env.jackpot.address,
+                    returnExcess: pl.address,
+                    forwardTonAmount: 0n,
+                }),
+            )
+            untracked += t
+            result.untracked++
+        } else {
+            const w = await waiting()
+            if (w.open && s.principal > 0n) {
+                const round = Number(w.d.round)
+                const kind = r.next()
+                if (kind < 0.4) {
+                    // a player withdraws after the randomness is known and before the searches run
+                    log.push('submit, withdraw, searches')
+                    const before = begin()
+                    const txs: BlockchainTransaction[] = []
+                    let outs: Message[] = []
+                    for await (const tx of await env.blockchain.sendMessageIter(await submitMessage(env))) {
+                        txs.push(tx)
+                        if (process.env.PROPERTY_EACH_TX) await midCheck(env, world.mid, tx)
+                        if (atJackpot(env, JackpotOp.submitRandomness)(tx)) {
+                            ;(
+                                env.blockchain as unknown as { defaultQueueManager: { messageQueue: unknown[] } }
+                            ).defaultQueueManager.messageQueue.length = 0
+                            outs = [...tx.outMessages.values()].filter((m) => m.info.type === 'internal')
+                            break
+                        }
+                    }
+                    const first = await finish('submit', before, {
+                        externals: txs.flatMap((t) => t.externals),
+                        transactions: txs,
+                    })
+                    const who = await withdrawerOf()
+                    if (who) {
+                        const ws = await walletAt(env, who.address).getWalletState()
+                        await apply('withdraw between submit and searches', () =>
+                            withdraw(env, who, amountOf(ws.balance)),
+                        )
+                    }
+                    const externals = [...first.externals]
+                    for (const m of outs) {
+                        const res = await finish('searches', begin(), await deliver(env, m))
+                        externals.push(...res.externals)
+                    }
+                    result.interleaved++
+                    checkDraw('interleaved', { externals }, round, w.d.mcHash, w.d.snapshotTickets)
+                } else if (kind < 0.5) {
+                    // a node that never answers: the slots roll over at the next boundary
+                    log.push('stuck draw')
+                    const node = nodeAt(env, 3, 0n)
+                    const saved = (await env.blockchain.getContract(node.address)).account
+                    await env.blockchain.setShardAccount(node.address, createEmptyShardAccount(node.address))
+                    await apply('submit (stuck)', () => submitTest(env, round))
+                    result.pokes++
+                    await apply('boundary (rolls the slots over)', () => makeBoundary(env), true)
+                    await env.blockchain.setShardAccount(node.address, saved)
+                    result.stuck++
+                } else {
+                    const res = await apply('submit', () => submitTest(env, round))
+                    checkDraw('submit', res, round, w.d.mcHash, w.d.snapshotTickets)
+                }
             } else {
-                misses++
-                if (at!.offset < live) fail('a live ticket missed')
+                env.blockchain.now = (env.blockchain.now ?? start) + 100
             }
         }
-        await checkTree()
+        await check(log[log.length - 1] ?? 'start')
     }
 
-    try {
-        const n = r.int(3, maxOps)
-        for (let i = 0; i < n; i++) {
-            const p = r.pick(players)
-            const live = ranges.filter((x) => x.live > 0n)
-            const roll = r.next()
-            if (roll < 0.25) {
-                await gramDeposit(p, r.next() < 0.1 ? toNano('10') : r.big(toNano('10'), toNano('3000')))
-            } else if (roll < 0.4) {
-                await hgramDeposit(p, r.big(toNano('5'), toNano('3000')))
-            } else if (roll < 0.55 && live.length > 0) {
-                await pickWithdrawal(r.pick(live))
-            } else if (roll < 0.62 && live.length > 0) {
-                await withdraw(r.pick(live), 0n)
-            } else if (roll < 0.75) {
-                await raise(r.big(1n, toNano('100')))
-            } else if (roll < 0.83) {
-                await nextRound()
-            } else {
-                await draw()
-            }
-        }
-        await checkTree()
-
-        // GRAM deposits whose mint came below 99% of their cap (the stored quote was older than a rise)
-        // wait for the governor's resolve_pending, two rounds later, with what the wallet holds for them
-        const waiting = (await env.jackpot.getBooks()).pending
-        if (waiting.size > 0) {
-            ops.push(`resolve(${waiting.size.toString()})`)
-            const config15 = getConfig(env.blockchain, 15n)!.beginParse().loadUint(32)
-            env.blockchain.now = env.blockchain.now! + 2 * config15 + 1
-            for (const [id, record] of waiting) {
-                // what Hipo minted for this record, as the governor reads it on chain, up to its cap
-                const arrived = minted.get(id) ?? 0n
-                const tokens = arrived < record.cap ? arrived : record.cap
-                if (tokens <= 0n) fail('a pending deposit with no tokens minted for it')
-                const body = beginCell()
-                    .storeUint(JackpotOp.resolvePending, 32)
-                    .storeUint(0, 64)
-                    .storeUint(id, 64)
-                    .storeCoins(tokens)
-                    .endCell()
-                await run(env.governor.address, env.jackpot.address, fees.hgramDeposit, body, 'resolve_pending')
-            }
-        }
-
-        // everyone leaves
-        for (const range of ranges.filter((x) => x.live > 0n)) await withdraw(range, 0n)
-        await checkTree()
-
-        const c: Counters = await counters(env)
-        const books = await env.jackpot.getBooks()
-        if (c.P !== 0n) fail(`P = ${c.P.toString()} after everyone left`)
-        if (c.I !== 0n) fail(`I = ${c.I.toString()} after everyone left`)
-        if (books.payouts.size !== 0) fail(`${books.payouts.size.toString()} payout(s) never confirmed`)
-        if (books.quotes.size !== 0 || books.pending.size !== 0) fail('records left open')
-        // nothing stranded outside T, and nothing counted that is not there
-        const real = await walletTokens(env.blockchain, world.jackpotWallet)
-        if (real !== c.T) fail(`wallet ${real.toString()} ≠ T ${c.T.toString()}`)
-        // each player got back at least their principal, less 1 nano-hGRAM of rounding per withdrawal
-        for (const [owner, p] of principal) {
-            const w = withdrawn.get(owner) ?? { tokens: 0n, count: 0n }
-            if ((w.tokens + w.count) * c.TC < p * c.TT) {
-                fail(
-                    `${owner} got ${w.tokens.toString()} hGRAM in ${w.count.toString()} withdrawals for ${p.toString()} principal`,
-                )
-            }
-        }
-    } catch (e) {
-        if (e instanceof SequenceFailure) throw e
-        throw new SequenceFailure(seed, ops, e instanceof Error ? e.message : String(e))
+    // everyone leaves: the pool, the wallets and every node end empty
+    for (const pl of players) {
+        const st = await env.blockchain.getContract(walletAt(env, pl.address).address)
+        if (st.accountState?.type !== 'active') continue
+        if ((await walletAt(env, pl.address).getWalletState()).balance === 0n) continue
+        await apply('exit', () => withdraw(env, pl, 0n))
     }
-    return { seed, ops, transactions: txCount, draws, withdrawals, winners, misses }
+    await check('final exit', true)
+    const end = await env.jackpot.getJackpotState()
+    if (end.principal !== 0n || end.tickets !== 0n || end.incomingTokens !== 0n)
+        fail(
+            `final exit: principal ${end.principal.toString()}, tickets ${end.tickets.toString()}, incoming ${end.incomingTokens.toString()}`,
+        )
+    result.midChecks = world.mid.count - midStart
+    return result
 }

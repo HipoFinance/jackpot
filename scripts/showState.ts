@@ -1,6 +1,6 @@
 import { NetworkProvider } from '@ton/blueprint'
-import { DrawState, QuoteKind } from '../wrappers/Jackpot'
-import { amount, openJackpot, payoutKindName, readPool } from './lib/common'
+import { DrawState } from '../wrappers/Jackpot'
+import { amount, openJackpot, readPool } from './lib/common'
 
 // Read-only: prints every getter of the Jackpot in readable units. Sends nothing.
 export async function run(provider: NetworkProvider) {
@@ -9,15 +9,16 @@ export async function run(provider: NetworkProvider) {
     // One getter at a time: a keyless toncenter rate-limits parallel reads (as in the Hipo contract repo).
     const version = await jackpot.getStorageVersion()
     const state = await jackpot.getJackpotState()
+    const boundary = await jackpot.getBoundary()
+    const retirement = await jackpot.getRetirement()
     const draw = await jackpot.getDrawState()
     const quote = await jackpot.getQuote()
     const fees = await jackpot.getJackpotFees()
     const addresses = await jackpot.getAddresses()
-    const books = await jackpot.getBooks()
     const balance = await jackpot.getBalance()
     const pool = await readPool(provider, jackpot, false)
     const [quoteCoins, quoteTokens] = quote
-    const free = state.totalTokens - state.inFlight - state.setAside
+    const free = state.heldTokens - state.reservedTokens
 
     console.info()
     console.info('JACKPOT %s', jackpot.address.toString())
@@ -28,17 +29,17 @@ export async function run(provider: NetworkProvider) {
 
     console.info()
     console.info('COUNTERS')
-    console.info('T  hGRAM held:         %s hGRAM', amount(state.totalTokens))
-    console.info('W  hGRAM wallet:        %s hGRAM', amount(pool.wallet))
-    console.info('W - T (outside T):   %s hGRAM', amount(pool.outside))
-    console.info('I  in flight:          %s hGRAM', amount(state.inFlight))
-    console.info('O  set aside:          %s hGRAM', amount(state.setAside))
-    console.info('F  free (T - I - O):   %s hGRAM', amount(free))
-    console.info('P  principal owed:     %s GRAM', amount(state.principal))
-    console.info('n  next booking:       %s', state.nextBooking.toString())
-    console.info('K_next:                %s', state.kNext.toString())
-    console.info('L_lo (b < K_next):     %s GRAM', amount(state.lLo))
-    console.info('L_hi (b >= K_next):    %s GRAM', amount(state.lHi))
+    console.info('held hGRAM (T):       %s hGRAM', amount(state.heldTokens))
+    console.info('wallet hGRAM (W):     %s hGRAM', amount(pool.wallet))
+    console.info('untracked (W - T):    %s hGRAM (reaches no one until return_tokens)', amount(pool.outside))
+    console.info('incoming (in T):      %s hGRAM, deposits not yet booked', amount(state.incomingTokens))
+    console.info('reserved (in T):      %s hGRAM, prizes of the open draw and burn owed', amount(state.reservedTokens))
+    console.info('free (T - reserved):  %s hGRAM', amount(free))
+    console.info('principal owed:        %s GRAM', amount(state.principal))
+    console.info('tickets:              %s (jGRAM supply, equal to principal)', amount(state.tickets))
+    console.info('unstaking:            %s hGRAM', amount(state.unstakingTokens))
+    console.info('next position:     %s', state.nextPosition.toString())
+    console.info('tag (snapshots):       %s', state.tag.toString())
     console.info('Carried prizes:        %s hGRAM', amount(state.carried))
     console.info('Burn owed:             %s hGRAM', amount(state.burnOwed))
     console.info('Node float:            %s GRAM', amount(state.nodeFloat))
@@ -53,18 +54,38 @@ export async function run(provider: NetworkProvider) {
         console.info('Kept for principal:    %s hGRAM', amount(needed))
         console.info('Pot now:               %s hGRAM', amount(free > needed ? free - needed : 0n))
     }
-    console.info('Last start:            %s (round since, unix time)', state.lastRoundSince.toString())
-    console.info('Rate at last start:    %s GRAM / %s hGRAM', amount(state.lastCoins), amount(state.lastTokens))
+
+    console.info()
+    console.info('BOUNDARY')
+    console.info('Last boundary:         %s', boundary.lastBoundary === 0 ? '-' : timeString(boundary.lastBoundary))
+    console.info(
+        'Boundary rate:         %s GRAM / %s hGRAM',
+        amount(boundary.boundaryCoins),
+        amount(boundary.boundaryTokens),
+    )
+    console.info('Rise minimum:          %s parts per million', String(boundary.riseMin))
+    console.info('Minimum gap:           %s seconds', String(boundary.minGap))
+    console.info(
+        'Pending minimum gap:   %s',
+        boundary.nextMinGap === 0 ? '-' : `${String(boundary.nextMinGap)} seconds, from the next boundary`,
+    )
+    console.info('Earliest next:         %s', timeString(boundary.earliestNextBoundary))
+    console.info('drand round (last + D): %s', boundary.drandRound.toString())
+
+    console.info()
+    console.info('RETIREMENT')
+    console.info('Retired:               %s', String(retirement.retired))
+    console.info('Successor:             %s', retirement.successor?.toString() ?? '-')
+    console.info('Successor deposit fee: %s GRAM', amount(retirement.successorDepositFee))
 
     console.info()
     console.info('DRAW')
     console.info('State:                 %s', drawStateName(draw.state))
-    console.info('Draw id:               %s', draw.drawId.toString())
-    console.info('Cutoff E:              %s bookings', draw.cutoff.toString())
-    console.info('Eligible (draw_L):     %s GRAM', amount(draw.eligible))
+    console.info('Snapshot tag:          %s', draw.tag.toString())
+    console.info('Snapshot tickets:      %s', amount(draw.snapshotTickets))
     console.info('drand round:           %s', draw.round.toString())
+    console.info('Masterchain block hash: %s', draw.mcHash === 0n ? '-' : draw.mcHash.toString(16))
     console.info('Seed:                  %s', draw.seed === 0n ? '-' : draw.seed.toString(16))
-    console.info('Randomness stored at:  %s', draw.randomnessTime.toString())
     console.info('Prizes:                %s hGRAM', draw.prizes.map(amount).join(' / '))
     console.info('Open slots (bitmask):  %s', openSlotList(draw.openSlots))
     console.info('Attempts per slot:     %s', draw.attempts.join(' / '))
@@ -84,16 +105,21 @@ export async function run(provider: NetworkProvider) {
 
     console.info()
     console.info('FEES (minimum value of each entry message)')
-    console.info('deposit:               %s GRAM', amount(fees.deposit))
-    console.info('hGRAM deposit:         %s GRAM', amount(fees.hgramDeposit))
+    console.info('deposit (forward amount): %s GRAM', amount(fees.deposit))
     console.info('withdraw:              %s GRAM', amount(fees.withdraw))
-    console.info('start_draw:            %s GRAM', amount(fees.startDraw))
-    console.info('submit_randomness:     %s GRAM', amount(fees.submitRandomness))
-    console.info('locate:                %s GRAM', amount(fees.locate))
-    console.info('requote:               %s GRAM', amount(fees.requote))
-    console.info('expire:                %s GRAM', amount(fees.expire))
-    console.info('claim:                 %s GRAM', amount(fees.claim))
-    console.info('attempt (surcharge basis): %s GRAM', amount(fees.attempt))
+    console.info('submit_randomness:     %s GRAM', amount(fees.submit))
+    console.info('poke:                  %s GRAM', amount(fees.poke))
+    console.info('w (comment withdraw):  %s GRAM', amount(fees.commentWithdraw))
+    console.info('refill:                %s GRAM', amount(fees.refill))
+    console.info('sweep:                 %s GRAM', amount(fees.sweep))
+    console.info('return_tokens:         %s GRAM', amount(fees.return))
+    console.info('unstake:               %s GRAM', amount(fees.unstake))
+    console.info('draw budget:           %s GRAM (the most one draw spends from the float)', amount(fees.drawBudget))
+    console.info('float low / high:      %s / %s GRAM', amount(fees.floatLow), amount(fees.floatHigh))
+    console.info('wallet / node storage: %s / %s GRAM', amount(fees.walletStorage), amount(fees.nodeStorage))
+    if (balance < fees.floatLow) {
+        console.info('WARNING: the float is below its low mark; send "refill" (scripts/refill.ts) or top it up')
+    }
 
     console.info()
     console.info('ADDRESSES')
@@ -103,53 +129,21 @@ export async function run(provider: NetworkProvider) {
     console.info('Burner:                %s', addresses.burner.toString())
     console.info('Governor:              %s', addresses.governor.toString())
     console.info('Halter:                %s', addresses.halter.toString())
-    console.info('Wallet code hash:      %s', addresses.walletCode.hash().toString('hex'))
-    console.info('Range code hash:       %s', addresses.rangeCode.hash().toString('hex'))
+    console.info('Hipo wallet code hash:  %s', addresses.walletCode.hash().toString('hex'))
+    console.info('jGRAM wallet code hash: %s', addresses.jettonWalletCode.hash().toString('hex'))
     console.info('Node code hash:        %s', addresses.nodeCode.hash().toString('hex'))
-
-    console.info()
-    console.info('BOOKS')
-    console.info('Pending deposits:      %s', String(books.pending.size))
-    for (const [id, p] of books.pending) {
-        console.info(
-            '  query %s: %s sent %s GRAM (cap %s hGRAM) at %s',
-            id.toString(),
-            p.owner.toString(),
-            amount(p.coins),
-            amount(p.cap),
-            String(p.createdAt),
-        )
-    }
-    console.info('Open quote requests:   %s', String(books.quotes.size))
-    for (const [id, q] of books.quotes) {
-        console.info('  query %s: %s at %s', id.toString(), quoteKindName(q.kind), String(q.createdAt))
-    }
-    console.info('Payouts in flight:     %s', String(books.payouts.size))
-    for (const [id, p] of books.payouts) {
-        console.info(
-            '  query %s: %s %s hGRAM to %s',
-            id.toString(),
-            payoutKindName(p.kind),
-            amount(p.amount),
-            p.recipient.toString(),
-        )
-    }
-    console.info('Claimable balances:    %s', String(books.claimable.size))
-    for (const [owner, c] of books.claimable) {
-        console.info('  %s: prize %s, other %s hGRAM', owner, amount(c.prize), amount(c.other))
-    }
 }
 
 function drawStateName(state: number) {
     return (Object.keys(DrawState) as (keyof typeof DrawState)[]).find((k) => DrawState[k] === state) ?? String(state)
 }
 
-function quoteKindName(kind: number) {
-    return (Object.keys(QuoteKind) as (keyof typeof QuoteKind)[]).find((k) => QuoteKind[k] === kind) ?? String(kind)
-}
-
 // Bit i of the mask is set while slot i is open: 7 is "0,1,2", 0 is "none".
 function openSlotList(mask: number) {
     const open = [0, 1, 2].filter((i) => (mask >> i) & 1)
     return open.length === 0 ? 'none' : open.join(',')
+}
+
+function timeString(unix: number) {
+    return `${String(unix)} (${new Date(unix * 1000).toISOString()})`
 }

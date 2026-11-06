@@ -1,10 +1,11 @@
 import { NetworkProvider } from '@ton/blueprint'
 import { beginCell } from '@ton/core'
 import { buildWitness, currentRound, fetchRound, roundTime } from '../wrappers/drand'
-import { DrawState } from '../wrappers/Jackpot'
+import { DrawState, submitCutoff } from '../wrappers/Jackpot'
 import { amount, askAmount, confirmSend, openJackpot, done } from './lib/common'
 
-// Sends the drand round the running draw waits for. Anyone may run this; the contract checks the signature
+// Sends the drand round the open draw waits for, between its publication and the cut-off before the earliest next
+// boundary. Anyone may run this; the contract checks the signature
 // on chain, and a wrong signature or witness only costs the sender the gas.
 export async function run(provider: NetworkProvider) {
     const ui = provider.ui()
@@ -24,12 +25,24 @@ export async function run(provider: NetworkProvider) {
         return
     }
 
+    const earliestNext = (await jackpot.getBoundary()).earliestNextBoundary
+    if (now >= earliestNext - submitCutoff) {
+        ui.write(
+            `Too late: submits close ${String(submitCutoff)} seconds before the earliest next boundary. The draw will skip if a boundary comes.`,
+        )
+        return
+    }
+    if ((await jackpot.getBalance()) < (await jackpot.getJackpotFees()).drawBudget) {
+        ui.write('The float is below the draw budget, so the Jackpot refuses a submit. Run refill first.')
+        return
+    }
+
     const fetched = await fetchRound(round)
     const signature = beginCell().storeBuffer(fetched.signature).endCell()
     const witness = buildWitness(round)
 
     const fees = await jackpot.getJackpotFees()
-    const value = await askAmount(provider, 'Enter the GRAM to send', amount(fees.submitRandomness))
+    const value = await askAmount(provider, 'Enter the GRAM to send', amount(fees.submit))
 
     const via = await confirmSend(
         provider,
@@ -37,7 +50,7 @@ export async function run(provider: NetworkProvider) {
         jackpot.address,
         value,
         [
-            `draw id:     ${draw.drawId.toString()}`,
+            `snapshot:    tag ${draw.tag.toString()}, ${amount(draw.snapshotTickets)} tickets`,
             `round:       ${String(round)}`,
             `signature:   ${fetched.signature.toString('hex')}`,
             `randomness:  ${fetched.randomness.toString('hex')} (sha256 of the signature)`,

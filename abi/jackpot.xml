@@ -1,0 +1,84 @@
+<abi>
+    <interface name="hipo_jackpot">
+        <get_method name="get_retirement" version="jackpot"/>
+        <msg_out>
+            <ext_out name="jackpot_booking"/>
+            <ext_out name="jackpot_withdrawal"/>
+            <ext_out name="jackpot_refused"/>
+            <ext_out name="jackpot_booking_undone"/>
+            <ext_out name="jackpot_boundary"/>
+            <ext_out name="jackpot_skip"/>
+            <ext_out name="jackpot_randomness"/>
+            <ext_out name="jackpot_slot"/>
+            <ext_out name="jackpot_unstake"/>
+            <ext_out name="jackpot_untracked"/>
+            <ext_out name="jackpot_settings"/>
+            <ext_out name="jackpot_retired"/>
+            <ext_out name="jackpot_successor"/>
+            <ext_out name="jackpot_swept"/>
+            <ext_out name="jackpot_hipo_wallet"/>
+            <ext_out name="jackpot_treasury"/>
+            <ext_out name="jackpot_foreign_return"/>
+        </msg_out>
+    </interface>
+
+    <get_method name="get_retirement">
+        <output version="jackpot" fixed_length="true">
+            <int name="retired">bool</int>
+            <slice name="successor" nullable="true">msgaddress</slice>
+            <int name="successor_deposit_fee">uint128</int>
+        </output>
+    </get_method>
+
+    <ext_out name="jackpot_booking">
+        booking#3b7e3b47 owner:MsgAddress depositor:MsgAddress b:uint32 principal:Coins tokens:Coins = ExtOutMsgBody;
+    </ext_out>
+    <ext_out name="jackpot_withdrawal">
+        withdrawal#9cef1f7e owner:MsgAddress b:uint32 principal:Coins tokens:Coins last:Bool moved:Bool quote_coins:uint128 quote_tokens:uint128 = ExtOutMsgBody;
+    </ext_out>
+    <ext_out name="jackpot_refused">
+        refused#a9f1b394 owner:MsgAddress tokens:Coins value:Coins principal:Coins reason:uint8 = ExtOutMsgBody;
+    </ext_out>
+    <ext_out name="jackpot_booking_undone">
+        booking_undone#ac38ff53 b:uint32 principal:Coins tokens:Coins = ExtOutMsgBody;
+    </ext_out>
+    <ext_out name="jackpot_boundary">
+        boundary#cb9aaaba tag:uint32 time:uint32 quote_coins:uint128 quote_tokens:uint128 snapshot_tickets:Coins pot:Coins burn:Coins carried:Coins unstaked:Coins prizes:(Maybe ^[ p0:Coins p1:Coins p2:Coins drand_round:uint64 mc_seqno:uint32 mc_hash:uint256 ]) = ExtOutMsgBody;
+    </ext_out>
+    <ext_out name="jackpot_skip">
+        skip#7bf99681 tag:uint32 time:uint32 quote_coins:uint128 quote_tokens:uint128 reserved:Coins drand_round:uint64 mc_seqno:uint32 mc_hash:uint256 = ExtOutMsgBody;
+    </ext_out>
+    <ext_out name="jackpot_randomness">
+        randomness#a02c7ffb tag:uint32 drand_round:uint64 seed:uint256 = ExtOutMsgBody;
+    </ext_out>
+    <ext_out name="jackpot_slot">
+        slot#9d87edd2 tag:uint32 slot:uint8 attempt:uint8 result:uint8 k:uint128 b:uint32 amount:Coins owner:MsgAddress = ExtOutMsgBody;
+    </ext_out>
+    <ext_out name="jackpot_unstake">
+        unstake#a5fc9f67 amount:Coins unstaking:Coins float:Coins = ExtOutMsgBody;
+    </ext_out>
+    <ext_out name="jackpot_untracked">
+        untracked#f4763a43 cause:uint8 tokens:Coins = ExtOutMsgBody;
+    </ext_out>
+    <ext_out name="jackpot_settings">
+        settings#1c421ecd rise_min:uint32 min_gap:uint32 next_min_gap:uint32 = ExtOutMsgBody;
+    </ext_out>
+    <ext_out name="jackpot_retired">
+        retired#a6a4f6b3 = ExtOutMsgBody;
+    </ext_out>
+    <ext_out name="jackpot_successor">
+        successor#5de56438 successor:MsgAddress successor_deposit_fee:Coins = ExtOutMsgBody;
+    </ext_out>
+    <ext_out name="jackpot_swept">
+        swept#e9b4624d tokens:Coins next_position:uint32 = ExtOutMsgBody;
+    </ext_out>
+    <ext_out name="jackpot_hipo_wallet">
+        hipo_wallet#064510fb parent:MsgAddress wallet:MsgAddress = ExtOutMsgBody;
+    </ext_out>
+    <ext_out name="jackpot_treasury">
+        treasury#5025a5bc treasury:MsgAddress = ExtOutMsgBody;
+    </ext_out>
+    <ext_out name="jackpot_foreign_return">
+        foreign_return#63eaf860 from:MsgAddress sender:MsgAddress amount:Coins sent:Bool = ExtOutMsgBody;
+    </ext_out>
+</abi>

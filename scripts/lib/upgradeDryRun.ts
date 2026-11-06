@@ -1,11 +1,11 @@
-import { Blockchain, createShardAccount, SendMessageResult } from '@ton/sandbox'
+import { Blockchain, createShardAccount, SandboxContract, SendMessageResult } from '@ton/sandbox'
 import { Address, Cell, toNano } from '@ton/core'
-import { DrawState, Jackpot } from '../../wrappers/Jackpot'
+import { DrawState, Jackpot, JackpotError } from '../../wrappers/Jackpot'
 
 // A sandbox dry run of an upgrade, on a copy of the live account (code, data, balance): the real upgrade
 // message from the governor, the new code's getters, and an upgrade back. The treasury and Hipo's wallets are
-// not in the sandbox, so nothing here needs them: the Jackpot must be halted with the draw idle and no open
-// quotes or pending deposits, so that the upgrade has no message in flight to disturb.
+// not in the sandbox, so nothing here needs them: the Jackpot must be halted with no draw resolving (a waiting one
+// is fine), so that the upgrade has no search in flight to disturb. The Jackpot keeps no records of its own.
 
 export interface LiveAccount {
     address: Address
@@ -35,6 +35,26 @@ function outcome(result: SendMessageResult, address: Address) {
     return { ok: compute.success && tx.description.actionPhase?.success !== false, exitCode: compute.exitCode }
 }
 
+// What a new build must keep to the letter: the addresses it reads (with the codes), the boundary, the retirement, the
+// stored rate, and the addresses it derives (the jGRAM wallets of a few owners, the nodes of the tree). If a derivation
+// changed, every wallet and node already deployed would be out of reach.
+async function fingerprint(jackpot: SandboxContract<Jackpot>) {
+    const a = await jackpot.getAddresses()
+    const owners = [a.governor, a.halter, a.burner, a.treasury]
+    const parts: string[] = [
+        [a.treasury, a.parent, a.wallet, a.burner, a.governor, a.halter].map((x) => x.toString()).join(),
+        [a.walletCode, a.jettonWalletCode, a.nodeCode].map((c) => c.hash().toString('hex')).join(),
+        JSON.stringify(await jackpot.getBoundary(), (_, v: unknown) => (typeof v === 'bigint' ? v.toString() : v)),
+        JSON.stringify(await jackpot.getRetirement(), (_, v: unknown) => (typeof v === 'bigint' ? v.toString() : v)),
+        (await jackpot.getQuote()).map((x) => x.toString()).join(),
+    ]
+    for (const owner of owners) parts.push((await jackpot.getWalletAddress(owner)).toString())
+    for (const [level, index] of [[1, 0n], [2, 0n], [3, 0n], [4, 0n], [1, 777n]] as const) {
+        parts.push((await jackpot.getNodeAddress(level, index)).toString())
+    }
+    return parts.join('|')
+}
+
 export async function dryRunUpgrade(live: LiveAccount, newCode: Cell, expectedVersion: number): Promise<Check[]> {
     const checks: Check[] = []
     const add = (name: string, ok: boolean, detail?: string) => {
@@ -52,15 +72,15 @@ export async function dryRunUpgrade(live: LiveAccount, newCode: Cell, expectedVe
 
     const state = await jackpot.getJackpotState()
     const draw = await jackpot.getDrawState()
-    const books = await jackpot.getBooks()
     const addresses = await jackpot.getAddresses()
     const versionBefore = await jackpot.getStorageVersion()
+    const printBefore = await fingerprint(jackpot)
+    const haltedBefore = state.halted
 
     // Checked, not only printed.
     add('the Jackpot is halted', state.halted)
-    add('the draw is idle', draw.state === DrawState.idle, `state ${String(draw.state)}`)
-    add('no quote requests are open', books.quotes.size === 0, `${String(books.quotes.size)} open`)
-    add('no pending deposits are open', books.pending.size === 0, `${String(books.pending.size)} open`)
+    // a draw that is waiting holds nothing in flight (a halted Jackpot or a silent drand leaves it waiting for good)
+    add('no draw is resolving', draw.state !== DrawState.resolving, `state ${String(draw.state)}`)
     if (!checks.every((c) => c.ok)) {
         return checks
     }
@@ -89,21 +109,28 @@ export async function dryRunUpgrade(live: LiveAccount, newCode: Cell, expectedVe
         const afterDraw = await jackpot.getDrawState()
         await jackpot.getQuote()
         await jackpot.getJackpotFees()
+        await jackpot.getBoundary()
+        await jackpot.getRetirement()
+        await jackpot.getJettonData()
         await jackpot.getAddresses()
-        await jackpot.getBooks()
         await jackpot.getPosition(0)
-        await jackpot.getRangeAddress(0n)
         await jackpot.getNodeAddress(1, 0n)
-        await jackpot.getClaimableParts(addresses.governor)
         add('every getter parses', true)
+        add('the halted flag is unchanged', after.halted === haltedBefore)
+        add(
+            'the addresses and codes it reads, the boundary, the retirement, the stored rate and the derived wallet and node addresses are unchanged',
+            (await fingerprint(jackpot)) === printBefore,
+        )
         const same =
-            after.totalTokens === state.totalTokens &&
-            after.inFlight === state.inFlight &&
-            after.setAside === state.setAside &&
+            after.heldTokens === state.heldTokens &&
+            after.incomingTokens === state.incomingTokens &&
+            after.reservedTokens === state.reservedTokens &&
             after.principal === state.principal &&
-            after.nextBooking === state.nextBooking &&
-            afterDraw.drawId === draw.drawId
-        add('T, I, O, P, n and draw_id are unchanged', same)
+            after.tickets === state.tickets &&
+            after.nextPosition === state.nextPosition &&
+            after.tag === state.tag &&
+            afterDraw.tag === draw.tag
+        add('held, incoming and reserved tokens, principal, tickets, next position and tag are unchanged', same)
     } catch (e) {
         add('every getter parses', false, e instanceof Error ? e.message : String(e))
     }
@@ -116,13 +143,13 @@ export async function dryRunUpgrade(live: LiveAccount, newCode: Cell, expectedVe
         outcome(topUp, live.address).ok && (await balance()) > before,
     )
 
-    // A requote of a record that does not exist must be refused by the new code with unknown_query (408):
-    // that shows its dispatch and handler run, without a record to move.
-    const requote = await jackpot.sendRequote(governor, { value, target: 0n })
-    const r = outcome(requote, live.address)
+    // A poke with too little value must be refused by the new code with insufficient_fee (101): that shows its
+    // dispatch and handler run, without a message to the treasury, which the sandbox does not have.
+    const poke = await jackpot.sendPoke(governor, { value: toNano('0.01') })
+    const r = outcome(poke, live.address)
     add(
-        'a requote reaches the new code (refused with unknown_query 408)',
-        r.exitCode === 408,
+        'a poke reaches the new code (refused with insufficient_fee 101)',
+        r.exitCode === JackpotError.insufficientFee,
         `exit code ${String(r.exitCode)}`,
     )
 

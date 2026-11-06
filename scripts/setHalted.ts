@@ -2,7 +2,7 @@ import { NetworkProvider } from '@ton/blueprint'
 import { amount, askAmount, confirmSend, openJackpot, warnIfNotRole, done } from './lib/common'
 
 // Halts or resumes the Jackpot. The halter or the governor may halt; only the governor resumes.
-// A halt stops deposits (GRAM and hGRAM) and draw starts. A running draw completes and withdrawals go on.
+// A halt returns deposits (hGRAM), refuses submits and makes no boundary. Withdrawals go on.
 export async function run(provider: NetworkProvider) {
     const ui = provider.ui()
     const jackpot = await openJackpot(provider)

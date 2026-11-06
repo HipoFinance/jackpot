@@ -14,9 +14,10 @@ import {
     done,
 } from './lib/common'
 
-// Points the Jackpot at a new Hipo parent, its hGRAM wallet and the wallet code, for when Hipo migrates its
+// Points the Jackpot at a new Hipo parent, its hGRAM wallet and the wallet code, for a Hipo change that keeps one token
+// worth the same (k = 1); a migration with another k is done by the migration upgrade. Halted only; Hipo migrates its
 // wallets. The wallet must be the parent's own derivation for the Jackpot. Refuses unless the Jackpot is
-// halted, the draw is idle and no payouts, quotes or pending deposits are open.
+// halted and no draw is resolving.
 export async function run(provider: NetworkProvider) {
     const ui = provider.ui()
     const jackpot = await openJackpot(provider)
@@ -25,7 +26,7 @@ export async function run(provider: NetworkProvider) {
     if (!pool.halted) {
         throw new Error('Halt the Jackpot first (setHalted)')
     }
-    requireQuiet(pool, 'Not changing the wallet', true)
+    requireQuiet(pool, 'Not changing the wallet')
 
     const current = await jackpot.getAddresses()
     ui.write(`Current parent:        ${current.parent.toString()}`)

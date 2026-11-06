@@ -1,24 +1,31 @@
-// The property test of the spec's first two acceptance criteria. Random sequences of GRAM and hGRAM
-// deposits, partial and full withdrawals, rate rises, validation-round changes and full draws, against the
-// real Hipo contracts. After every transaction on the Jackpot or its hGRAM wallet: F·TC ≥ P·TT, F ≥ 0, and
-// the real wallet holds at least T. Every slot's answer comes from the range holding the k(i, j)-th eligible
-// live ticket, recomputed here from the logs as of the draw's start, while players withdraw in the draw's
-// window; after each draw every node's committed less held equals the live tickets below it, and
-// L_lo + L_hi all of them. At the end everyone withdraws, and each player's hGRAM must be worth at
-// least their principal, less 1 nano-hGRAM per withdrawal; nothing may be left stranded or unconfirmed.
+// The amendment's Property (extended), Winners recomputed, Fixed storage and Logs criteria. Random sequences of
+// deposits (some to a frozen wallet, so that the full-body bounce brings them back), partial and full
+// withdrawals, `w`, rewards in parts, gifts, pokes, boundaries, skips, hGRAM sent with no notification and
+// full draws (some with a withdrawal between the submit and the searches, some with a node that never
+// answers), against the real Hipo contracts and the test build of the Jackpot. After every chain:
+// free_tokens·TC ≥ principal·TT, tickets = principal, held_tokens ≤ the real wallet, untracked hGRAM equals
+// what the run injected, the principal is the sum of the balances, the tree and the wallets agree, the data has
+// the cells it had at deploy, the treasury was asked for a quote only by a poke, and every log is an external out
+// to addr_none that parses to its end. Every slot is recomputed from the logs alone: the round's drand
+// signature and the mc_hash the boundary logged. At the end of a sequence everyone withdraws in full.
+//
+// PROPERTY_LOG=<file> is rewritten after every sequence with the running counts, so a stopped run still reports;
+// PROPERTY_SEED shifts the seeds, so two processes can run different sequences.
+// PROPERTY_EACH_TX=1 steps every chain one transaction at a time and checks solvency after each (slower).
 //
 // It runs PROPERTY_SEQUENCES sequences (default 10,000) or until PROPERTY_SECONDS have passed (default 540),
 // whichever comes first, and prints how many ran. Each sequence has its own seed, PROPERTY_SEED + i; a
 // failure prints that seed and the operations, and PROPERTY_SEED=<seed> PROPERTY_SEQUENCES=1 replays it.
+import { writeFileSync } from 'fs'
 import { SequenceFailure, makeWorld, runSequence } from './jackpot/sequences'
 
 const sequences = Number(process.env.PROPERTY_SEQUENCES ?? '10000')
 const seconds = Number(process.env.PROPERTY_SECONDS ?? '540')
 const baseSeed = Number(process.env.PROPERTY_SEED ?? '20261027')
 
-describe('Property: solvency and principal over random sequences', () => {
+describe('Property: invariants, winners and logs over random sequences', () => {
     it(
-        'keeps F·TC ≥ P·TT and wallet ≥ T after every transaction, and returns every principal',
+        'keeps solvency, tickets = principal, tree = balances and fixed storage after every chain, recomputes every winner, and returns every principal',
         async () => {
             const world = await makeWorld()
             const started = Date.now()
@@ -28,6 +35,16 @@ describe('Property: solvency and principal over random sequences', () => {
             let withdrawals = 0
             let winners = 0
             let misses = 0
+            let rollovers = 0
+            let interleaved = 0
+            let stuck = 0
+            let boundaries = 0
+            let skips = 0
+            let pokes = 0
+            let bounces = 0
+            let untracked = 0
+            let logs = 0
+            let midChecks = 0
             const failures: string[] = []
             for (let i = 0; i < sequences; i++) {
                 if ((Date.now() - started) / 1000 > seconds) break
@@ -39,6 +56,16 @@ describe('Property: solvency and principal over random sequences', () => {
                     withdrawals += result.withdrawals
                     winners += result.winners
                     misses += result.misses
+                    rollovers += result.rollovers
+                    interleaved += result.interleaved
+                    stuck += result.stuck
+                    boundaries += result.boundaries
+                    skips += result.skips
+                    pokes += result.pokes
+                    bounces += result.bounces
+                    untracked += result.untracked
+                    logs += result.logs
+                    midChecks += result.midChecks
                 } catch (e) {
                     if (!(e instanceof SequenceFailure)) throw e
                     failures.push(e.message)
@@ -46,12 +73,20 @@ describe('Property: solvency and principal over random sequences', () => {
                     if (failures.length >= 5) break
                 }
                 ran++
+                if (process.env.PROPERTY_LOG)
+                    writeFileSync(
+                        process.env.PROPERTY_LOG,
+                        `sequences ${ran.toString()} (seed ${baseSeed.toString()}+) transactions ${transactions.toString()} draws ${draws.toString()} misses ${misses.toString()} rollovers ${rollovers.toString()} failures ${failures.length.toString()} elapsed ${((Date.now() - started) / 1000).toFixed(0)} s\n`,
+                    )
             }
             const elapsed = ((Date.now() - started) / 1000).toFixed(0)
             console.log(
                 `property: ${ran.toString()} sequences (seeds ${baseSeed.toString()}..${(baseSeed + ran - 1).toString()}) in ${elapsed} s: ` +
                     `${transactions.toString()} transactions, ${draws.toString()} draws, ${withdrawals.toString()} withdrawals, ` +
-                    `${winners.toString()} winners and ${misses.toString()} misses checked, ` +
+                    `${winners.toString()} winners and ${misses.toString()} misses checked (${(draws ? misses / draws : 0).toFixed(2)} per draw), ` +
+                    `${rollovers.toString()} rollovers, ${interleaved.toString()} draws with a withdrawal between submit and searches, ${stuck.toString()} stuck draws, ` +
+                    `${boundaries.toString()} boundaries, ${skips.toString()} skips, ${pokes.toString()} pokes, ${bounces.toString()} bounced deposits, ${untracked.toString()} untracked transfers, ${logs.toString()} logs parsed, ` +
+                    `${midChecks.toString()} per-transaction checks, ` +
                     `${failures.length.toString()} failure(s)`,
             )
             expect(failures).toEqual([])

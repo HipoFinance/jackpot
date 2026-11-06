@@ -6,28 +6,26 @@
 const int err::insufficient_fee = 101;
 const int err::insufficient_funds = 102;
 const int err::access_denied = 103;
-const int err::only_basechain_allowed = 104;
 const int err::halted = 106;
 const int err::invalid_op = 107;
 const int err::invalid_parameters = 109;
-const int err::deposit_too_small = 110;
 
-const int err::not_idle = 401;
 const int err::rate_falling = 402;
-const int err::round_not_changed = 403;
 const int err::not_waiting_for_randomness = 404;
-const int err::not_resolving = 405;
-const int err::slot_closed = 406;
-const int err::too_soon = 407;
-const int err::unknown_query = 408;
-const int err::nothing_to_claim = 409;
-const int err::already_set_up = 410;
+const int err::too_late = 405;
 const int err::not_set_up = 411;
+const int err::opening = 412;
 const int err::unknown_version = 413;
-const int err::no_quote = 414;
 const int err::draw_changed = 415;
-
-const int err::unexpected_validator_set_format = 304;
+const int err::not_transferable = 416;
+const int err::float_too_low = 417;
+const int err::refill_not_needed = 418;
+const int err::forged_bounce = 419;
+const int err::not_retired = 420;
+const int err::not_swept = 421;
+const int err::cannot_sweep = 422;
+const int err::bad_comment = 423;
+const int err::too_many_owners = 424;
 
 
 ;; Hipo's op codes the Jackpot sends or receives (HipoFinance/contract, contracts/imports/constants.fc).
@@ -36,82 +34,127 @@ const int op::transfer_notification = 0x7362d09c;
 const int op::gas_excess = 0xd53276db;
 const int op::provide_current_quote = 0xad83913f;
 const int op::take_current_quote = 0x0a420458;
-const int op::deposit_coins = 0x3d3761a6;
+const int op::unstake_tokens = 0x595f07bc;
+const int op::withdrawal_notification = 0xf0fa223b;
 const int op::top_up = 0x5372158c;
 
-;; The Jackpot's own op codes: crc32 of "jackpot::<name>", see schema.tlb.
-const int op::deposit = 0x7c6bacac;
-const int op::withdrawn = 0x32e2541b;
-const int op::start_draw = 0xb9af1e01;
+;; The Jackpot's own op codes: crc32 of "jackpot::<name>", see schema.tlb. The TEP ones keep their codes.
+const int op::poke = 0x5444df0f;
+const int op::deposit_options = 0x8785a274;
+const int op::deposit_refused = 0xa763e68f;
+const int op::prepare_deposit = 0x4ac19f29;
+const int op::deposit_ready = 0xc8682b07;
+const int op::deposit_booked = 0x42e3c02d;
+const int op::deposit_cancelled = 0xa3d4c7cf;
+const int op::close_wallet = 0x0cba59a9;
+const int op::withdraw_options = 0x63a28f24;
+const int op::burn = 0x595f07bc;
+const int op::burn_notification = 0x7bdd97de;
+const int op::close_node = 0x07e3e272;
+const int op::provide_wallet_address = 0x2c76b973;
+const int op::take_wallet_address = 0xd1735400;
 const int op::submit_randomness = 0x52cc77c3;
-const int op::locate = 0x100ffec7;
-const int op::requote = 0xfa418de9;
-const int op::expire = 0xff25ead2;
-const int op::claim = 0xe53d2340;
+const int op::refill = 0xa16904fa;
 const int op::hit = 0x5c850e0e;
 const int op::miss = 0x847501f7;
-const int op::range_setup = 0xe82ed41c;
-const int op::withdraw = 0x35528864;
-const int op::check = 0x7eda5174;
 const int op::update = 0x4bb1957e;
 const int op::descend = 0x3b4030a5;
 const int op::lost = 0xa6208f83;
 const int op::upgrade_code = 0x1870f697;
 const int op::set_hipo_wallet = 0x8ceea056;
-const int op::resolve_pending = 0x0827b963;
 const int op::return_tokens = 0x842c3822;
-const int op::settle_failed_payout = 0xf6b46a38;
+const int op::settle_unstake = 0x81d4ed7a;
 const int op::set_burn_share = 0xdf23bdaf;
 const int op::set_min_pot = 0x19ee5cbe;
 const int op::set_burn_batch = 0xc82e7221;
 const int op::set_min_deposit = 0x0cf62e2f;
+const int op::set_rise_min = 0xa13346fa;
+const int op::set_min_gap = 0x996900dc;
+const int op::set_content = 0xeb4dbc1b;
 const int op::set_halter = 0x271f8ef1;
 const int op::set_halted = 0xd3cb3ba0;
 const int op::clear_falling = 0xdf19084f;
 const int op::withdraw_surplus = 0x9a30705b;
+const int op::retire = 0xf6e41c95;
+const int op::set_successor = 0xefd50f41;
+const int op::withdraw_for = 0x2742c19b;
+const int op::close_subtree = 0x4cf9e825;
+const int op::sweep = 0xca7fef55;
+const int op::set_treasury = 0xf0be6c1c;
+const int op::rescue_jetton = 0xa24305cd;
+const int op::rescue_nft = 0xd672136a;
+const int op::ownership_assigned = 0x05138d91;
+const int op::nft_transfer = 0x5fcc3d14;
+
+;; The ops of the logs: crc32("jackpot::<name>").
+const int log::booking = 0x3b7e3b47;
+const int log::withdrawal = 0x9cef1f7e;
+const int log::refused = 0xa9f1b394;
+const int log::booking_undone = 0xac38ff53;
+const int log::boundary = 0xcb9aaaba;
+const int log::skip = 0x7bf99681;
+const int log::randomness = 0xa02c7ffb;
+const int log::slot = 0x9d87edd2;
+const int log::unstake = 0xa5fc9f67;
+const int log::untracked = 0xf4763a43;
+const int log::settings = 0x1c421ecd;
+const int log::retired = 0xa6a4f6b3;
+const int log::successor = 0x5de56438;
+const int log::swept = 0xe9b4624d;
+const int log::hipo_wallet = 0x064510fb;
+const int log::treasury = 0x5025a5bc;
+const int log::foreign_return = 0x63eaf860;
 
 
-;; Draw states. A new draw starts only from idle.
-const int draw::idle = 0;
-const int draw::quoting = 1;
-const int draw::waiting = 2;
-const int draw::resolving = 3;
+;; Draw states. No quoting state: the pot is fixed at the boundary.
+const int draw::none = 0;
+const int draw::waiting = 1;
+const int draw::resolving = 2;
 
-;; What a quote request is for. The reply finds the record by query_id and acts on its kind.
-const int quote::booking = 0;
-const int quote::withdrawal = 1;
-const int quote::draw = 2;
-const int quote::refresh = 3; ;; only stores the rate: the first quote, asked for at deploy
+;; Why a deposit was refused.
+const int reason::halted = 1;
+const int reason::retired = 2;
+const int reason::rate_falling = 3;
+const int reason::below_min_deposit = 4;
+const int reason::price = 5;
+const int reason::wallet_busy = 6;
+const int reason::tree_full = 7;
+const int reason::bad_options = 8;
+const int reason::low_value = 9;
+const int reason::wallet_unavailable = 10;
 
-;; What a payout is. A failed burn goes back to the burn owed; a failed prize becomes claimable as a prize,
-;; which waits while the rate has fallen; anything else becomes claimable as `other`, which never waits.
-const int payout::other = 0;
-const int payout::burn = 1;
-const int payout::prize = 2;
+;; The cause in an untracked log.
+const int untracked::refund_unpaid = 1;
 
 ;; Outcome of a slot, in the slot log.
 const int slot::hit = 0;
 const int slot::miss = 1;
 const int slot::rolled_over = 2;
-const int slot::expired = 3;
+const int slot::expired = 3; ;; rolled over at a boundary with the search still out
 const int slot::returned = 4; ;; a hit while the rate has fallen: the prize went back into F
 const int slot::lost = 5; ;; a node found no child covering the position: treated as a miss
 
 
-;; Protocol constants from the spec's Decisions. Changing any of them is a code upgrade.
+;; Protocol constants from the spec. Changing any of them is a code upgrade.
 const int attempts_per_slot = 16; ;; A
-const int drand_delay = 60; ;; D, seconds between a draw's start and the drand round it waits for
-const int requote_after = 600; ;; a quote request with no reply for 10 minutes may be sent again
+const int drand_delay = 60; ;; D, seconds from a boundary to the drand round it waits for
+const int submit_cutoff = 1800; ;; S, seconds before the earliest next boundary after which no submit is taken
+const int unstake_guard = 604800; ;; 7 days: after this a stale unstaking counter no longer blocks an unstake
 const int basis_points = 10000;
 const int max_burn_share = 2000;
+const int min_rise_min = 1;
+const int max_rise_min = 10000;
+const int min_min_gap = 3600;
+const int max_min_gap = 2592000;
+const int ppm = 1000000;
+const int max_payload_cells = 8;
+const int max_withdraw_for = 100;
 const int share::first = 5000;
 const int share::second = 3000;
-const int one_gram = 1000000000;
-;; A partial withdrawal must take at least this much principal, so that w > 0 at any rate below
-;; 10^9 GRAM per hGRAM. A full withdrawal of a smaller live part is always allowed.
+;; A partial withdrawal must take at least this much principal, so that the hGRAM paid for it is never 0.
 const int min_partial_withdrawal = 1000000000; ;; 1 GRAM
 
-;; The tree: 4 levels of 64-ary nodes over the ranges, room for 64^4 bookings.
+;; The tree: 4 levels of 64-ary nodes, room for 64^4 positions.
 const int tree::levels = 4;
 const int tree::bits = 6; ;; log2 of the arity
 const int tree::capacity = 16777216; ;; 64^4
@@ -120,152 +163,138 @@ const int tree::capacity = 16777216; ;; 64^4
 const int storage_version = 1;
 
 
+;; The float: the Jackpot's own GRAM, which pays draws and node openings.
+const int float::low = 8000000000; ;; float_low
+const int float::high = 15000000000; ;; float_high
+;; Reward of a successful submit.
+const int reward::submit = 20000000; ;; 0.02 GRAM
+;; What the Jackpot keeps after the end.
+const int float::after_end = 1000000000;
+
+
 ;; Fees. Every entry message must carry at least its fee, checked before anything changes, and the fee
 ;; covers every message the step causes, so nothing an outsider starts is paid from the Jackpot's own
-;; GRAM. What a chain does not spend stays in the Jackpot's balance, above the storage float, where the
-;; governor can withdraw it.
+;; GRAM. What a user chain does not spend goes back to the user.
 ;;
-;; The figures are fixed rather than read from config 20/21, as the burner does. They are sized from the
-;; gas measured in tests/Gas.spec.ts (every Jackpot handler under 32k gas but the drand check, about 81k;
-;; a node about 52k in its worst case, a fold of all 64 children) at 400 nano-GRAM per gas. Mainnet config 21
-;; currently reads 66.67 nano-GRAM per gas, so the fees carry about 6 times headroom over it; the node
-;; hops pin 56k gas against a 75k budget, about 1.3 times at the 400 basis. Most of
-;; each fee is never burned: replies carry it back, and the rest stays above the storage float.
-;; Gas.spec.ts sends every entry message with exactly its fee and fails if the chain does not finish or
-;; costs the Jackpot GRAM.
+;; The figures are fixed rather than read from config, sized at 400 nano-GRAM per gas, the worst case
+;; (mainnet config 21 reads 66.67 nano-GRAM per gas). The gas behind them is measured in tests/Gas.spec.ts.
 
-;; Attached to each provide_current_quote. The treasury replies with send::remaining_value, so this
-;; pays the treasury's gas and the Jackpot's reply handler, whose gas limit comes from the reply's value.
+;; The quote round trip of a poke: the treasury's gas and the reply's.
 const int fee::quote = 30000000; ;; 0.03 GRAM
 
 ;; Attached to each outgoing hGRAM transfer: Hipo's send_tokens_fee() plus the recipient wallet's
-;; storage and gas. The recipient wallet sends the rest back as gas_excess, whose handler it also pays.
+;; storage and gas. The recipient wallet sends the rest back as gas_excess.
 const int fee::payout = 50000000; ;; 0.05 GRAM
 
-;; Carried to the burner with each burn transfer, as forward_ton_amount. The burner pays its DeDust swap
-;; from it (burner/contracts/imports/constants.fc, budget::swap_gas and swap_forward).
+;; Carried to the burner with each burn transfer, as forward_ton_amount.
 const int fee::burn_forward = 500000000; ;; 0.5 GRAM
 
-;; Storage reserve a new range is deployed with: at least 10 years at today's prices, checked against
-;; config 18 in tests/Range.spec.ts.
-const int fee::range_storage = 100000000; ;; 0.1 GRAM
+;; A prize's forward_ton_amount: enough for a receiving contract to parse the notification.
+const int fee::prize_notify = 10000000; ;; 0.01 GRAM
 
-;; Attached to range_setup: the storage reserve plus the range's own gas for the setup and the forwarding
-;; fee of its state_init.
-const int fee::range_setup = fee::range_storage + 10000000; ;; 0.11 GRAM
+;; Gas of one Jackpot or wallet handler, with room: 50,000 gas at 400 nano-GRAM per gas.
+const int fee::handler = 20000000; ;; 0.02 GRAM
 
-;; Gas of one Jackpot or range handler: 37,500 gas at 400 nano-GRAM per gas; the most measured is 32k.
-const int fee::handler = 15000000; ;; 0.015 GRAM
+;; Storage reserve a jGRAM wallet keeps.
+const int fee::wallet_storage = 26000000; ;; 0.026 GRAM: the built wallet is 23 cells and 12,373 bits, 13.4+ years at today's prices and 2.2+ at the old ones
 
-;; The tree. Every node message carries the remaining value of the one before it (mode 64), so a chain of
-;; 4 nodes needs 4 hops; a level-1 node sends what is left of an update back to the Jackpot. A hop is
-;; sized for the worst case: a fold of all 64 children and the longest scan, at every level.
+;; The forwarding fee of the wallet's StateInit, which every prepare_deposit carries.
+const int fee::wallet_deploy_forward = 8000000; ;; 0.008 GRAM: the StateInit is 23 cells and 12,373 bits, 6.3M at 400 nano-GRAM per bit
 
-;; One node's share of an update or a descent: its gas in the worst case and the forwarding fee of its one
-;; message.
-const int fee::node_hop = 30000000; ;; 0.03 GRAM: 75,000 gas, the worst case measured is about 52,000
+;; The tree. Every node message carries the remaining value of the one before it (mode 64).
+const int fee::node_hop = 35000000; ;; 0.035 GRAM: 87,500 gas
 
-;; Storage reserve a new node keeps from its first update: at least 10 years at today's prices, checked
-;; against config 18 in tests/Node.spec.ts.
-const int fee::node_storage = 300000000; ;; 0.3 GRAM
+;; Storage reserve a new node keeps from its first update.
+const int fee::node_storage = 150000000; ;; 0.15 GRAM
 
-;; The forwarding fee of a new node's state_init, paid from the update that deploys it.
+;; The forwarding fee of a new node's StateInit, paid from the update that deploys it.
 const int fee::node_deploy_forward = 20000000; ;; 0.02 GRAM
 
-;; What opening a node costs its opener: the reserve and the state_init's forwarding.
+;; What opening a node costs its opener: the reserve and the StateInit's forwarding.
 const int fee::node_open = fee::node_storage + fee::node_deploy_forward;
 
-;; An update of one booking's live tickets, down the 4 levels.
+;; An update of one position's tickets, down the 4 levels and on to the owner.
 const int fee::update = tree::levels * fee::node_hop;
 
-;; A booking's share of the nodes it may open: 1/64 of a level-1 node, 1/4096 of a level-2 node, and so on.
-;; The Jackpot keeps it in its float and pays each new node from there; the first node of each level is
-;; paid from the float the Jackpot is deployed with.
+;; A new position's share of the nodes it may open.
 const int fee::node_share = fee::node_open / 64 + fee::node_open / 4096 + fee::node_open / 262144 + 3;
 
-;; The range's part of a descent: its gas, and the forwarding of its answer.
-const int fee::range_check = 10000000; ;; 0.01 GRAM
+;; One search of the draw, from the float.
+const int fee::search = tree::levels * fee::node_hop + fee::handler;
 
-;; A descent from the top node to a range and the answer back to the Jackpot, whose handler it pays.
-const int fee::descent = fee::update + fee::range_check + fee::handler;
+;; A message to a wallet that needs only its gas: deposit_cancelled, close_wallet.
+const int fee::release = 10000000; ;; 0.01 GRAM
 
-;; A booking, whichever way the tokens came: the notification's gas, the quote round trip, the booking's
-;; handler, then a range deployment, the update down the tree and the node share, or a payout returning
-;; the tokens, whichever costs more.
-const int fee::booking = fee::handler + fee::quote + fee::handler + fee::range_setup + fee::update + fee::node_share;
+;; Added to an entry fee when a payload is present: the forwarding of max_payload_cells over every hop it rides.
+const int fee::payload = 20000000; ;; 0.02 GRAM: 8 cells of 1,023 bits cost about 3.6M a hop, over 4 hops
 
-;; Allowance for Hipo's own deposit fee, deposit_coins_fee(0) in the treasury: about 0.009 GRAM at the
-;; old gas prices. deposit_coins throws if `coins` exceeds what is left after it, and the Jackpot then
-;; refunds the bounced GRAM, so being short here costs a deposit, never funds.
-const int fee::hipo_deposit = 20000000; ;; 0.02 GRAM
+;; The value a deposit's prepare_deposit and deposit_booked each carry at least. The undo of a bounced deposit_booked
+;; sends the tree update and the cancel before the refund, so the floor covers update + cancel + refund + two handlers
+;; (the bounce's and the refund's) and the forwarding of all three.
+const int fee::bounce_floor = fee::update + fee::release + fee::payout + 2 * fee::handler + 10000000;
 
-;; Rides on deposit_coins to the treasury and comes back as the value of the mint notification, the
-;; burner's pattern: the treasury reserves `coins` and forwards the rest, the parent relays it, and the
-;; wallet passes on what is above its storage fee. It pays Hipo's fee and then the booking.
-const int fee::deposit_forward = fee::hipo_deposit + fee::booking;
+;; deposit, as forward_ton_amount of the hGRAM transfer: the notification's gas, the prepare_deposit with the
+;; wallet's StateInit, the wallet's gas, deposit_ready at the Jackpot, the tree update and the node share, and
+;; deposit_booked with the wallet's reserve; and the bounce floor for the last of them. No quote.
+const int fee::deposit = 4 * fee::handler + fee::wallet_deploy_forward + fee::update + fee::node_share
+    + fee::wallet_storage + fee::bounce_floor + 5000000;
 
-;; deposit: the Jackpot's own gas and the forward.
-const int fee::deposit = fee::handler + fee::deposit_forward;
+;; burn, sent to the wallet: its gas, burn_notification at the Jackpot, the update, the close, and the payout.
+const int fee::withdraw = 3 * fee::handler + fee::update + fee::release + fee::payout;
 
-;; forward_ton_amount of an hGRAM deposit: the booking, which starts with the notification's gas.
-const int fee::hgram_deposit = fee::booking;
+;; A `w`, or one owner of withdraw_for: the burn with the wallet's StateInit and its comment.
+const int fee::comment_withdraw = fee::withdraw + fee::wallet_deploy_forward + 3000000;
 
-;; withdraw, sent to the range: the range's gas, then withdrawn at the Jackpot, its update down the tree,
-;; the quote round trip, and the payout. What a withdrawal carries above this (and above the surcharge,
-;; when it owes one) goes back to the owner.
-const int fee::withdraw = fee::handler + fee::handler + fee::update + fee::quote + fee::handler + fee::payout;
+;; submit_randomness: the quicknet check, then the draw: no quote.
+const int fee::submit = 60000000 + 3 * fee::handler;
 
-;; Kept by a range from a withdrawal the Jackpot refused, for the gas of returning the rest to the owner.
-const int fee::range_bounce = 5000000; ;; 0.005 GRAM
+;; A poke: its handler, the quote round trip and the reply without boundary work.
+const int fee::poke = 2 * fee::handler + fee::quote;
 
-;; The smallest overpayment of a withdrawal worth sending back to the owner, so that a refund is never
-;; eaten by its own forwarding fee.
-const int fee::min_refund = 10000000; ;; 0.01 GRAM
+;; Hipo's unstake_tokens fee, sent with the unstake from the float or from a refill.
+const int fee::unstake = 100000000; ;; 0.1 GRAM
 
-;; start_draw: the quote round trip, and a burn, since the draw this starts may end by sending the burn
-;; owed. At most one burn is sent per draw, so this prepays every burn there will be.
-const int fee::start_draw = fee::handler + fee::quote + fee::payout + fee::burn_forward;
+;; refill: the handler and the unstake it pays for. No quote.
+const int fee::refill = 2 * fee::handler + fee::unstake;
 
-;; submit_randomness: the quicknet check, about 78k gas in all, has a 125k gas budget at 400 nano-GRAM
-;; per gas; the handler's gas limit comes from this value.
-const int fee::submit_randomness = 50000000; ;; 0.05 GRAM
+;; provide_wallet_address: its gas and the reply.
+const int fee::wallet_address = 2 * fee::handler;
 
-;; One attempt of a slot, in gas: the Jackpot's locate handler, the descent through 4 nodes, the range's
-;; check, and the hit or miss handler. The most measured in tests/Gas.spec.ts is 126,590 gas, 0.0506 GRAM
-;; at 400 nano-GRAM per gas, plus about 10% margin. The surcharge of a withdrawal held back in a draw
-;; is sized from it, not from fee::locate, which also pays the prize payout and a worst-case descent.
-const int fee::attempt = 56000000; ;; 0.056 GRAM
+;; In gas units: the most gas a boundary's own work may use, the gas limit the reply raises to. The float pays the
+;; gas really used. Measured (tests/Gas.spec.ts), over a reply that is not a boundary: 11,244 gas for a boundary, 22,887 with
+;; an unstake, 33,785 when it also rolls over three open slots; three times the worst.
+const int fee::boundary_max = 100000;
 
-;; locate: a descent to a range and its answer, then a prize payout on a hit.
-const int fee::locate = fee::handler + fee::descent + fee::payout;
+;; Returning tokens that came with too little GRAM, when the return can be paid for.
+const int fee::return = fee::handler + fee::payout;
 
-;; requote: one more quote round trip. What the reply then causes was paid by the message that made the
-;; record, and is still in the balance, because the lost reply never spent it.
-const int fee::requote = fee::handler + fee::quote;
+;; Closing the tree is paid by sweep's sender, never by the float or a node's reserve. One node's term is its gas
+;; bound priced at the current gas price, plus the forwarding of its close_node. The bounds are measured on the node
+;; code (tests/Retire.spec.ts, "Gas bounds") and set with at least 1.5 times headroom; the margin is applied once, at
+;; the top, and flows down the tree with the values (see imports/utils.fc, close_cost).
+const int close::gas_1 = 20000; ;; a level-1 node: finish and delete itself (measured 11,388)
+const int close::gas_inner = 450000; ;; a node above level 1, up to 64 children (measured 290,166)
+const int close::margin_num = 3; ;; the margin, 3/2
+const int close::margin_den = 2;
 
-;; expire: closes a slot, and may end the draw; the burn it may send was prepaid by start_draw.
-const int fee::expire = fee::handler;
+;; sweep: its gas, one payout and fee::burn_forward. It must also bring close_cost(next_position).
+const int fee::sweep = 2 * fee::handler + fee::payout + fee::burn_forward + 10000000;
 
-;; claim: a payout of each kind, the prize and the rest.
-const int fee::claim = fee::handler + 2 * fee::payout;
+;; Sending a foreign jetton or NFT back: the handler, the log, the transfer and its forwarding.
+const int foreign::gas = 30000; ;; gas of the foreign-token handler, to price its log
 
-;; The Jackpot's own GRAM, kept for its storage and never withdrawn by the governor.
-const int fee::jackpot_storage = 10000000000; ;; 10 GRAM
+;; withdraw_for: the Jackpot's own gas for one owner, 12,000 gas at 400 nano-GRAM per gas, on top of what the owner's
+;; wallet is sent (measured 8,326 gas an owner in tests/Retire.spec.ts).
+const int fee::withdraw_for_gas = 4800000;
 
+const int fee::foreign_return = 60000000; ;; 0.06 GRAM
 
-;; Log topics of the external-out messages, read by the keeper and the off-chain HPO incentive
-;; computation.
-const int log::booking = 0x1;
-const int log::withdrawal = 0x2;
-const int log::draw_start = 0x3;
-const int log::randomness = 0x4;
-const int log::slot = 0x5;
-const int log::withdrawn = 0x6;
-const int log::setup_failed = 0x7;
-
-
-const int config::election = 15;
-const int config::current_validators = 34;
+;; The most one draw can spend from the float: the boundary's gas, 48 searches at their worst real cost, 3 prize
+;; payouts with their notifications, one burn, the submit reward and an unstake, plus the value that three
+;; searches carry in flight.
+const int fee::search_worst = 70000000; ;; 0.07 GRAM: 175,000 gas at 400 nano-GRAM per gas
+const int fee::draw_budget = 3 * attempts_per_slot * fee::search_worst + 4 * fee::payout + 3 * fee::prize_notify
+    + fee::burn_forward + reward::submit + fee::unstake + 3 * fee::search + fee::boundary_max * 400;
 
 
 const int send::regular = 0;
@@ -285,5 +314,4 @@ const int reserve::negate = 8;
 const int reserve::bounce_if_failed = 16;
 
 
-const int chain::main = -1;
 const int chain::base = 0;

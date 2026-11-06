@@ -1,8 +1,8 @@
 # Hipo Jackpot
 
 A no-loss prize draw on top of the Hipo liquid staking protocol (`HipoFinance/contract`). Players
-deposit GRAM or hGRAM, the contract holds hGRAM, and each validation round's yield is paid to three
-drawn players. See README.md.
+deposit hGRAM, the contract holds it, and each validation round's yield is paid to three drawn
+players. See README.md.
 
 > Terminology: GRAM = the coin, hGRAM = Hipo's jetton. The network is still called the TON blockchain.
 
