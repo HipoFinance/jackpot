@@ -20,7 +20,7 @@ comes back, but the number puts people off.
 After this change the Jackpot reads the current gas, forwarding and storage prices from the chain and computes each fee
 from them. It adds double the price (triple on the legs where a shortfall would be hardest to undo) on what a later
 step spends, so a price jump during the few seconds a chain runs still leaves it room. The 0.25 GRAM insurance goes;
-if that failure ever happens, the Jackpot's own GRAM covers it, at most about 0.066 GRAM. A deposit then needs about
+if that failure ever happens, the Jackpot's own GRAM covers it, at most about 0.068 GRAM. A deposit then needs about
 0.091 GRAM, a burn 0.079. If prices rise to the old level, the fees rise with them, to about what they are now, and
 nothing breaks for good.
 
@@ -217,8 +217,8 @@ GRAM today. Unspent value comes back as before.
   that can actually occur commits; a bounce carrying no GRAM at all would get no gas and its compute phase would be
   skipped, but `deposit_ready` never sends `deposit_booked` with less than that. The float's exposure is
   `update_value + release + gas(G_J) + fwd(1, 545) + 2·fwd(log)` per event, the last two the update's forwarding and
-  two logs (about 0.3–0.4M nano-GRAM today): about 0.066 GRAM today, 0.40 at 400 nano-GRAM per gas, before the
-  recomputation with the new bounds. **When the
+  two logs (about 0.3–0.4M nano-GRAM today): about 0.068 GRAM today with the final bounds (about 0.40 at 400 nano-GRAM
+  per gas, an estimate from before them). **When the
   bounce carries less than `update_value + release + payout_fee`** (the undo's own sends come first, then the refund), the counters and the tree are still undone, but the refund is
   not sent: the hGRAM is left untracked, with an `untracked` log, for `return_tokens`. This reverses
   the code review's fix (F2, amendment 1), which made every deposit carry 0.25 GRAM for it. **Why that is sound now:**
@@ -250,8 +250,8 @@ GRAM today. Unspent value comes back as before.
   `burnAttach` in `wrappers/Jackpot.ts` computes it. **The burn fee is `get_burn_fee(forward, cells, bits)`** (wrapper
   `getBurnFee`), for the burn's own forward amount and payload, since the wallet's leg carries the payload;
   `get_jackpot_fees().withdraw` is the burn fee with no payload and no forward amount, so an app that sends either must
-  use `get_burn_fee`. A wallet whose storage debt is above the burn fee less the wallet's minimum needs more than the
-  burn fee. A wrong attach only causes a refusal, never a loss.
+  use `get_burn_fee`. A wallet whose storage debt is above the burn fee less the wallet's minimum (about 0.068 GRAM
+  today) needs more than the burn fee. A wrong attach only causes a refusal, never a loss.
   Every figure is at the current price, so apps read them each time and do not cache them.
 - **`scripts/setSuccessor.ts`** requires a successor fee of at least 3 times the successor's current deposit fee, since
   the fee is frozen when set.
@@ -411,9 +411,9 @@ the other legs do not depend on `G_N`.
   above about 1,000 nano-GRAM per gas; this design fails only on a jump of that size in seconds.
 - **`deposit_booked` short of gas** would lose the booked principal with no bounce. `booked_min` leaves it its handler's
   gas at twice the price; it is not the only lasting harm, so it is in the table's terms too.
-- **A short undo is paid by the float,** at most about 0.066 GRAM today per event (0.40 at 400 nano-GRAM per gas), plus
-  the update's forwarding and two logs (about 0.3–0.4M nano-GRAM today), to be recomputed with the new bounds, for
-  an event with no known trigger. If the bounce carries less than `payout_fee`, the undo still restores the counters and
+- **A short undo is paid by the float,** at most about 0.068 GRAM today per event, the update's forwarding and two logs
+  included (about 0.40 at 400 nano-GRAM per gas, an estimate from before the final bounds), for an event with no known
+  trigger. If the bounce carries less than `payout_fee`, the undo still restores the counters and
   the tree, but its refund is not sent: the hGRAM stays untracked, with an `untracked` log, until the governor's
   `return_tokens` pays it. Nothing is lost; the depositor waits.
 - **Apps must add a wallet's storage debt** to `get_wallet_minimum_internal()`, which is computed without a storage
@@ -433,7 +433,8 @@ the other legs do not depend on `G_N`.
   this path (Changes, step 1) and a criterion covers it.
 - **Hipo's fee formulas are mirrored** in `fees.fc`. If Hipo changes `send_tokens_fee` or `unstake_tokens_fee`, the
   Jackpot's figures drift; Hipo's upgrade checklist gets that line.
-- **The wallet's reserve is smaller today:** 5 years of storage at the current price (about 0.0075 GRAM) in place of
+- **The wallet's reserve is smaller today:** 5 years of storage at the current price (about 0.0091 GRAM for the built 28-cell
+  wallet at 135 a cell) in place of
   0.026. It is topped up at each booking and rises with storage prices; a wallet that runs out freezes only at 0.1 GRAM
   of debt, and with the burn check counting `due_payment()`, debt no longer opens a loss window.
 - **`withdraw_for` near the gas limit:** 100 owners use about 833,000 of the 1,000,000 gas; `per` is computed once,

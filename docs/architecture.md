@@ -108,7 +108,8 @@ can win that pot, and a withdrawal after it cannot take the prizes. Nothing is r
 Every fee a user attaches is computed on the chain from the current prices (`contracts/imports/fees.fc`: `GETGASFEE`,
 `GETFORWARDFEE`, `GETFORWARDFEESIMPLE`, `GETSTORAGEFEE`), so a change of the network's prices moves the fees with it.
 Each handler has a gas bound at least 1.5 times what the built code uses (`tests/Gas.spec.ts`, `tests/Fees.spec.ts`),
-and a fee adds a headroom of 2 (3 for `release`, the value that closes a wallet) on the value a later transaction spends.
+and a fee adds a headroom of 2 (3 for `release`, the value that closes a wallet, and for the refused-burn leg of the
+wallet's minimum) on the value a later transaction spends.
 The bounds are the Jackpot 60,000 gas (`bound::jackpot`), a wallet 18,000, a node 110,000, a submit 150,000, TEP-89 28,000
 and the poke handler 22,000; the treasury's quote 40,000. `get_jackpot_fees` returns the fees at today's prices and `get_fee_parts` the parts they
 are built from.
@@ -127,7 +128,7 @@ are built from.
   payload bits)`, which already counts the forward amount and the payload; the minimum is `get_wallet_minimum_internal`
   and the payload fee is eight times the payload's forwarding plus one more. The getter shows the minimum with **no**
   storage debt (a getter runs without a storage phase); in a transaction the wallet also counts its debt. A wallet in
-  debt above about 0.066 GRAM today therefore needs more than the burn fee. Read the debt from the account's storage
+  debt above about 0.068 GRAM today therefore needs more than the burn fee. Read the debt from the account's storage
   stats: `max(0, due_payment + storage fee for (now - last_paid) - balance)`.
 - **The first booking.** The forwarding of the top node's StateInit (about 1.87M today) is paid by the float, taken out of
   the reserve, so a price step cannot leave `deposit_booked` short; the node's size is pinned by a test.
@@ -136,7 +137,7 @@ are built from.
 - **The undo** of a bounced `deposit_booked` raises its own gas limit to `bound::jackpot` once its checks pass (the bounce comes from the owner's own wallet, which
   the booking carries), and sends its
   update and cancel with explicit values from the balance; the float is exposed to `update_value + release +
-  gas(bound::jackpot)` at most. Its refund is paid only when the bounce carries more than the update, the release and the
+  gas(bound::jackpot)` plus the update's forwarding and two logs at most, about 0.068 GRAM today. Its refund is paid only when the bounce carries more than the update, the release and the
   payout fee; a bounce of `deposit_booked` does not (it cannot happen for a wallet that just answered), so the tokens
   leave the count untracked, with an untracked log, and `return_tokens` recovers them.
 - A jGRAM wallet keeps `wallet_storage`: five years at the current price.
@@ -259,7 +260,8 @@ has had it since November 2025).
 
 ### Gas and the float
 
-Users pay for their own chains. The entry minimums are sized at 400 nano-GRAM per gas, and each handler passes on
+Users pay for their own chains. The entry minimums are computed at the current prices (only the float's amounts are
+sized at 400 nano-GRAM per gas), and each handler passes on
 what it received less its gas, reserving the Jackpot's balance from before the message, so a user chain doesn't
 move the float.
 
@@ -297,9 +299,10 @@ notification was missed) it only lowers `unstaking_tokens`. A stuck count blocks
   successor refuses, the hGRAM goes to the owner. `scripts/setSuccessor.ts` refuses a fee below the successor's
   three times the successor's deposit fee (its prices may rise before the move) plus `fee::return` and the payload's fee,
   read from its `get_jackpot_fees`.
-- **`withdraw_for(to_successor, owners)`** (governor, retired only): up to 100 owner hashes, sent as `w` burns. For
-  `n` owners the governor pays at least `n·per + gas(gas_consumed() + 10,000)`, where `per` is the value sent to each
-  wallet (the `w` value, plus the successor fee for a move), and gets back what is above that; what an owner's wallet does not spend goes to that owner. The
+- **`withdraw_for(to_successor, value_per_owner, owners)`** (governor, retired only): up to 100 owner hashes, sent as
+  `w` burns, each with the governor's `value_per_owner`, which must be at least `per` (the `w` value, plus the successor
+  fee for a move); a larger value empties a wallet whose storage debt `per` would not cover. For `n` owners the governor
+  pays at least `n·value_per_owner + gas(gas_consumed() + 10,000)` and gets back what is above that; what an owner's wallet does not spend goes to that owner. The
   successor fee is charged whenever `to_successor` is set, even with no successor set; that is harmless, since the
   governor pays.
 - **`sweep`** (anyone, with `fee::sweep + close_cost(next_position)`, read from `get_close_cost`): only when retired,
@@ -498,7 +501,8 @@ the booking's reply cell, so a future upgrade must keep that layout while a `dep
     `get_jackpot_state`). A difference means an update was lost.
   - `unstaking_tokens > 0` past two rounds: check the wallet, then `scripts/settleUnstake.ts`.
   - hGRAM outside `held_tokens` (the untracked hGRAM): a payout that came back, to return with `scripts/returnTokens.ts`.
-  - the fees are sized at 400 nano-GRAM per gas unit; mainnet config 21 is 66.67. Re-measure if the price rises.
+  - the user fees follow the current prices; only the float's amounts (`fee::draw_budget`, `fee::unstake_bound`) are
+    sized at 400 nano-GRAM per gas unit, and mainnet config 21 is 66.67. Re-measure them if the price nears 400.
 - **The tree:** watch `next_position`. At 16,777,216 positions new wallets get their tokens back, and existing wallets,
   withdrawals and draws go on.
 - **If drand stops:** the waiting draw waits, and the next boundary skips it; deposits and withdrawals go on.

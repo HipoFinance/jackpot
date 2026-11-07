@@ -19,8 +19,10 @@ instantly in hGRAM.
   hash fixed at the boundary, so neither validators nor the Hipo team can predict or steer a draw.
 - A share of each draw goes to the HPO burn.
 
-> **Status:** v2 with amendment 1 is built; its contracts are not yet deployed. The approved design is in
-> [`docs/specs/`](docs/specs) (the v2 spec and its amendment), the contracts and their invariants in
+> **Status:** v2 with amendments 1 and 2 is built; its contracts are not yet deployed. The approved design is in
+> [`docs/specs/`](docs/specs): the [v2 spec](docs/specs/2026-10-31-jackpot-v2.md),
+> [amendment 1](docs/specs/2026-11-03-jackpot-v2-amendment-1.md) and
+> [amendment 2, the fees](docs/specs/2026-11-06-jackpot-fees.md); the contracts and their invariants in
 > [`docs/architecture.md`](docs/architecture.md), the message layouts in [`contracts/schema.tlb`](contracts/schema.tlb)
 > and the logs in tongo's ABI form in [`abi/jackpot.xml`](abi/jackpot.xml).
 
