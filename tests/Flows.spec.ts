@@ -4,6 +4,7 @@
 // at a boundary, and the float refilled by an unstake. One draw runs on the production build with the recorded drand
 // rounds; the others use the test build (tests/jackpot/testbuild.ts).
 import '@ton/test-utils'
+import { forwardFee } from './jackpot/prices'
 import { Address, beginCell, toNano } from '@ton/core'
 import { Blockchain, createEmptyShardAccount, SendMessageResult } from '@ton/sandbox'
 import { createHash } from 'crypto'
@@ -125,9 +126,12 @@ describe('Flows', () => {
             expect(leaf.owners[0]).toBe(BigInt('0x' + alice.address.hash.toString('hex')))
             expect(await treeTotal(env)).toBe(v)
             // The first position opens the first node of each level from the float, and keeps its node share: the
-            // float falls by exactly that and by nothing else. The user paid for all the gas.
+            // float falls by exactly that and by the forwarding of the top node's StateInit, which the float pays (a price
+            // step must not leave the booking short). The user paid for all the gas.
             const nodeOpen = env.fees.nodeStorage + toNano('0.02')
-            expect(before - (await balanceOf(env, env.jackpot.address))).toBe(4n * nodeOpen - nodeShare(env))
+            expect(before - (await balanceOf(env, env.jackpot.address))).toBe(
+                4n * nodeOpen - nodeShare(env) + forwardFee(env.blockchain, 43n, 22721n),
+            )
             await expectSolvent(env)
             expect((await env.jackpot.getJettonData()).totalSupply).toBe(v)
         })

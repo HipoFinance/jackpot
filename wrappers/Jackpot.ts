@@ -155,7 +155,6 @@ export const maxPayloadCells = 8
 export const maxWithdrawFor = 100
 export const rewardSubmit = toNano('0.02') // r_s
 export const handlerFee = toNano('0.02') // fee::handler
-export const withdrawForGas = 4_800_000n // fee::withdraw_for_gas: the Jackpot's own gas for one owner of withdraw_for
 
 // Decisions of the spec, used as the initial parameters.
 export const defaults = {
@@ -342,6 +341,58 @@ export interface JackpotFees {
     floatHigh: bigint
     walletStorage: bigint
     nodeStorage: bigint
+    // a payout with a cap-size payload, a move's options or a refund's deposit_refused
+    payoutFee: bigint
+    // provide_wallet_address
+    tep89: bigint
+}
+
+// The parts the fees are built from, at the current price (get_fee_parts): for tests and monitoring.
+export interface FeeParts {
+    hop: bigint
+    updateMin: bigint
+    updateValue: bigint
+    release: bigint
+    hipoSend: bigint
+    hipoUnstake: bigint
+    bookedMin: bigint
+    nodeShare: bigint
+    wValue: bigint
+    burnArrives: bigint
+}
+
+// What an app attaches to a burn: `burnFee` must already include the forward amount and the payload's fee, as
+// jackpot.getBurnFee(forwardAmount, cells, bits) does. It is never less than the wallet's own minimum
+// (wallet.getWalletMinimumInternal(), which counts no storage debt) plus the payload's forwarding (`payloadFee`, eight
+// times fwd_simple(payload), and one fwd_simple more for the wallet's own hop) plus the wallet's debt, and a small margin.
+// The debt is read from the wallet's account: its balance, due_payment and last_paid. `storagePrice` is {bit, cell} per
+// 65536 seconds (config 18; the default is an upper bound for the basechain), and the wallet's size is the built wallet's.
+export interface WalletAccount {
+    balance: bigint
+    duePayment: bigint
+    lastPaid: number
+}
+
+export function burnAttach(
+    burnFee: bigint,
+    walletMinimum: bigint,
+    payloadFee = 0n,
+    account?: WalletAccount,
+    now = Math.floor(Date.now() / 1000),
+    storagePrice = { bit: 1n, cell: 500n },
+    walletSize = { cells: 28n, bits: 13153n },
+    margin = 1_000_000n,
+): bigint {
+    let debt = 0n
+    if (account != null) {
+        const elapsed = BigInt(Math.max(0, now - account.lastPaid))
+        const fee = ((walletSize.cells * storagePrice.cell + walletSize.bits * storagePrice.bit) * elapsed + 65535n) / 65536n
+        const owed = account.duePayment + fee - account.balance
+        debt = owed > 0n ? owed : 0n
+    }
+    // payloadFee is 8 · fwd_simple(payload): the wallet checks its minimum for the payload plus that, and one hop more
+    const floor = walletMinimum + payloadFee + payloadFee / 8n + debt
+    return (burnFee > floor ? burnFee : floor) + margin
 }
 
 export class Jackpot implements Contract {
@@ -545,9 +596,17 @@ export class Jackpot implements Contract {
     async sendWithdrawFor(
         provider: ContractProvider,
         via: Sender,
-        opts: { value: bigint; toSuccessor: boolean; owners: Address[] },
+        opts: { value: bigint; toSuccessor: boolean; owners: Address[]; valuePerOwner?: bigint },
     ) {
-        const body = op(JackpotOp.withdrawFor).storeBit(opts.toSuccessor).storeRef(ownersCell(opts.owners))
+        // valuePerOwner: what each owner's burn carries; at least the formula's (get_fee_parts().wValue, plus the successor fee for a move)
+        const body = op(JackpotOp.withdrawFor)
+            .storeBit(opts.toSuccessor)
+            .storeRef(ownersCell(opts.owners))
+            .storeCoins(
+                opts.valuePerOwner ??
+                    (await this.getFeeParts(provider)).wValue +
+                        (opts.toSuccessor ? (await this.getRetirement(provider)).successorDepositFee : 0n),
+            )
         await this.sendMessage(provider, via, opts.value, body.endCell())
     }
 
@@ -704,6 +763,34 @@ export class Jackpot implements Contract {
             floatHigh: stack.readBigNumber(),
             walletStorage: stack.readBigNumber(),
             nodeStorage: stack.readBigNumber(),
+            payoutFee: stack.readBigNumber(),
+            tep89: stack.readBigNumber(),
+        }
+    }
+
+    // the burn fee for a forward amount and a payload of `cells` and `bits` (outside its root), at the current price
+    async getBurnFee(provider: ContractProvider, forwardAmount: bigint, cells: number, bits: number): Promise<bigint> {
+        const { stack } = await provider.get('get_burn_fee', [
+            { type: 'int', value: forwardAmount },
+            { type: 'int', value: BigInt(cells) },
+            { type: 'int', value: BigInt(bits) },
+        ])
+        return stack.readBigNumber()
+    }
+
+    async getFeeParts(provider: ContractProvider): Promise<FeeParts> {
+        const { stack } = await provider.get('get_fee_parts', [])
+        return {
+            hop: stack.readBigNumber(),
+            updateMin: stack.readBigNumber(),
+            updateValue: stack.readBigNumber(),
+            release: stack.readBigNumber(),
+            hipoSend: stack.readBigNumber(),
+            hipoUnstake: stack.readBigNumber(),
+            bookedMin: stack.readBigNumber(),
+            nodeShare: stack.readBigNumber(),
+            wValue: stack.readBigNumber(),
+            burnArrives: stack.readBigNumber(),
         }
     }
 

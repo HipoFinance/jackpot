@@ -47,6 +47,13 @@ it is booked the player's jGRAM wallet notifies the beneficiary like any jetton 
 comes back with a reason code. A withdrawal is a standard burn that can ask for the hGRAM to go to a successor Jackpot.
 The Jackpot answers TEP-89 `provide_wallet_address`. See `contracts/schema.tlb`.
 
+Fees are priced at the chain's current prices and read from the contract: `get_jackpot_fees` (deposit, `w`, poke, submit,
+refill, TEP-89, payload, payout), `get_burn_fee(forward amount, payload cells, payload bits)` for a burn, and
+`get_wallet_minimum_internal` on the player's wallet. A burn should carry `max(burn fee, wallet minimum + payload fee +
+the wallet's storage debt)` (`burnAttach` in `wrappers/Jackpot.ts` computes it from the wallet's account); one that
+carries less is refused and the wallet restores the balance. What a message brings above its fee comes back as
+`gas_excess`.
+
 ### The end
 
 The governor can **retire** the Jackpot: deposits stop for good, and withdrawals, draws and prizes go on. It can

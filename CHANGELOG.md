@@ -4,6 +4,23 @@ What changed in Hipo Jackpot, newest first.
 
 ## Unreleased
 
+- Fix round after the tier-3 review of amendment 2: the first booking's top-node StateInit forwarding is paid by the float
+  (a price step could leave `deposit_booked` without gas and lose the principal); the burn fee prices the wallet's leg
+  with the payload (`get_burn_fee`); TEP-89 bound 28,000; bounds 60,000 (Jackpot) and 18,000 (wallet) for the cap-payload,
+  full-burn and `w` paths; the undo checks the bounce comes from the owner's wallet (the owner rides last in the booking's
+  reply); `booked_min` counts the payload; the wallet's `from_jackpot?` branch is sized for the Jackpot's comment; the
+  getter `get_wallet_minimum_internal` counts no debt; `withdraw_for` takes `value_per_owner`. **A `deposit_ready` refusal's
+  refund no longer ignores errors:** a failed refund now bounces `deposit_ready`, and the governor's `return_tokens(…,
+  true)` recovers it.
+- Amendment 2, fees priced at current prices (`docs/specs/2026-11-06-jackpot-fees.md`): `contracts/imports/fees.fc`
+  computes the deposit, burn, `w`, poke, submit, refill, TEP-89 and `withdraw_for` fees from the chain's gas, forwarding
+  and storage prices, with gas bounds of at least 1.5 times the measured gas and a headroom of 2 (3 on `release`).
+  `burn_notification` checks its fee first, within 30,000 gas, and throws when short, so the wallet restores the balance;
+  the wallet's frozen minimum now counts its storage debt (`get_wallet_minimum_internal`); a burn from the Jackpot to a
+  wallet in debt goes to the owner. `deposit_ready` refuses with `low_value` below `update_min + booked_min`. The undo of
+  a bounced `deposit_booked` sets its own gas limit and drops `fee::bounce_floor`. `get_jackpot_fees` has new fields and
+  `get_fee_parts` is new; `setSuccessor` wants 3 times the successor's deposit fee. Declined: a fee per call rather than
+  per handler (the bounds are fixed in code); the undo's refund is not guaranteed (untracked and recoverable).
 - Verification tests for the criteria that were open (`tests/Verification.spec.ts`): the boundary rule at the exact
   threshold, 1,000 pokes, a placed boundary, the deposit, burn and `w` chains, every bounceable message's `extra_flags`,
   the Failures table row by row, a bounced `deposit_booked`, the rate in exact fractions, the end of the tree (the excess,

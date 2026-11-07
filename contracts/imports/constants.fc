@@ -172,17 +172,12 @@ const int reward::submit = 20000000; ;; 0.02 GRAM
 const int float::after_end = 1000000000;
 
 
-;; Fees. Every entry message must carry at least its fee, checked before anything changes, and the fee
-;; covers every message the step causes, so nothing an outsider starts is paid from the Jackpot's own
-;; GRAM. What a user chain does not spend goes back to the user.
-;;
-;; The figures are fixed rather than read from config, sized at 400 nano-GRAM per gas, the worst case
-;; (mainnet config 21 reads 66.67 nano-GRAM per gas). The gas behind them is measured in tests/Gas.spec.ts.
+;; Fees. The user-side fees (deposit, burn, w, poke, submit, refill, TEP-89, withdraw_for) are computed at the chain's
+;; current prices in imports/fees.fc. What stays here is what the Jackpot's own GRAM pays, sized at 400 nano-GRAM per gas,
+;; the worst case (mainnet config 21 reads 66.67 nano-GRAM per gas): the float must never be short for a draw whatever the
+;; price does. The gas behind them is measured in tests/Gas.spec.ts.
 
-;; The quote round trip of a poke: the treasury's gas and the reply's.
-const int fee::quote = 30000000; ;; 0.03 GRAM
-
-;; Attached to each outgoing hGRAM transfer: Hipo's send_tokens_fee() plus the recipient wallet's
+;; Attached to each outgoing hGRAM transfer from the float: Hipo's send_tokens_fee() plus the recipient wallet's
 ;; storage and gas. The recipient wallet sends the rest back as gas_excess.
 const int fee::payout = 50000000; ;; 0.05 GRAM
 
@@ -192,17 +187,11 @@ const int fee::burn_forward = 500000000; ;; 0.5 GRAM
 ;; A prize's forward_ton_amount: enough for a receiving contract to parse the notification.
 const int fee::prize_notify = 10000000; ;; 0.01 GRAM
 
-;; Gas of one Jackpot or wallet handler, with room: 50,000 gas at 400 nano-GRAM per gas.
+;; Gas of one Jackpot handler, with room: 50,000 gas at 400 nano-GRAM per gas.
 const int fee::handler = 20000000; ;; 0.02 GRAM
 
-;; Storage reserve a jGRAM wallet keeps.
-const int fee::wallet_storage = 26000000; ;; 0.026 GRAM: the built wallet is 23 cells and 12,373 bits, 13.4+ years at today's prices and 2.2+ at the old ones
-
-;; The forwarding fee of the wallet's StateInit, which every prepare_deposit carries.
-const int fee::wallet_deploy_forward = 8000000; ;; 0.008 GRAM: the StateInit is 23 cells and 12,373 bits, 6.3M at 400 nano-GRAM per bit
-
-;; The tree. Every node message carries the remaining value of the one before it (mode 64).
-const int fee::node_hop = 35000000; ;; 0.035 GRAM: 87,500 gas
+;; The tree, for the float's own searches. Every node message carries the remaining value of the one before it.
+const int fee::node_hop = 35000000; ;; 0.035 GRAM
 
 ;; Storage reserve a new node keeps from its first update.
 const int fee::node_storage = 150000000; ;; 0.15 GRAM
@@ -213,52 +202,15 @@ const int fee::node_deploy_forward = 20000000; ;; 0.02 GRAM
 ;; What opening a node costs its opener: the reserve and the StateInit's forwarding.
 const int fee::node_open = fee::node_storage + fee::node_deploy_forward;
 
-;; An update of one position's tickets, down the 4 levels and on to the owner.
-const int fee::update = tree::levels * fee::node_hop;
-
 ;; A new position's share of the nodes it may open.
 const int fee::node_share = fee::node_open / 64 + fee::node_open / 4096 + fee::node_open / 262144 + 3;
 
 ;; One search of the draw, from the float.
 const int fee::search = tree::levels * fee::node_hop + fee::handler;
 
-;; A message to a wallet that needs only its gas: deposit_cancelled, close_wallet.
-const int fee::release = 10000000; ;; 0.01 GRAM
-
-;; Added to an entry fee when a payload is present: the forwarding of max_payload_cells over every hop it rides.
-const int fee::payload = 20000000; ;; 0.02 GRAM: 8 cells of 1,023 bits cost about 3.6M a hop, over 4 hops
-
-;; The value a deposit's prepare_deposit and deposit_booked each carry at least. The undo of a bounced deposit_booked
-;; sends the tree update and the cancel before the refund, so the floor covers update + cancel + refund + two handlers
-;; (the bounce's and the refund's) and the forwarding of all three.
-const int fee::bounce_floor = fee::update + fee::release + fee::payout + 2 * fee::handler + 10000000;
-
-;; deposit, as forward_ton_amount of the hGRAM transfer: the notification's gas, the prepare_deposit with the
-;; wallet's StateInit, the wallet's gas, deposit_ready at the Jackpot, the tree update and the node share, and
-;; deposit_booked with the wallet's reserve; and the bounce floor for the last of them. No quote.
-const int fee::deposit = 4 * fee::handler + fee::wallet_deploy_forward + fee::update + fee::node_share
-    + fee::wallet_storage + fee::bounce_floor + 5000000;
-
-;; burn, sent to the wallet: its gas, burn_notification at the Jackpot, the update, the close, and the payout.
-const int fee::withdraw = 3 * fee::handler + fee::update + fee::release + fee::payout;
-
-;; A `w`, or one owner of withdraw_for: the burn with the wallet's StateInit and its comment.
-const int fee::comment_withdraw = fee::withdraw + fee::wallet_deploy_forward + 3000000;
-
-;; submit_randomness: the quicknet check, then the draw: no quote.
-const int fee::submit = 60000000 + 3 * fee::handler;
-
-;; A poke: its handler, the quote round trip and the reply without boundary work.
-const int fee::poke = 2 * fee::handler + fee::quote;
-
-;; Hipo's unstake_tokens fee, sent with the unstake from the float or from a refill.
-const int fee::unstake = 100000000; ;; 0.1 GRAM
-
-;; refill: the handler and the unstake it pays for. No quote.
-const int fee::refill = 2 * fee::handler + fee::unstake;
-
-;; provide_wallet_address: its gas and the reply.
-const int fee::wallet_address = 2 * fee::handler;
+;; Hipo's unstake_tokens fee with headroom 2, at 400 nano-GRAM per gas and the old forwarding prices: the most a run-time unstake costs (a test
+;; checks it up to that price). The float's draw_budget is built on it.
+const int fee::unstake_bound = 200000000; ;; 0.2 GRAM
 
 ;; In gas units: the most gas a boundary's own work may use, the gas limit the reply raises to. The float pays the
 ;; gas really used. Measured (tests/Gas.spec.ts), over a reply that is not a boundary: 11,244 gas for a boundary, 22,887 with
@@ -283,10 +235,6 @@ const int fee::sweep = 2 * fee::handler + fee::payout + fee::burn_forward + 1000
 ;; Sending a foreign jetton or NFT back: the handler, the log, the transfer and its forwarding.
 const int foreign::gas = 30000; ;; gas of the foreign-token handler, to price its log
 
-;; withdraw_for: the Jackpot's own gas for one owner, 12,000 gas at 400 nano-GRAM per gas, on top of what the owner's
-;; wallet is sent (measured 8,326 gas an owner in tests/Retire.spec.ts).
-const int fee::withdraw_for_gas = 4800000;
-
 const int fee::foreign_return = 60000000; ;; 0.06 GRAM
 
 ;; The most one draw can spend from the float: the boundary's gas, 48 searches at their worst real cost, 3 prize
@@ -294,7 +242,7 @@ const int fee::foreign_return = 60000000; ;; 0.06 GRAM
 ;; searches carry in flight.
 const int fee::search_worst = 70000000; ;; 0.07 GRAM: 175,000 gas at 400 nano-GRAM per gas
 const int fee::draw_budget = 3 * attempts_per_slot * fee::search_worst + 4 * fee::payout + 3 * fee::prize_notify
-    + fee::burn_forward + reward::submit + fee::unstake + 3 * fee::search + fee::boundary_max * 400;
+    + fee::burn_forward + reward::submit + fee::unstake_bound + 3 * fee::search + fee::boundary_max * 400;
 
 
 const int send::regular = 0;

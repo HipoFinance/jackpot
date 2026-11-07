@@ -233,7 +233,7 @@ describe('The submit', () => {
     it('the float gate does not count the submit’s own value', async () => {
         const sc = await waiting()
         const { env } = sc
-        await setBalance(env, env.jackpot.address, env.fees.drawBudget - G('0.05'))
+        await setBalance(env, env.jackpot.address, env.fees.drawBudget - env.fees.submit / 2n)
         const g = await balanceOf(env, env.jackpot.address)
         expect(g).toBeLessThan(env.fees.drawBudget)
         expect(g + env.fees.submit).toBeGreaterThan(env.fees.drawBudget)

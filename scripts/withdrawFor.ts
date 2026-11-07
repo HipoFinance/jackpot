@@ -1,6 +1,6 @@
 import { NetworkProvider } from '@ton/blueprint'
-import { Address } from '@ton/core'
-import { handlerFee, maxWithdrawFor, withdrawForGas } from '../wrappers/Jackpot'
+import { Address, toNano } from '@ton/core'
+import { maxWithdrawFor } from '../wrappers/Jackpot'
 import { amount, askAmount, confirmSend, openJackpot, warnIfNotRole, done } from './lib/common'
 
 // Withdraws everything for a batch of owners of a retired Jackpot: the Jackpot burns each owner's jGRAM balance, and
@@ -46,9 +46,17 @@ export async function run(provider: NetworkProvider) {
         toSuccessor = (await ui.input('Move them to the successor? [yN]')).trim().toLowerCase() === 'y'
     }
 
-    const per = fees.commentWithdraw + (toSuccessor ? retirement.successorDepositFee : 0n)
-    // the Jackpot also needs gas for each owner (fee::withdraw_for_gas) and one handler
-    const needed = (per + withdrawForGas) * BigInt(owners.length) + handlerFee
+    // what each owner's wallet is sent; the Jackpot's own gas is priced on what it has used, so add a margin
+    const parts = await jackpot.getFeeParts()
+    const formula = parts.wValue + (toSuccessor ? retirement.successorDepositFee : 0n)
+    // a wallet in storage debt above about 0.07 GRAM needs more than the formula; a larger value per owner empties it
+    const answer = (await ui.input(`Value per owner in GRAM (empty: the formula, ${amount(formula)})`)).trim()
+    const per = answer === '' ? formula : toNano(answer)
+    if (per < formula) {
+        throw new Error(`The value per owner is below the formula's ${amount(formula)} GRAM. Nothing sent.`)
+    }
+    const gasEach = fees.commentWithdraw - parts.wValue
+    const needed = per * BigInt(owners.length) + gasEach * BigInt(owners.length + 2)
     ui.write(`Owners:   ${String(owners.length)}`)
     ui.write(`Per owner: ${amount(per)} GRAM; at least ${amount(needed)} GRAM in all`)
 
@@ -60,6 +68,7 @@ export async function run(provider: NetworkProvider) {
 
     const via = await confirmSend(provider, 'Withdraw for a batch of owners', jackpot.address, value, [
         `owners:       ${String(owners.length)}`,
+        `per owner:    ${amount(per)} GRAM`,
         `paid to:      ${toSuccessor ? 'the successor, as a deposit for each owner' : 'each owner'}`,
         ...owners.map((o) => `  ${o.toString()}`),
     ])
@@ -67,7 +76,7 @@ export async function run(provider: NetworkProvider) {
         return
     }
 
-    await jackpot.sendWithdrawFor(via, { value, toSuccessor, owners })
+    await jackpot.sendWithdrawFor(via, { value, toSuccessor, owners, valuePerOwner: per })
 
     done(ui, via)
 }

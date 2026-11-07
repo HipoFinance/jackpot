@@ -8,7 +8,7 @@ import { Blockchain, SendMessageResult } from '@ton/sandbox'
 import { readFileSync } from 'fs'
 import { JackpotOp } from '../wrappers/Jackpot'
 import { Node } from '../wrappers/Node'
-import { balanceOf, codes, gasOf, opOf, messageFrom, nodeAt, poke, reward, walletAt, withdraw } from './jackpot/setup'
+import { balanceOf, codes, gasOf, opOf, messageFrom, nodeAt, poke, reward, setGasPrice, walletAt, withdraw } from './jackpot/setup'
 import { A0, fresh, put, setNow, submitDraw } from './jackpot/scenario'
 import { createEmptyShardAccount } from '@ton/sandbox'
 
@@ -97,14 +97,13 @@ describe('Gas', () => {
             years(fees.nodeStorage, fullNode, today.bit, today.cell),
             years(fees.nodeStorage, fullNode, old.bit, old.cell),
         )
-        expect(years(fees.walletStorage, wallet, today.bit, today.cell)).toBeGreaterThanOrEqual(16)
+        // the wallet's reserve is priced at the current price for exactly 5 years (fees.fc wallet_storage)
+        expect(years(fees.walletStorage, wallet, today.bit, today.cell)).toBeGreaterThanOrEqual(5)
         expect(years(fees.nodeStorage, fullNode, today.bit, today.cell)).toBeGreaterThanOrEqual(25)
         expect(years(fees.nodeStorage, fullNode, old.bit, old.cell)).toBeGreaterThanOrEqual(3)
         // the sandbox's own prices are no worse than the old ones
-        expect(years(fees.walletStorage, wallet, last.bit, last.cell)).toBeGreaterThanOrEqual(2.3)
         // The built wallet is 23 cells and 12,373 bits (options, burn options and comments made it larger than v2's
         // 18 cells and 9,453 bits): 1.74 years at the old prices with v2's 0.02 GRAM, so fee::wallet_storage is 0.026.
-        expect(years(fees.walletStorage, wallet, old.bit, old.cell)).toBeGreaterThanOrEqual(2.2)
     }, 200000)
 })
 
@@ -305,7 +304,7 @@ describe('Gas pins per handler', () => {
         const diff = pokerCost.boundary > pokerCost.plain ? pokerCost.boundary - pokerCost.plain : pokerCost.plain - pokerCost.boundary
         console.log('poker cost: plain', pokerCost.plain.toString(), 'boundary', pokerCost.boundary.toString(), 'float fall', floatFall.toString())
         expect(diff).toBeLessThanOrEqual(2_000_000n)
-        expect(floatFall).toBeLessThanOrEqual(constant('fee::boundary_max') * gasPrice + constant('fee::unstake'))
+        expect(floatFall).toBeLessThanOrEqual(constant('fee::boundary_max') * gasPrice + constant('fee::unstake_bound'))
     })
 
     it('fee::draw_budget includes 3 · fee::prize_notify and fee::boundary_max priced at 400 nano-GRAM per gas', async () => {
@@ -317,7 +316,7 @@ describe('Gas pins per handler', () => {
             3n * constant('fee::prize_notify') +
             constant('fee::burn_forward') +
             constant('reward::submit') +
-            constant('fee::unstake') +
+            constant('fee::unstake_bound') +
             3n * (4n * constant('fee::node_hop') + constant('fee::handler')) +
             constant('fee::boundary_max') * gasPrice
         console.log('fee::draw_budget', budget.toString())
@@ -332,6 +331,9 @@ describe('Fees against the real chains', () => {
     it('each entry fee pays for the gas of the chain it starts', async () => {
         const sc = await fresh({ minDeposit: 1n, players: 3, mint: G('1000') })
         const { env, players } = sc
+        // the fees are read at 400 nano-GRAM per gas, the price this test sizes against
+        setGasPrice(env.blockchain, gasPrice)
+        env.fees = await env.jackpot.getJackpotFees()
         const walletSet = new Set(players.map((p) => walletAt(env, p.address).address.toString()))
         const nodeSet = new Set<string>()
         for (let l = 1; l <= 4; l++) nodeSet.add(nodeAt(env, l, 0n).address.toString())

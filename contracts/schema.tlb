@@ -102,7 +102,7 @@ poke#5444df0f query_id:uint64 = InternalMsgBody;
 _ tag:(## 4) { tag = 3 } time:uint32 poker:MsgAddress = PokeContext;
 
 // Deposit. The player sends hGRAM to the Jackpot (Hipo's send_tokens, recipient = the Jackpot) with
-// forward_ton_amount >= the deposit fee (get_jackpot_fees), plus fwd and fee::payload when the options ask for
+// forward_ton_amount >= the deposit fee (get_jackpot_fees), plus fwd and the payload's fee when the options ask for
 // them, and optionally this forward payload, inline or in a ref. Without options the price limit is 1%: the
 // deposit is refused if c < v - v / 100. beneficiary and response_destination: addr_none means the depositor;
 // otherwise a basechain address other than the Jackpot. forward_ton_amount and forward_payload ride on the
@@ -128,10 +128,11 @@ deposit_ready#c8682b07 query_id:uint64 busy:Bool has_position:Bool b:has_positio
     context:^DepositContext = InternalMsgBody;
 // Jackpot -> wallet: the booking. balance += c, pending -= 1, the position is b; the wallet then sends the
 // transfer_notification of the beneficiary (when forward_ton_amount > 0) and the gas_excess of the response
-// destination. reply = depositor, response_destination, forward_ton_amount, forward_payload.
+// destination. reply = depositor, response_destination, forward_ton_amount, forward_payload, owner. The owner comes
+// last, where the wallet does not read: a bounce of this message is an undo only when it comes from the owner's wallet.
 deposit_booked#42e3c02d query_id:uint64 c:Coins b:uint32
     reply:^[ depositor:MsgAddress response_destination:MsgAddress forward_ton_amount:Coins
-    forward_payload:(Maybe ^Cell) ] = InternalMsgBody;
+    forward_payload:(Maybe ^Cell) owner:MsgAddress ] = InternalMsgBody;
 // Jackpot -> wallet: the deposit ended without a booking (refused, or the deposit_ready had nothing to book)
 deposit_cancelled#a3d4c7cf query_id:uint64 = InternalMsgBody;
 // Jackpot -> wallet: after a full withdrawal; deletes the wallet if balance = 0 and pending = 0
@@ -139,7 +140,7 @@ close_wallet#0cba59a9 query_id:uint64 = InternalMsgBody;
 
 // Withdrawal is a TEP-74 burn, sent to the wallet by its owner. amount = 0 withdraws the whole balance (and
 // needs a balance above 0); a partial amount is at least 1 GRAM of principal. value >= the withdraw fee (plus
-// forward_ton_amount in the options, plus fee::payload with a payload); the rest is returned. The tokens come
+// forward_ton_amount in the options, plus the payload's fee); the rest is returned. The tokens come
 // back by the Jackpot's send_tokens, at the stored rate; a withdrawal is paid even while halted, retired or the
 // rate has fallen, at w = min(x * TT / TC, F * x / P).
 // to_successor: the Jackpot sends the tokens to the successor, as a deposit for the owner, when one is set.
@@ -239,9 +240,11 @@ retire#f6e41c95 query_id:uint64 = InternalMsgBody;
 // of its tokens: a to_successor withdrawal moves only when its value covers it.
 set_successor#efd50f41 query_id:uint64 successor:MsgAddress successor_deposit_fee:Coins = InternalMsgBody;
 // only after retire, at most 100 owners; owners = address hashes, 3 to a cell, chained by the last ref.
-// The governor pays: n * the comment-withdraw fee (plus the successor fee with to_successor) + one handler;
-// each owner's wallet gets a burn of everything it holds.
-withdraw_for#2742c19b query_id:uint64 to_successor:Bool owners:^Cell = InternalMsgBody;
+// The governor pays n * value_per_owner + gas(gas_consumed() + 10,000); value_per_owner must be at least the `w` value
+// (get_fee_parts), plus the successor fee with to_successor, and is what each owner's burn carries. A wallet in storage
+// debt above about 0.07 GRAM needs a larger one, else its GRAM goes to the owner and nothing is burned. Each owner's
+// wallet gets a burn of everything it holds.
+withdraw_for#2742c19b query_id:uint64 to_successor:Bool owners:^Cell value_per_owner:Coins = InternalMsgBody;
 // anyone, with fee::sweep + close_cost(next_position), when retired, no principal, no incoming tokens, no unstaking
 // tokens and no draw resolving: a waiting draw ends, the hGRAM goes to the burner, and the tree closes from the top on
 // the sender's value (the float changes by 0 for the close). With next_position = 0 no close_node is sent.

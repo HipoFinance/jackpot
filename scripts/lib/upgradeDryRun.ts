@@ -1,6 +1,6 @@
 import { Blockchain, createShardAccount, SandboxContract, SendMessageResult } from '@ton/sandbox'
-import { Address, Cell, toNano } from '@ton/core'
-import { DrawState, Jackpot, JackpotError } from '../../wrappers/Jackpot'
+import { Address, beginCell, Cell, toNano } from '@ton/core'
+import { DrawState, Jackpot, JackpotError, JackpotOp, withdrawOptions } from '../../wrappers/Jackpot'
 
 // A sandbox dry run of an upgrade, on a copy of the live account (code, data, balance): the real upgrade
 // message from the governor, the new code's getters, and an upgrade back. The treasury and Hipo's wallets are
@@ -145,13 +145,74 @@ export async function dryRunUpgrade(live: LiveAccount, newCode: Cell, expectedVe
 
     // A poke with too little value must be refused by the new code with insufficient_fee (101): that shows its
     // dispatch and handler run, without a message to the treasury, which the sandbox does not have.
-    const poke = await jackpot.sendPoke(governor, { value: toNano('0.01') })
+    // half the poke fee, read from the new build, so a price change cannot make the probe pass the fee
+    let pokeProbe = toNano('0.01') // kept only when the new build's getter cannot be read: the check below then fails anyway
+    try {
+        pokeProbe = (await jackpot.getJackpotFees()).poke / 2n
+    } catch {
+        // the getter check above reports it
+    }
+    const poke = await jackpot.sendPoke(governor, { value: pokeProbe })
     const r = outcome(poke, live.address)
     add(
         'a poke reaches the new code (refused with insufficient_fee 101)',
         r.exitCode === JackpotError.insufficientFee,
         `exit code ${String(r.exitCode)}`,
     )
+
+    // The rule for every Jackpot: burn_notification reaches its fee check within this much gas, so that the wallet's
+    // frozen minimum always pays for the refusal. A burn with half the burn fee from the wallet of the governor must be refused
+    // with insufficient_fee, within the bound.
+    const gasBeforeFeeCheck = 30000n
+    // an 8-cell payload, the most a burn may carry: reading its size is part of the check's gas
+    let payload = beginCell().storeBuffer(Buffer.alloc(127, 1)).storeUint(0x7f, 7).endCell()
+    for (let i = 2; i <= 8; i++) {
+        payload = beginCell().storeBuffer(Buffer.alloc(127, i)).storeUint(0x7f, 7).storeRef(payload).endCell()
+    }
+    const options = withdrawOptions({ forwardPayload: payload })
+    const notification = beginCell()
+        .storeUint(JackpotOp.burnNotification, 32)
+        .storeUint(0, 64)
+        .storeCoins(toNano('1'))
+        .storeAddress(addresses.governor)
+        .storeAddress(addresses.governor)
+        .storeBit(false)
+        .storeUint(0, 32)
+        .storeMaybeRef(options)
+        .endCell()
+    try {
+        // half the burn fee, read from the new build: enough gas to run, short of the fee, whatever the prices are
+        const probe = (await jackpot.getJackpotFees()).withdraw / 2n
+        const burnResult = await blockchain.sendMessage({
+            info: {
+                type: 'internal',
+                src: await jackpot.getWalletAddress(addresses.governor),
+                dest: live.address,
+                value: { coins: probe },
+                bounce: true,
+                bounced: false,
+                ihrDisabled: true,
+                ihrFee: 0n,
+                forwardFee: 0n,
+                createdLt: 0n,
+                createdAt: 0,
+            },
+            body: notification,
+        })
+        const burnTx = jackpotTransaction(burnResult, live.address)
+        const burnGas =
+            burnTx?.description.type === 'generic' && burnTx.description.computePhase.type === 'vm'
+                ? burnTx.description.computePhase.gasUsed
+                : undefined
+        const burnExit = outcome(burnResult, live.address).exitCode
+        add(
+            `a short burn_notification is refused within ${String(gasBeforeFeeCheck)} gas`,
+            burnGas != null && burnGas <= gasBeforeFeeCheck && burnExit === JackpotError.insufficientFee,
+            `gas ${String(burnGas)}, exit code ${String(burnExit)}`,
+        )
+    } catch (e) {
+        add('a short burn_notification is refused within the gas bound', false, e instanceof Error ? e.message : String(e))
+    }
 
     if (versionBefore !== expectedVersion) {
         // The layout changed, so the old code cannot read it: roll forward instead. A second upgrade_code to

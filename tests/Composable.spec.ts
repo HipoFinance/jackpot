@@ -362,6 +362,7 @@ describe('Composable: fees count forwarding', () => {
         const [alice, bob] = players
         await put(env, alice, G('100')) // position 0 exists, so a new wallet opens no node
         setGasPrice(env.blockchain, 400n)
+        env.fees = await env.jackpot.getJackpotFees() // the fees follow the price
         const inner = G('0.02')
         const payload = heavy()
         const before = await balanceOf(env, env.jackpot.address)
@@ -449,13 +450,14 @@ describe('Composable: withdrawals', () => {
         expect(await jgramOf(env, alice.address)).toBe(G('190'))
     }, 300000)
 
-    it('Withdrawal by burn: a payout short of value for its forward fields goes without them', async () => {
+    it('Withdrawal by burn: a burn short of value for its forward fields is refused, and the wallet restores the balance', async () => {
         const sc = await fresh({ minDeposit: 1n, players: 1, mint: G('1000') })
         const { env, players } = sc
         const [alice] = players
         await put(env, alice, G('100'))
         const w = walletAt(env, alice.address)
         const fwd = G('0.3')
+        const j0 = await jgramOf(env, alice.address)
         const [note] = await holdUntil(
             env,
             messageFrom(
@@ -472,15 +474,21 @@ describe('Composable: withdrawals', () => {
             ),
             toAddr(w.address),
         )
-        // delivered with the value of a bare withdrawal: enough for the tree and the payout, not for the forward fields
+        // delivered with the value of a bare withdrawal: the Jackpot's fee check counts the forward fields, so it refuses
+        // before any state changes, and the bounce makes the wallet restore the balance
         const poor = {
             ...note,
             info: { ...(note.info as object), value: { coins: env.fees.withdraw } } as typeof note.info,
         }
         const h0 = await hgramOf(env, alice.address)
         const r = await env.blockchain.sendMessage(poor)
-        expectChainSucceeded(r)
-        expect(await hgramOf(env, alice.address)).toBe(h0 + G('20'))
+        expect(r.transactions).toHaveTransaction({
+            to: env.jackpot.address,
+            success: false,
+            exitCode: JackpotError.insufficientFee,
+        })
+        expect(await hgramOf(env, alice.address)).toBe(h0)
+        expect(await jgramOf(env, alice.address)).toBe(j0)
         expect(notificationsTo(r, alice.address)).toHaveLength(0)
     }, 200000)
 })

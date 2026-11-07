@@ -1,0 +1,178 @@
+;; Every user-side fee, priced at the chain's current prices (spec 2026-11-06-jackpot-fees.md). The Jackpot and the
+;; wallet read them from the chain: GETGASFEE, GETFORWARDFEE, GETFORWARDFEESIMPLE, GETSTORAGEFEE. Each fee adds the
+;; headroom H on value a later transaction spends, so that it survives a price rise before that transaction runs.
+;; The float-side constants (fee::search, fee::draw_budget, fee::foreign_return, fee::burn_forward) stay in constants.fc.
+
+#include "utils.fc";
+
+int get_forward_fee_simple(int cells, int bits, int is_mc) asm "GETFORWARDFEESIMPLE";
+int get_storage_fee(int cells, int bits, int seconds, int is_mc) asm "GETSTORAGEFEE";
+int due_payment() asm "DUEPAYMENT";
+
+;; Gas bounds, each at least 1.5 times the gas measured on the built code (tests/Gas.spec.ts pins them).
+const int bound::jackpot = 60000; ;; G_J: a Jackpot handler
+const int bound::wallet = 18000; ;; G_W: a wallet handler
+const int bound::node = 110000; ;; G_N: a node hop; the worst case, a fold of all 64 children with an owner, measures 73,226
+const int bound::pre = 30000; ;; G_pre: the Jackpot's gas up to its fee check in burn_notification, a rule for every future Jackpot
+const int bound::submit = 150000; ;; G_S
+const int bound::poke = 22000; ;; the poke handler, measured 14,070
+const int bound::quote = 40000; ;; the treasury's quote and the reply, measured 5,803 and 16,051
+const int bound::tep89 = 28000; ;; measured 18,126 with include_address
+
+;; The built jGRAM wallet's size: pinned by tests/Gas.spec.ts. The wallet's StateInit goes in every prepare_deposit.
+const int wallet::cells = 28;
+const int wallet::bits = 13153;
+
+;; The top node's StateInit, sent with the first position's update: the node's code and data (42 cells), the init cell
+;; and the update's body (545 bits), pinned by tests/Fees.spec.ts. Its forwarding is paid by the float, not by the booking.
+const int node::cells = 43;
+const int node::bits = 22721;
+
+const int fee::headroom = 2; ;; H
+
+int gas_fee(int g) inline {
+    return get_gas_fee(g, 0);
+}
+
+int fwd(int cells, int bits) inline {
+    return get_forward_fee(cells, bits, 0);
+}
+
+int fwd_simple(int cells, int bits) inline {
+    return get_forward_fee_simple(cells, bits, 0);
+}
+
+int five_years() inline {
+    return 157680000;
+}
+
+;; What a jGRAM wallet keeps against storage: 5 years at the current price.
+int wallet_storage() inline {
+    return get_storage_fee(wallet::cells, wallet::bits, five_years(), 0);
+}
+
+;; Message sizes outside the root cell: upper bounds.
+int fwd_prepare() inline { return fwd(wallet::cells + 2, wallet::bits + 1241); }
+int fwd_ready() inline { return fwd(2, 1241); }
+int fwd_log() inline { return fwd(1, 1023); }
+int fwd_booked() inline { return fwd(1, 1023); } ;; the reply (with the owner) measures 806 bits, plus 8 per byte of the forward amount
+int fwd_burn_note() inline { return fwd(2, 1023); }
+int fwd_zero() inline { return fwd(0, 0); }
+int fwd_node() inline { return fwd(1, 545); } ;; an update with an owner
+int fwd_node_deploy() inline { return fwd(node::cells, node::bits); } ;; the first position's update, with the top node's StateInit
+
+;; One node hop, and a tree update at the current price.
+int hop() inline { return gas_fee(bound::node) + fwd_node(); }
+int update_min() inline { return 4 * hop(); }
+int update_value() inline { return fee::headroom * update_min(); }
+
+;; deposit_cancelled, close_wallet: headroom 3, since a release lost leaves a wallet "opening" for good.
+int release() inline { return 3 * (gas_fee(bound::wallet) + fwd_zero()); }
+
+;; Hipo's send_tokens_fee and unstake_tokens_fee, as Hipo computes them.
+int hipo_send() inline {
+    return get_storage_fee(2, 658, five_years(), 0) + gas_fee(22369) + fwd_simple(2, 543);
+}
+
+int hipo_unstake() inline_ref {
+    int gas = 9040 + 6538 + 15798 + 7757 + 5960 + 6558 + 12316 + 17738 + 7757 + 5960 + 6558 + 12316 + 17738 + 7307 + 7179;
+    int s = fwd(0, 0);
+    int m = fwd(1, 1023);
+    int l = fwd(4, 2046);
+    return gas_fee(gas) + 8 * m + 4 * l + 3 * s;
+}
+
+;; A payout with a cap-size payload, a move's deposit_options or a refund's deposit_refused.
+int payout_fee() inline_ref {
+    return 2 * hipo_send() + 3 * (fwd(10, 9700) - fwd(2, 1023));
+}
+
+;; The forwarding of a payload over the hops it rides: 8 times its size. Cap 8 cells.
+int payload_fee_of(int cells, int bits) inline {
+    return cells > 0 ? 8 * fwd_simple(cells, bits) : 0;
+}
+
+int payload_fee_cap() inline {
+    return payload_fee_of(8, 8184);
+}
+
+;; What deposit_ready must keep for the update's forwarding, the log, deposit_booked and its handler.
+int booked_min(int payload_cells, int payload_bits) inline_ref {
+    return fee::node_share + fwd_node() + fwd_log() + fwd_booked() + fee::headroom * gas_fee(bound::wallet)
+        + (payload_cells > 0 ? 2 * fwd_simple(payload_cells, payload_bits) : 0);
+}
+
+;; The deposit, checked at transfer_notification against its incoming value.
+int deposit_fee(int inner_forward, int payload_cells, int payload_bits) inline_ref {
+    int h = fee::headroom;
+    int a = gas_fee(bound::jackpot) + fwd_prepare()
+        + h * (gas_fee(2 * bound::wallet + bound::jackpot) + fwd_ready() + fwd_log() + fwd_booked() + 3 * fwd_zero())
+        + update_value() + fee::node_share + wallet_storage();
+    int b = gas_fee(bound::jackpot) + fwd_prepare()
+        + h * (gas_fee(bound::wallet + bound::jackpot) + fwd_ready() + fwd_log())
+        + release() + payout_fee();
+    return max(a, b) + inner_forward + payload_fee_of(payload_cells, payload_bits);
+}
+
+;; What the owner attaches to a burn.
+int burn_fee(int forward_amount, int payload_cells, int payload_bits) inline_ref {
+    ;; the wallet's leg carries the payload: its first hop is spent before the Jackpot's check
+    return gas_fee(bound::wallet) + fwd(2 + payload_cells, 1023 + payload_bits)
+        + fee::headroom * (gas_fee(bound::jackpot) + fwd_log() + fwd_zero())
+        + update_value() + release() + payout_fee()
+        + forward_amount + payload_fee_of(payload_cells, payload_bits);
+}
+
+;; What a burn must bring to the Jackpot: the burn fee less the wallet's own leg.
+int burn_arrives(int forward_amount, int payload_cells, int payload_bits) inline {
+    return burn_fee(forward_amount, payload_cells, payload_bits) - gas_fee(bound::wallet)
+        - fwd(2 + payload_cells, 1023 + payload_bits);
+}
+
+;; What the wallet checks on an owner's burn (formula frozen in its fixed code): enough to reach the Jackpot's fee
+;; check, throw, and bounce the burn back to a wallet that can still run on_bounce. Includes the storage debt.
+int wallet_minimum_no_debt(int payload_cells, int payload_bits) inline_ref {
+    return gas_fee(bound::wallet) + fwd(2 + payload_cells, 1023 + payload_bits)
+        + 3 * (gas_fee(bound::pre) + fwd(3, 1176) + gas_fee(bound::wallet) + fwd_zero());
+}
+
+;; The same with the wallet's storage debt: for the checks inside a transaction. A getter runs without a storage phase.
+int wallet_minimum(int payload_cells, int payload_bits) inline_ref {
+    return wallet_minimum_no_debt(payload_cells, payload_bits) + due_payment();
+}
+
+;; The comment a burn from the Jackpot carries ("Hipo Jackpot: moved" is the longest): one cell, under 256 bits.
+const int jackpot_comment::cells = 1;
+const int jackpot_comment::bits = 256;
+
+;; The value the Jackpot sends a wallet in a `w` or one owner of withdraw_for, and the `w` fee.
+int w_value() inline_ref {
+    ;; the burn the Jackpot sends carries a comment: its size is in jackpot_comment::*
+    return fwd_prepare() + fee::headroom * (gas_fee(bound::wallet) + fwd(2 + jackpot_comment::cells, 1023 + jackpot_comment::bits))
+        + burn_arrives(1, jackpot_comment::cells, jackpot_comment::bits);
+}
+
+int w_fee() inline_ref {
+    return gas_fee(bound::jackpot) + w_value();
+}
+
+int poke_fee() inline_ref {
+    return gas_fee(bound::poke) + fwd(1, 1023) + fee::headroom * (gas_fee(bound::quote) + 2 * fwd(1, 1023));
+}
+
+int submit_fee() inline {
+    return gas_fee(bound::submit) + fwd(1, 1023) + 2 * fwd_zero();
+}
+
+;; Hipo's unstake, sent from a refill or a boundary, with headroom.
+int unstake_run() inline_ref {
+    return fee::headroom * hipo_unstake();
+}
+
+int refill_fee() inline_ref {
+    return gas_fee(bound::jackpot) + fwd(1, 1023) + unstake_run();
+}
+
+int tep89_fee() inline {
+    return gas_fee(bound::tep89) + fwd(1, 1023);
+}

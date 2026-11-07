@@ -39,7 +39,7 @@ import {
     walletAt,
     withdraw,
 } from './jackpot/setup'
-import { A0, deliver, fresh, holdUntil, pokeFake, put, setNow, submitDraw, toAddr, toBoundary } from './jackpot/scenario'
+import { A0, deliver, fresh, holdUntil, pokeFake, put, setBalance, setNow, submitDraw, toAddr, toBoundary } from './jackpot/scenario'
 
 const G = (n: string | number) => toNano(String(n))
 const ppm = 1_000_000n
@@ -353,6 +353,8 @@ describe('Gas returned', () => {
         await toBoundary(env, 0n)
         const d = await env.jackpot.getDrawState()
         expect(d.state).toBe(DrawState.waiting)
+        // the draw's float gate (fee::draw_budget) must be met, whatever the refills above left
+        await setBalance(env, env.jackpot.address, env.fees.drawBudget + G('1'))
         const { submitTest } = await import('./jackpot/setup')
         await returned(env, env.keeper, env.fees.submit, (value) => submitTest(env, Number(d.round), value), G('0.02'))
     }, 600000)
@@ -479,7 +481,7 @@ describe('Failures, row by row', () => {
         // a hand-made bounce for the booking: principal and tickets leave, the refund is paid at the stored rate
         const s0 = await jackpotState(env)
         const wallet = walletAt(env, players[0].address).address
-        const reply = beginCell().storeAddress(players[0].address).storeAddress(players[0].address).storeCoins(1n).storeMaybeRef(null).endCell()
+        const reply = beginCell().storeAddress(players[0].address).storeAddress(players[0].address).storeCoins(1n).storeMaybeRef(null).storeAddress(players[0].address).endCell()
         const original = beginCell().storeUint(JackpotOp.depositBooked, 32).storeUint(5, 64).storeCoins(G('10')).storeUint(0, 32).storeRef(reply).endCell()
         const h = await hgramOf(env, players[0].address)
         expectChainSucceeded(await env.blockchain.sendMessage(bounceOf(wallet, env.jackpot.address, G('0.4'), original)))
@@ -520,7 +522,7 @@ describe('Failures, row by row', () => {
         const h = await hgramOf(env, bob.address)
         const held0 = (await jackpotState(env)).heldTokens
         // the bounce comes back with too little value to pay the refund
-        const r = await env.blockchain.sendMessage(bounceOf(wallet, env.jackpot.address, G('0.01'), prepare.body))
+        const r = await env.blockchain.sendMessage(bounceOf(wallet, env.jackpot.address, G('0.004'), prepare.body))
         const [log] = logsOf<UntrackedLog>(r.externals, LogTopic.untracked)
         expect(log.tokens).toBe(G('40'))
         const s = await jackpotState(env)

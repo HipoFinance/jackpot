@@ -130,7 +130,7 @@ jGRAM: Alice 100,000, Bob 50,000
 
 ### 5. Carol deposits for Dave, with options
 
-Carol deposits 30,000 hGRAM **for Dave**, with `deposit_options` in the transfer's payload: Dave as beneficiary, a `min_principal` of 29,859.254 (she accepts a price of up to 0.5%), and a forward amount of 0.01 GRAM with the comment "A gift from Carol". Her app attaches the deposit fee plus that 0.01 and `fee::payload`.
+Carol deposits 30,000 hGRAM **for Dave**, with `deposit_options` in the transfer's payload: Dave as beneficiary, a `min_principal` of 29,859.254 (she accepts a price of up to 0.5%), and a forward amount of 0.01 GRAM with the comment "A gift from Carol". Her app attaches the deposit fee plus that 0.01 and the payload's fee.
 
 The context in `prepare_deposit` (5) names Dave as owner, so it goes to Dave's jGRAM wallet and deploys it. At the stored rate her hGRAM is worth 30,009.3 GRAM, and the pot is not 0, so she pays the entry price: she books **30,000 GRAM** and 9.3 GRAM goes into the pot. That price is her share of the pot she is joining, so on average Dave wins it back.
 
@@ -291,7 +291,7 @@ Anyone may send `refill` then; here Frank does (1). It asks for no quote: it uns
 
 | held_tokens | reserved_tokens | free_tokens | pot, at the stored rate | principal | float, GRAM | stored rate | draw | tag |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **59,959.1** | 0 | **59,959.1** | **14.87** | 60,000 | **7.32** | **1.000930** | none | 1 |
+| **59,959.1** | 0 | **59,959.1** | **14.87** | 60,000 | **7.24** | **1.000930** | none | 1 |
 
 jGRAM: Bob 30,000, Dave 30,000
 
@@ -311,7 +311,7 @@ The value covers `fee::foreign_return`, so it sends the 25 XYZ straight back wit
 
 | held_tokens | reserved_tokens | free_tokens | pot, at the stored rate | principal | float, GRAM | stored rate | draw | tag |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 59,959.1 | 0 | 59,959.1 | 14.87 | 60,000 | 7.32 | 1.000930 | none | 1 |
+| 59,959.1 | 0 | 59,959.1 | 14.87 | 60,000 | 7.24 | 1.000930 | none | 1 |
 
 jGRAM: Bob 30,000, Dave 30,000
 
@@ -322,7 +322,7 @@ jGRAM: Bob 30,000, Dave 30,000
 
 ### 13. The governor retires the Jackpot and names a successor
 
-The governor sends `retire` (1). From now on deposits are refused with reason `retired`, and nothing can clear it. Withdrawals, `w`, boundaries and draws keep working. Then it names a successor (2), a new Jackpot deployed in the same sandbox, with the GRAM each move must send it for its deposit fee: 0.6017 GRAM.
+The governor sends `retire` (1). From now on deposits are refused with reason `retired`, and nothing can clear it. Withdrawals, `w`, boundaries and draws keep working. Then it names a successor (2), a new Jackpot deployed in the same sandbox, with the GRAM each move must send it for its deposit fee: 0.1654 GRAM.
 
 Each is one message with a log and no reply. In a real end the governor would now wait for the next boundary and its draw, which pays the last pot to the players. This story goes straight on.
 
@@ -333,7 +333,7 @@ Each is one message with a log and no reply. In a real end the governor would no
 
 | held_tokens | reserved_tokens | free_tokens | pot, at the stored rate | principal | float, GRAM | stored rate | draw | tag |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 59,959.1 | 0 | 59,959.1 | 14.87 | 60,000 | **7.41** | 1.000930 | none | 1 |
+| 59,959.1 | 0 | 59,959.1 | 14.87 | 60,000 | **7.34** | 1.000930 | none | 1 |
 
 jGRAM: Bob 30,000, Dave 30,000, **retired**
 
@@ -353,7 +353,7 @@ From there it is Alice's `w` again: Bob's 30,000 GRAM of principal is paid to Bo
 
 | held_tokens | reserved_tokens | free_tokens | pot, at the stored rate | principal | float, GRAM | stored rate | draw | tag |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **29,986.98** | 0 | **29,986.98** | 14.87 | **30,000** | 7.41 | 1.000930 | none | 1 |
+| **29,986.98** | 0 | **29,986.98** | 14.87 | **30,000** | 7.34 | 1.000930 | none | 1 |
 
 jGRAM: **Bob 0**, Dave 30,000
 
@@ -382,7 +382,7 @@ In the second graph the successor runs an ordinary first deposit: it deploys Dav
 
 | held_tokens | reserved_tokens | free_tokens | pot, at the stored rate | principal | float, GRAM | stored rate | draw | tag |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **14.87** | 0 | **14.87** | 14.87 | **0** | 7.41 | 1.000930 | none | 1 |
+| **14.87** | 0 | **14.87** | 14.87 | **0** | 7.34 | 1.000930 | none | 1 |
 
 jGRAM: **Dave 0**, **Dave 30,000 in the new Jackpot**
 
@@ -393,7 +393,7 @@ jGRAM: **Dave 0**, **Dave 30,000 in the new Jackpot**
 
 Nobody is owed anything now: `principal` is 0. Anyone may send `sweep`; the governor does, bringing `fee::sweep` plus the cost of closing the tree (1). What the Jackpot still holds, 14.866 hGRAM, goes to the burner (2, 5, 8). That is the yield since the last boundary, from the third reward, plus rounding: it is here only because this story did not wait for a last draw.
 
-Then `close_node` goes to the top node (3). Each node checks that every sum under it is 0, forwards `close_node` to each child that exists, and deletes itself, sending its whole balance, storage reserve included, back to the Jackpot. The float rose from 7.41 to 8.19 GRAM. All four nodes are gone, and the Jackpot is at its end.
+Then `close_node` goes to the top node (3). Each node checks that every sum under it is 0, forwards `close_node` to each child that exists, and deletes itself, sending its whole balance, storage reserve included, back to the Jackpot. The float rose from 7.34 to 8.12 GRAM. All four nodes are gone, and the Jackpot is at its end.
 
 **The rest goes to the burner**
 
@@ -411,7 +411,7 @@ Then `close_node` goes to the top node (3). Each node checks that every sum unde
 
 | held_tokens | reserved_tokens | free_tokens | pot, at the stored rate | principal | float, GRAM | stored rate | draw | tag |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **0** | 0 | **0** | **0** | 0 | **8.19** | 1.000930 | none | 1 |
+| **0** | 0 | **0** | **0** | 0 | **8.12** | 1.000930 | none | 1 |
 
 jGRAM: Dave 30,000 in the new Jackpot, **tree nodes left: 0**
 

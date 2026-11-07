@@ -11,6 +11,7 @@
 ;; When the balance and `pending` are both 0 the Jackpot closes the wallet and its GRAM returns to the owner.
 
 #include "imports/utils.fc";
+#include "imports/fees.fc";
 
 global slice jackpot;
 global slice owner;
@@ -107,7 +108,7 @@ int opening?() inline {
     position = b;
 
     ;; the reserve is topped up to its target first, then the notification and the rest of the value
-    raw_reserve(fee::wallet_storage, reserve::at_most);
+    raw_reserve(wallet_storage(), reserve::at_most);
     slice depositor = reply~load_msg_addr();
     slice response = reply~load_msg_addr();
     int fwd = reply~load_coins();
@@ -172,12 +173,14 @@ int opening?() inline {
     int incoming = get_incoming_value().pair_first();
 
     if from_jackpot? {
-        if balance == 0 {
-            ;; nothing to take: the value goes to the owner, and a wallet with nothing pending goes away
-            if pending == 0 {
+        ;; nothing to take, or too little value to reach the Jackpot's fee check and bounce (the wallet's minimum, with
+        ;; its storage debt): the value goes to the owner, nothing is burned, and a wallet with nothing pending goes
+        ;; away. This branch never throws.
+        if (balance == 0) | (incoming < wallet_minimum(jackpot_comment::cells, jackpot_comment::bits)) {
+            if (pending == 0) & (balance == 0) {
                 close_self();
             } else {
-                raw_reserve(fee::wallet_storage, reserve::at_most);
+                raw_reserve(wallet_storage(), reserve::at_most);
                 builder excess = begin_cell().store_uint(op::gas_excess, 32).store_uint(query_id, 64);
                 send_msg(false, owner.to_builder(), null(), excess, 0, send::unreserved_balance + send::ignore_errors);
             }
@@ -187,20 +190,22 @@ int opening?() inline {
     } else {
         throw_unless(err::not_set_up, set_up?);
         throw_unless(err::access_denied, equal_slice_bits(src, owner));
-        int needed = fee::withdraw;
+        int pcells = 0;
+        int pbits = 0;
         if ~ options.null?() {
             slice os = options.begin_parse();
             throw_unless(err::invalid_parameters, os~load_uint(32) == op::withdraw_options);
             os~load_int(1);
-            needed += os~load_coins();
+            os~load_coins();
             cell payload = os~load_maybe_ref();
             os.end_parse();
             ifnot payload.null?() {
-                needed += fee::payload;
                 throw_unless(err::invalid_parameters, payload_fits?(payload));
+                ( pcells, pbits ) = payload_size(payload, max_payload_cells);
             }
         }
-        throw_unless(err::insufficient_fee, incoming >= needed);
+        ;; enough for the Jackpot to reach its own fee check, throw, and bounce the burn back (formula in imports/fees.fc)
+        throw_unless(err::insufficient_fee, incoming >= wallet_minimum(pcells, pbits) + payload_fee_of(pcells, pbits));
         throw_unless(err::invalid_parameters, response.addr_none?() | base_addr?(response));
         ifnot x {
             x = balance;
@@ -259,7 +264,7 @@ int opening?() inline {
         if last? {
             pending = max(pending - 1, 0);
         }
-        raw_reserve(fee::wallet_storage, reserve::at_most);
+        raw_reserve(wallet_storage(), reserve::at_most);
         builder excess = begin_cell().store_uint(op::gas_excess, 32).store_uint(query_id, 64);
         send_msg(false, owner.to_builder(), null(), excess, 0, send::unreserved_balance + send::ignore_errors);
         return ();
@@ -336,4 +341,11 @@ var get_wallet_data() method_id {
 var get_wallet_state() method_id {
     load_data();
     return ( jackpot, owner, set_up?, balance, has_position?, position, pending );
+}
+
+;; What the wallet requires of an owner's burn with no payload, at the current price, with NO storage debt: a getter
+;; runs without a storage phase. In a transaction the wallet also counts its debt (DUEPAYMENT), so a wallet in debt
+;; needs this plus the debt.
+int get_wallet_minimum_internal() method_id {
+    return wallet_minimum_no_debt(0, 0);
 }

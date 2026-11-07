@@ -94,6 +94,13 @@ export class Wallet implements Contract {
         }
     }
 
+    // what the wallet requires of an owner's burn with no payload, at the current price, with NO storage debt (a getter
+    // runs without a storage phase); in a transaction the wallet also counts its debt, so see burnAttach
+    async getWalletMinimumInternal(provider: ContractProvider): Promise<bigint> {
+        const { stack } = await provider.get('get_wallet_minimum_internal', [])
+        return stack.readBigNumber()
+    }
+
     async getWalletState(provider: ContractProvider): Promise<WalletState> {
         const { stack } = await provider.get('get_wallet_state', [])
         return {

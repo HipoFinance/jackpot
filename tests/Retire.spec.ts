@@ -14,9 +14,7 @@ import {
     SuccessorLog,
     SweptLog,
     WithdrawalLog,
-    handlerFee,
     logsOf,
-    withdrawForGas,
     withdrawOptions,
 } from '../wrappers/Jackpot'
 import { Node } from '../wrappers/Node'
@@ -41,6 +39,7 @@ import {
     walletAt,
     withdraw,
 } from './jackpot/setup'
+import { gasFee } from './jackpot/prices'
 import { A0, deliver, fresh, holdUntil, put, setBalance, setNextPosition, setUnstaking, startDeposit, submitDraw, toAddr, toBoundary } from './jackpot/scenario'
 
 const G = (n: string | number) => toNano(String(n))
@@ -587,7 +586,7 @@ describe('Migration: R1, the threshold of a move', () => {
         await retire(env)
         const h0 = await hgramOf(env, alice.address)
         const r = await env.jackpot.sendWithdrawFor(env.governor.getSender(), {
-            value: (env.fees.commentWithdraw + withdrawForGas) * 2n + handlerFee,
+            value: ((await env.jackpot.getFeeParts()).wValue + G('0.05')) * 2n + gasFee(env.blockchain, 60000n),
             toSuccessor: true,
             owners: [alice.address],
         })
@@ -607,15 +606,44 @@ describe('Migration: R1, the threshold of a move', () => {
 })
 
 describe('withdraw_for: the Jackpot’s own gas', () => {
-    it('F3: withdraw_for needs (per + fee::withdraw_for_gas) · n + fee::handler: one nano-GRAM less is refused, the exact value runs, and the float does not fall', async () => {
+    it('F3: withdraw_for needs n · per + gas(gas_consumed() + 10,000): below n · per + gas(10,000) is refused, the exact value runs, and the float does not fall', async () => {
         const sc = await fresh({ minDeposit: 1n, players: 3, mint: G('1000') })
         const { env, players } = sc
         for (const p of players) await put(env, p, G('100'))
         await retire(env)
         const owners = players.map((p) => p.address)
-        const need = (env.fees.commentWithdraw + withdrawForGas) * 3n + handlerFee
+        // n · per + gas(gas_consumed() + 10,000): the check runs after the loop that sends the burns, so the gas consumed
+        // there is measured with a generous value first
+        const per = (await env.jackpot.getFeeParts()).wValue
+        const snap = env.blockchain.snapshot()
+        const probe = await env.jackpot.sendWithdrawFor(env.governor.getSender(), { value: per * 3n + G('1'), toSuccessor: false, owners })
+        const consumed = gasOf(probe, env.jackpot.address).find((g) => g.op === JackpotOp.withdrawFor)!.gas
+        await env.blockchain.loadFrom(snap)
+        // bracket the real threshold: lo is refused, hi runs; bisect to the nano-GRAM
+        let hi = per * 3n + gasFee(env.blockchain, consumed + 10000n)
+        let lo = per * 3n + gasFee(env.blockchain, 10000n) - 1n
+        const runs = async (value: bigint) => {
+            await env.blockchain.loadFrom(snap)
+            const r = await env.jackpot.sendWithdrawFor(env.governor.getSender(), { value, toSuccessor: false, owners })
+            const tx = r.transactions.find((t) => t.inMessage?.info.dest?.toString() === env.jackpot.address.toString())
+            const refusedHere = tx?.description.type === 'generic' && tx.description.computePhase.type === 'vm' && tx.description.computePhase.exitCode === JackpotError.insufficientFee
+            return !refusedHere
+        }
+        expect(await runs(lo)).toBe(false)
+        expect(await runs(hi)).toBe(true)
+        while (hi - lo > 1n) {
+            const mid = (lo + hi) / 2n
+            if (await runs(mid)) hi = mid
+            else lo = mid
+        }
+        // hi is the threshold: one nano-GRAM below it is refused, and it passes; it is n · per + gas(g + 10,000) with g the gas consumed at the check
+        expect(hi - per * 3n).toBeGreaterThan(gasFee(env.blockchain, 10000n))
+        expect(hi - per * 3n).toBeLessThanOrEqual(gasFee(env.blockchain, consumed + 10000n))
+        const need = hi
+        await env.blockchain.loadFrom(snap)
         const refused = await env.jackpot.sendWithdrawFor(env.governor.getSender(), { value: need - 1n, toSuccessor: false, owners })
         expect(refused.transactions).toHaveTransaction({ to: env.jackpot.address, success: false, exitCode: JackpotError.insufficientFee })
+        await env.blockchain.loadFrom(snap)
         const before = await balanceOf(env, env.jackpot.address)
         const r = await env.jackpot.sendWithdrawFor(env.governor.getSender(), { value: need, toSuccessor: false, owners })
         expectChainSucceeded(r)
@@ -623,7 +651,7 @@ describe('withdraw_for: the Jackpot’s own gas', () => {
         for (const p of players) expect(await jgramOf(env, p.address)).toBe(0n)
     }, 300000)
 
-    it('F3: 100 owners at the exact value: the float does not fall, and the Jackpot’s gas per owner is within withdraw_for_gas', async () => {
+    it('F3: 100 owners at the exact value: the float does not fall, and the float does not fall at 400 nano-GRAM per gas', async () => {
         const sc = await fresh({ minDeposit: 1n, players: 4, mint: G('1000') })
         const { env, players } = sc
         for (const p of players) await put(env, p, G('100'))
@@ -631,14 +659,69 @@ describe('withdraw_for: the Jackpot’s own gas', () => {
         const owners: Address[] = players.map((p) => p.address)
         for (let i = 0; owners.length < 100; i++) owners.push((await env.blockchain.treasury(`other${i.toString()}`)).address)
         setGasPrice(env.blockchain, 400n)
-        const need = (env.fees.commentWithdraw + withdrawForGas) * 100n + handlerFee
+        env.fees = await env.jackpot.getJackpotFees()
+        const per = (await env.jackpot.getFeeParts()).wValue
+        // the check runs after the owners are parsed; 100 owners need well under 1,000,000 gas at the check
+        const need = per * 100n + gasFee(env.blockchain, 1_100_000n)
         const before = await balanceOf(env, env.jackpot.address)
         const r = await env.jackpot.sendWithdrawFor(env.governor.getSender(), { value: need, toSuccessor: false, owners })
         expectChainSucceeded(r)
         const gas = gasOf(r, env.jackpot.address).find((g) => g.op === JackpotOp.withdrawFor)!.gas
-        expect(gas * 400n).toBeLessThanOrEqual(withdrawForGas * 100n + handlerFee)
+        expect(gas).toBeLessThanOrEqual(1_000_000n)
         expect(await balanceOf(env, env.jackpot.address)).toBeGreaterThanOrEqual(before)
     }, 600000)
+
+    it('a wallet in storage debt above 0.07 GRAM is skipped at the default value per owner (its GRAM goes to the owner) and emptied with a larger one', async () => {
+        const sc = await fresh({ minDeposit: 1n, players: 2, mint: G('1000') })
+        const { env, players } = sc
+        for (const p of players) await put(env, p, G('100'))
+        await retire(env)
+        // both wallets in debt just below the freeze limit
+        for (const p of players) {
+            const address = walletAt(env, p.address).address
+            const acc = (await env.blockchain.getContract(address)).account
+            await env.blockchain.setShardAccount(address, {
+                ...acc,
+                account: {
+                    ...acc.account!,
+                    storage: { ...acc.account!.storage, balance: { coins: G('0.01') } },
+                    storageStats: { ...acc.account!.storageStats, lastPaid: (env.blockchain.now ?? 0) - 1000, duePayment: G('0.09') },
+                },
+            })
+        }
+        const per = (await env.jackpot.getFeeParts()).wValue
+        const snap = env.blockchain.snapshot()
+        // the default: skipped, nothing burned, the GRAM goes to the owner
+        const owner0 = await balanceOf(env, players[0].address)
+        const skipped = await env.jackpot.sendWithdrawFor(env.governor.getSender(), {
+            value: per * 2n + G('0.5'),
+            toSuccessor: false,
+            owners: [players[0].address],
+        })
+        expectChainSucceeded(skipped)
+        expect(await jgramOf(env, players[0].address)).toBe(G('100'))
+        expect(await balanceOf(env, players[0].address)).toBeGreaterThan(owner0)
+        await env.blockchain.loadFrom(snap)
+        // a larger value per owner covers the debt: the balance is burned and the hGRAM paid
+        const h0 = await hgramOf(env, players[1].address)
+        const emptied = await env.jackpot.sendWithdrawFor(env.governor.getSender(), {
+            value: G('0.5'),
+            toSuccessor: false,
+            owners: [players[1].address],
+            valuePerOwner: G('0.2'),
+        })
+        expectChainSucceeded(emptied)
+        expect(await jgramOf(env, players[1].address)).toBe(0n)
+        expect(await hgramOf(env, players[1].address)).toBeGreaterThan(h0)
+        // a value per owner below the formula is refused
+        const low = await env.jackpot.sendWithdrawFor(env.governor.getSender(), {
+            value: G('0.5'),
+            toSuccessor: false,
+            owners: [players[0].address],
+            valuePerOwner: per - 1n,
+        })
+        expect(low.transactions).toHaveTransaction({ to: env.jackpot.address, success: false, exitCode: JackpotError.insufficientFee })
+    }, 300000)
 
     it('a governor move carries the comment "Hipo Jackpot: moved" and an owner’s own move her payload', async () => {
         const sc = await fresh({ minDeposit: 1n, players: 1, mint: G('1000') })
@@ -650,7 +733,7 @@ describe('withdraw_for: the Jackpot’s own gas', () => {
         const fee = next.fees.deposit + next.fees.return + next.fees.payload
         await env.jackpot.sendSetSuccessor(env.governor.getSender(), { value: G('0.05'), successor: next.jackpot.address, depositFee: fee })
         const r = await env.jackpot.sendWithdrawFor(env.governor.getSender(), {
-            value: (env.fees.commentWithdraw + fee + withdrawForGas) * 2n + handlerFee,
+            value: ((await env.jackpot.getFeeParts()).wValue + fee) * 2n + gasFee(env.blockchain, 60000n),
             toSuccessor: true,
             owners: [alice.address],
         })

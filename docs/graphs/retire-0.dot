@@ -5,5 +5,5 @@ digraph {
   "governor" [ label="governor" class="n-person" ]
   "jackpot" [ label="Jackpot" class="n-jackpot" ]
   "governor" -> "jackpot" [ label="1\lop::retire\l" class="e-msg" ]
-  "governor" -> "jackpot" [ label="2\lop::set_successor\lsuccessor: new Jackpot (successor)\ldeposit fee: 0.6017 GRAM\l" class="e-msg" ]
+  "governor" -> "jackpot" [ label="2\lop::set_successor\lsuccessor: new Jackpot (successor)\ldeposit fee: 0.1654 GRAM\l" class="e-msg" ]
 }

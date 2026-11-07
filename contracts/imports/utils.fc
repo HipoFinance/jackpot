@@ -158,6 +158,9 @@ int base_addr?(slice a) inline {
 ;; compiler drops the call, whose result nobody reads, and the cap is never enforced.
 int payload_cells(cell c, int n) impure asm "CDATASIZE" "DROP" "DROP";
 
+;; The cells and bits of a payload, counted with the same bound: it throws when there are more than `n` cells.
+(int, int) payload_size(cell c, int n) impure asm "CDATASIZE" "DROP";
+
 ;; True when the payload has at most max_payload_cells cells. Costs bounded gas.
 int payload_fits?(cell c) inline_ref {
     int fits? = true;

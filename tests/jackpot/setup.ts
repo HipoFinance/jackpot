@@ -24,6 +24,7 @@ import {
 } from '../../wrappers/Jackpot'
 import { Wallet } from '../../wrappers/Wallet'
 import { Node } from '../../wrappers/Node'
+import { setGasPrices } from './prices'
 import { buildWitness, roundAt, roundTime } from '../../wrappers/drand'
 import { compileTestJackpot, mcHashOf, testSignatureCell } from './testbuild'
 
@@ -506,31 +507,8 @@ export async function sweepValue(env: Env): Promise<bigint> {
     return env.fees.sweep + (await env.jackpot.getCloseCost())
 }
 
-// Sets the basechain gas price (config 21) to `nano` nano-GRAM per gas, the worst case the fees are sized at (the
-// sandbox's own is lower). The prices are stored in 1/65536 nano-GRAM.
+// Sets the gas price (configs 20 and 21) to `nano` nano-GRAM per gas, the worst case the fees are sized at (the sandbox's
+// own is lower). The other prices are in ./prices.
 export function setGasPrice(blockchain: Blockchain, nano: bigint) {
-    const config = Dictionary.loadDirect(Dictionary.Keys.BigInt(32), Dictionary.Values.Cell(), blockchain.config)
-    const prices = config.get(21n)
-    if (prices == null) throw new Error('no config 21')
-    const old = prices.beginParse()
-    const flatTag = old.loadUint(8)
-    const flatLimit = old.loadUintBig(64)
-    const flatPrice = old.loadUintBig(64)
-    const extTag = old.loadUint(8)
-    old.loadUintBig(64) // the old gas_price
-    const rest = old.loadBits(old.remainingBits)
-    config.set(
-        21n,
-        beginCell()
-            .storeUint(flatTag, 8)
-            .storeUint(flatLimit, 64)
-            .storeUint(flatPrice, 64)
-            .storeUint(extTag, 8)
-            .storeUint(nano * 65536n, 64)
-            .storeBits(rest)
-            .endCell(),
-    )
-    const storage = beginCell()
-    config.storeDirect(storage)
-    blockchain.setConfig(storage.endCell())
+    setGasPrices(blockchain, nano)
 }

@@ -61,7 +61,7 @@ see Retire and the end.
 
 ## Boundaries
 
-A **poke** is a message from anyone with at least `fee::poke`. The Jackpot sends the treasury a
+A **poke** is a message from anyone with at least the poke fee (`get_jackpot_fees`). The Jackpot sends the treasury a
 `provide_current_quote` whose `custom_payload` is the **poke context** (a tag, the time, the poker), carrying the rest
 of its value (mode 64). The treasury answers `take_current_quote` to the Jackpot with the context unchanged. Nothing is
 stored between the two messages. If the request bounces (the bounce carries the whole body), the rest of the value goes
@@ -103,10 +103,50 @@ can win that pot, and a withdrawal after it cannot take the prizes. Nothing is r
 
 ## Message flows
 
+### Fees
+
+Every fee a user attaches is computed on the chain from the current prices (`contracts/imports/fees.fc`: `GETGASFEE`,
+`GETFORWARDFEE`, `GETFORWARDFEESIMPLE`, `GETSTORAGEFEE`), so a change of the network's prices moves the fees with it.
+Each handler has a gas bound at least 1.5 times what the built code uses (`tests/Gas.spec.ts`, `tests/Fees.spec.ts`),
+and a fee adds a headroom of 2 (3 for `release`, the value that closes a wallet) on the value a later transaction spends.
+The bounds are the Jackpot 60,000 gas (`bound::jackpot`), a wallet 18,000, a node 110,000, a submit 150,000, TEP-89 28,000
+and the poke handler 22,000; the treasury's quote 40,000. `get_jackpot_fees` returns the fees at today's prices and `get_fee_parts` the parts they
+are built from.
+
+- `deposit`: the larger of two chains (a booking, and a refusal that pays a refund), plus the options' forward amount
+  and the payload's forwarding. `burn`: the wallet's leg, the Jackpot's, the update, the release, a payout, and the
+  forward amount and payload. `w`, `poke`, `submit`, `refill` and TEP-89 are priced the same way.
+- **The burn check.** `burn_notification` checks its fee first, within 30,000 gas, before any state changes; a short
+  burn throws, bounces, and the wallet restores the balance. This is a rule for every future Jackpot (the upgrade
+  dry run checks it). The wallet's code is fixed, so its own minimum (`get_wallet_minimum_internal`: its gas, the
+  bounce, three times a refusal's legs; the getter excludes the storage debt, which the wallet adds in a transaction with
+  `DUEPAYMENT`) is frozen with it, and the 30,000 bound is
+  what keeps that minimum enough.
+  **What an app attaches to a burn** (one rule, `burnAttach` in `wrappers/Jackpot.ts`): `max(burn fee, minimum +
+  payload fee + the wallet's debt) + a small margin`. The burn fee is `jackpot.getBurnFee(forward amount, payload cells,
+  payload bits)`, which already counts the forward amount and the payload; the minimum is `get_wallet_minimum_internal`
+  and the payload fee is eight times the payload's forwarding plus one more. The getter shows the minimum with **no**
+  storage debt (a getter runs without a storage phase); in a transaction the wallet also counts its debt. A wallet in
+  debt above about 0.066 GRAM today therefore needs more than the burn fee. Read the debt from the account's storage
+  stats: `max(0, due_payment + storage fee for (now - last_paid) - balance)`.
+- **The first booking.** The forwarding of the top node's StateInit (about 1.87M today) is paid by the float, taken out of
+  the reserve, so a price step cannot leave `deposit_booked` short; the node's size is pinned by a test.
+- **The update.** `deposit_ready` refuses with `low_value` (and refunds) when the value left is below `update_min +
+  booked_min`; the update gets `update_value` when there is room, else what is left after `deposit_booked`'s minimum.
+- **The undo** of a bounced `deposit_booked` raises its own gas limit to `bound::jackpot` once its checks pass (the bounce comes from the owner's own wallet, which
+  the booking carries), and sends its
+  update and cancel with explicit values from the balance; the float is exposed to `update_value + release +
+  gas(bound::jackpot)` at most. Its refund is paid only when the bounce carries more than the update, the release and the
+  payout fee; a bounce of `deposit_booked` does not (it cannot happen for a wallet that just answered), so the tokens
+  leave the count untracked, with an untracked log, and `return_tokens` recovers them.
+- A jGRAM wallet keeps `wallet_storage`: five years at the current price.
+- The float side is sized at 400 nano-GRAM per gas (`fee::draw_budget`, `fee::unstake_bound` 0.2 GRAM for Hipo's
+  unstake), since a draw must never find the float short.
+
 ### Deposit
 
-The player transfers hGRAM to the Jackpot with `forward_ton_amount` of at least `fee::deposit` (plus the options'
-forward amount, plus `fee::payload` with a payload), and optionally a forward payload, `deposit_options`: the smallest
+The player transfers hGRAM to the Jackpot with `forward_ton_amount` of at least the deposit fee (`get_jackpot_fees`, `deposit`; plus the options'
+forward amount, plus the payload's fee with a payload), and optionally a forward payload, `deposit_options`: the smallest
 principal accepted, a beneficiary, a response destination, a forward amount and a forward payload. The Jackpot reads it
 inline or in a ref; a ref is recommended, since with its addresses it does not fit inline beside the transfer's other
 fields.
@@ -159,11 +199,11 @@ defaults to `v - floor(v / 100)`, so a price above 1% is refused unless the app 
 
 A withdrawal is a standard TEP-74 `burn` sent to the wallet by its owner, or the comment `w` (below).
 
-1. The owner sends `burn(x)` to their wallet (`x = 0` means all, and needs a balance), with at least `fee::withdraw`
+1. The owner sends `burn(x)` to their wallet (`x = 0` means all, and needs a balance), with at least the burn fee (`getBurnFee`)
    and optional `withdraw_options` (send to the successor, a forward amount and payload). A partial burn takes at
    least 1 GRAM of principal. The wallet checks the owner and the fee, lowers the balance, and sends
    `burn_notification`. When that empties it (`last`), `pending += 1`.
-2. The Jackpot takes `burn_notification` only from the wallet of the owner it names, and never throws. `tickets -= x`,
+2. The Jackpot takes `burn_notification` only from the wallet of the owner it names, and, once its fee check has passed, never throws. `tickets -= x`,
    `update(tag, b, -x)`, `close_wallet` to the wallet if `last`, and the payment is made in the same transaction, at the
    stored rate: `w = min(floor(x * TT / TC), floor(F * x / P))`, then `principal -= x`. The hGRAM goes to the owner
    with the caller's `query_id`, forward amount and payload, and the leftover GRAM to the response destination. A
@@ -176,7 +216,7 @@ action phase fails, the bounce brings the whole `burn_notification` back to the 
 its GRAM to the owner in the message that deletes the account. A later deposit deploys it again with a new position.
 Positions are never reused.
 
-**`w`.** A plain message to the Jackpot with the text comment `w` (or `W`), at least `fee::comment_withdraw`, from a
+**`w`.** A plain message to the Jackpot with the text comment `w` (or `W`), at least the `w` fee (`get_jackpot_fees`, `commentWithdraw`), from a
 basechain address, makes the Jackpot send that sender's wallet a burn of everything, with the wallet's StateInit (so a
 sender with no wallet deploys one that returns the value). The hGRAM comes back with the comment
 `Hipo Jackpot withdrawal`. An empty comment is a top-up; any other text is refused with `bad_comment`.
@@ -186,7 +226,7 @@ sender with no wallet deploys one that returns the value). The hGRAM comes back 
 The states are none, waiting and resolving. A boundary that sets a pot aside opens a draw in state waiting. There is no
 quoting state.
 
-1. **Submit.** Anyone sends `submit_randomness(signature, witness)` with at least `fee::submit`, from when drand
+1. **Submit.** Anyone sends `submit_randomness(signature, witness)` with at least the submit fee (`get_jackpot_fees`), from when drand
    publishes `R` (the round at `last_boundary + 60 s`) until 1,800 s (`submit_cutoff`) before the earliest next
    boundary, `last_boundary + min_gap`. The Jackpot checks, cheapest first: the fee, the state, the cut-off, halted,
    the flag, its float against `fee::draw_budget`, then the drand check. A failed check throws, so junk pays for
@@ -255,10 +295,11 @@ notification was missed) it only lowers `unstaking_tokens`. A stuck count blocks
   Jackpot, or `addr_none` to clear it. A withdrawal with `to_successor` is paid, if the value covers the fee, as a
   `deposit_options` deposit for the same owner into the successor, with `successor_deposit_fee` attached; if the
   successor refuses, the hGRAM goes to the owner. `scripts/setSuccessor.ts` refuses a fee below the successor's
-  `fee::deposit + fee::return + fee::payload`, read from its `get_jackpot_fees`.
+  three times the successor's deposit fee (its prices may rise before the move) plus `fee::return` and the payload's fee,
+  read from its `get_jackpot_fees`.
 - **`withdraw_for(to_successor, owners)`** (governor, retired only): up to 100 owner hashes, sent as `w` burns. For
-  `n` owners the governor pays `n·(fee::comment_withdraw + fee::withdraw_for_gas + successor fee for a move) +
-  fee::handler`, and gets back what is above that; what an owner's wallet does not spend goes to that owner. The
+  `n` owners the governor pays at least `n·per + gas(gas_consumed() + 10,000)`, where `per` is the value sent to each
+  wallet (the `w` value, plus the successor fee for a move), and gets back what is above that; what an owner's wallet does not spend goes to that owner. The
   successor fee is charged whenever `to_successor` is set, even with no successor set; that is harmless, since the
   governor pays.
 - **`sweep`** (anyone, with `fee::sweep + close_cost(next_position)`, read from `get_close_cost`): only when retired,
@@ -435,7 +476,8 @@ must end with `throw(0)` (so the old code never saves over it), must accept data
 to the same code must succeed; the dry run does exactly that), and must never lower `tag`: nodes compare it with the tag
 of each message to decide when to fold. `upgrade_code` saves the data before `set_code`, because the tick may have
 changed it in memory. If `migrate` cannot read the stored layout, the transaction throws and the old code and data stay.
-Wallet and node code cannot be upgraded.
+Wallet and node code cannot be upgraded. The undo of a bounced `deposit_booked` expects the owner's address at the end of
+the booking's reply cell, so a future upgrade must keep that layout while a `deposit_booked` may be in flight.
 
 ## Operator's checklist
 

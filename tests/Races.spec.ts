@@ -4,7 +4,7 @@
 import '@ton/test-utils'
 import { Address, BitString, Cell, beginCell, toNano } from '@ton/core'
 import { BlockchainTransaction, SandboxContract, TreasuryContract } from '@ton/sandbox'
-import { JackpotOp, SlotResult } from '../wrappers/Jackpot'
+import { JackpotOp, LogTopic, SlotResult, UntrackedLog, logsOf } from '../wrappers/Jackpot'
 import {
     Env,
     depositHgram,
@@ -20,6 +20,7 @@ import {
     walletAt,
     withdraw,
 } from './jackpot/setup'
+import { gasFee, forwardFee } from './jackpot/prices'
 import { Scene, deliver, fresh, holdUntil, put, startDeposit, submitDraw, toAddr, toBoundary } from './jackpot/scenario'
 
 const G = (n: string | number) => toNano(String(n))
@@ -280,17 +281,25 @@ describe('Closed and frozen wallets', () => {
         expect((await jackpotState(env)).incomingTokens).toBe(G('30'))
         // the first deposit_ready arrives: the Jackpot books, deposit_booked bounces off the frozen wallet, the booking is undone
         const principal0 = (await jackpotState(env)).principal
-        expectChainSucceeded(await deliver(env, r1))
+        const undone = await deliver(env, r1)
+        expectChainSucceeded(undone)
         const s = await jackpotState(env)
         expect(s.incomingTokens).toBe(0n)
         expect(s.principal).toBe(principal0)
         expect(s.tickets).toBe(principal0)
         // the owner has the 30 back, less at most the entry price (here: none, there is no pot)
+        // the refund is paid from what the bounce carries; when that is short of the payout fee, the tokens leave the count
+        // untracked and return_tokens recovers them (the undo itself stands either way)
+        if ((await hgramOf(env, a.address)) < h + G('30') - 2n) {
+            const [log] = logsOf<UntrackedLog>(undone.externals, LogTopic.untracked)
+            expect(log.tokens).toBeGreaterThan(0n)
+            expectChainSucceeded(await env.jackpot.sendReturnTokens(env.governor.getSender(), { value: G('0.3'), owner: a.address, amount: log.tokens }))
+        }
         expect(await hgramOf(env, a.address)).toBeGreaterThanOrEqual(h + G('30') - 2n)
         await expectSolvent(env)
     }, 120000)
 
-    it('Bounce value: a bounced deposit_booked carrying exactly the bounce floor, at 400 nano-GRAM per gas and with an 8-cell, 1,023-bit payload, is undone: the counters are right and the refund is paid', async () => {
+    it('Bounce value: the smallest bounced deposit_booked, at 400 nano-GRAM per gas and with an 8-cell, 1,023-bit payload, is undone: the counters are right and the tokens are untracked, not lost', async () => {
         const sc = await fresh({ minDeposit: 1n, players: 2, mint: G('1000') })
         const { env, players } = sc
         await put(env, players[0], G('100'))
@@ -306,6 +315,7 @@ describe('Closed and frozen wallets', () => {
             .storeAddress(players[0].address)
             .storeCoins(G('0.05'))
             .storeMaybeRef(payload)
+            .storeAddress(players[0].address)
             .endCell()
         const original = beginCell()
             .storeUint(JackpotOp.depositBooked, 32)
@@ -314,8 +324,9 @@ describe('Closed and frozen wallets', () => {
             .storeUint(0, 32)
             .storeRef(reply)
             .endCell()
-        // update (4 hops) + cancel + refund + two handlers + forwarding: fee::bounce_floor
-        const floor = 4n * 35_000_000n + 10_000_000n + 50_000_000n + 2n * 20_000_000n + 10_000_000n
+        // the smallest bounce deposit_booked can carry: its forwarding and H wallet handlers (the undo raises its own gas
+        // limit and pays its update and cancel from the Jackpot's balance)
+        const floor = forwardFee(env.blockchain, 1n, 1023n) + 2n * gasFee(env.blockchain, 18000n)
         const msg = messageFrom(
             walletAt(env, players[0].address).address,
             env.jackpot.address,
@@ -329,7 +340,9 @@ describe('Closed and frozen wallets', () => {
         const s1 = await jackpotState(env)
         expect([s1.principal, s1.tickets]).toEqual([s0.principal - G('10'), s0.tickets - G('10')])
         expect((await nodeAt(env, 1, 0n).getNodeData()).removed[0]).toBe(G('10'))
-        expect(await hgramOf(env, players[0].address)).toBeGreaterThan(h) // the refund was paid
+        // the refund needs the payout fee; this bounce carries less, so the tokens are untracked and logged
+        expect(logsOf<UntrackedLog>(r.externals, LogTopic.untracked)[0].tokens).toBeGreaterThan(0n)
+        expect(await hgramOf(env, players[0].address)).toBe(h)
         expect(s1.heldTokens - (await hgramOf(env, env.jackpot.address))).toBeLessThanOrEqual(0n)
     }, 120000)
 
@@ -344,6 +357,7 @@ describe('Closed and frozen wallets', () => {
             .storeAddress(players[0].address)
             .storeCoins(1n)
             .storeMaybeRef(null)
+            .storeAddress(players[0].address)
             .endCell()
         const original = beginCell()
             .storeUint(JackpotOp.depositBooked, 32)

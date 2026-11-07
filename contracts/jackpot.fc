@@ -12,6 +12,7 @@
 ;; one wallet per player (contracts/wallet.fc) holds the player's principal.
 
 #include "imports/utils.fc";
+#include "imports/fees.fc";
 #include "imports/drand.fc";
 
 ;; FunC allows 31 globals, so what is read rarely -- the governor's parameters, the boundary, the draw's prizes,
@@ -480,7 +481,7 @@ int value_left(int sent) inline {
     int fwd = forward_ton_amount;
     cell body_payload = payload;
     ;; keep? is a move already decided on the value left: its forward fields stay, whatever the handler spent since
-    if (~ keep?) & (value_left(sent) < fee::payout + fwd) {
+    if (~ keep?) & (value_left(sent) < payout_fee() + fwd) {
         fwd = 0;
         body_payload = null();
     }
@@ -491,12 +492,12 @@ int value_left(int sent) inline {
 
 ;; The refund of tokens the handler counts (counted? true: they are in held_tokens) or does not count yet. When the
 ;; value cannot pay a transfer at all (fee::return), counted tokens leave the count unpaid, with an untracked log, and
-;; uncounted ones simply stay in the wallet. `sent` is what the handler already sent; with sent > 0 (the undo of a
-;; booking, which has sent the update and the cancel) the refund's send ignores errors: a refund lost leaves hGRAM
-;; untracked, which return_tokens recovers, and the undo itself stands.
-() refund(int query_id, slice to, int amount, int reason, int has_options?, int fwd, cell payload, int counted?, int sent)
-    impure inline_ref {
-    if value_left(sent) < fee::payout {
+;; uncounted ones simply stay in the wallet. `sent` is what the handler already sent from the message's value; with soft?
+;; (the undo of a booking) the refund's send ignores errors: a refund lost leaves hGRAM untracked, which return_tokens
+;; recovers, and the undo itself stands.
+() refund(int query_id, slice to, int amount, int reason, int has_options?, int fwd, cell payload, int counted?, int sent,
+    int soft?) impure inline_ref {
+    if value_left(sent) < payout_fee() {
         if counted? {
             held_tokens -= amount;
             emit_log(log::untracked, begin_cell().store_uint(untracked::refund_unpaid, 8).store_coins(amount));
@@ -517,13 +518,13 @@ int value_left(int sent) inline {
             .store_maybe_ref(reason == reason::bad_options ? null() : payload)
             .end_cell();
     }
-    pay_rest(query_id, to, to, amount, refund_fwd, refund_payload, 0, sent, sent > 0 ? send::ignore_errors : 0, false);
+    pay_rest(query_id, to, to, amount, refund_fwd, refund_payload, 0, sent, soft? ? send::ignore_errors : 0, false);
 }
 
 ;; Sends a change of the tickets of position b down the tree. A new position's update carries its owner, the
 ;; deploy of the top node when b = 0, and the reserve of every node b opens. Returns the part of the value that came
 ;; from the float.
-int send_update(int query_id, int b, int delta, int owner_hash) impure inline_ref {
+int send_update(int query_id, int b, int delta, int owner_hash, int coins) impure inline_ref {
     int opens = 0;
     builder state_init = null();
     int has_owner? = owner_hash >= 0;
@@ -550,7 +551,7 @@ int send_update(int query_id, int b, int delta, int owner_hash) impure inline_re
         body = body.store_uint(owner_hash, 256);
     }
     builder top = create_address(chain::base, node_hash(tree::levels, 0));
-    out(false, top, state_init, body, fee::update + opens, send::pay_gas_separately);
+    out(false, top, state_init, body, coins + opens, send::pay_gas_separately);
     return opens;
 }
 
@@ -705,6 +706,8 @@ builder nft_transfer_body(int query_id, slice new_owner, slice response, int for
     slice response = sender;
     int fwd = 0;
     cell inner = null();
+    int pcells = 0;
+    int pbits = 0;
     if p.slice_bits() >= 32 {
         if p.preload_uint(32) == op::deposit_options {
             has_options? = true;
@@ -736,6 +739,9 @@ builder nft_transfer_body(int query_id, slice new_owner, slice response, int for
                     & (~ equal_slice_bits(response, my_address()));
                 if ok? & (~ inner.null?()) {
                     ok? = payload_fits?(inner);
+                    if ok? {
+                        ( pcells, pbits ) = payload_size(inner, max_payload_cells);
+                    }
                 }
             }
         }
@@ -748,12 +754,12 @@ builder nft_transfer_body(int query_id, slice new_owner, slice response, int for
         reason = reason::halted;
     } elseif retired?() {
         reason = reason::retired;
-    } elseif incoming_value() < fee::deposit + fwd + (inner.null?() ? 0 : fee::payload) {
+    } elseif incoming_value() < deposit_fee(fwd, pcells, pbits) {
         reason = reason::low_value;
     }
     if reason {
         ;; a refusal for bad options goes to the depositor, never to an address the options named
-        refund(query_id, ok? ? response : sender, amount, reason, has_options?, ok? ? fwd : 0, inner, false, 0);
+        refund(query_id, ok? ? response : sender, amount, reason, has_options?, ok? ? fwd : 0, inner, false, 0, false);
         return ();
     }
 
@@ -782,10 +788,15 @@ builder nft_transfer_body(int query_id, slice new_owner, slice response, int for
     ifnot is_jwallet_of?(src, owner) {
         return ();
     }
+    int pcells = 0;
+    int pbits = 0;
+    ifnot payload.null?() {
+        ( pcells, pbits ) = payload_size(payload, max_payload_cells);
+    }
 
     if busy? {
         incoming_tokens -= t;
-        refund(query_id, response, t, reason::wallet_busy, has_options?, fwd, payload, true, 0);
+        refund(query_id, response, t, reason::wallet_busy, has_options?, fwd, payload, true, 0, false);
         return ();
     }
 
@@ -815,29 +826,41 @@ builder nft_transfer_body(int query_id, slice new_owner, slice response, int for
         reason = reason::price;
     } elseif (~ has_position?) & (next_position >= tree::capacity) {
         reason = reason::tree_full;
+    } elseif value_left(0) < update_min() + booked_min(pcells, pbits) {
+        ;; the update and deposit_booked could not be paid for at the current price
+        reason = reason::low_value;
     }
     if reason {
         emit_log(log::refused, begin_cell().store_slice(owner).store_coins(t).store_coins(v).store_coins(c).store_uint(reason, 8));
         builder cancel = begin_cell().store_uint(op::deposit_cancelled, 32).store_uint(query_id, 64);
-        out(true, jwallet_address(owner), null(), cancel, fee::release, send::regular);
-        refund(query_id, response, t, reason, has_options?, fwd, payload, true, fee::release);
+        out(true, jwallet_address(owner), null(), cancel, release(), send::regular);
+        refund(query_id, response, t, reason, has_options?, fwd, payload, true, release(), false);
         return ();
     }
 
     principal += c;
     tickets += c;
     int float_delta = 0;
+    ;; the update gets the full headroom when the value allows, else what is left after deposit_booked's minimum
+    int uv = min(update_value(), value_left(0) - booked_min(pcells, pbits));
     if has_position? {
-        send_update(query_id, b, c, -1);
+        send_update(query_id, b, c, -1, uv);
     } else {
         b = next_position;
         next_position += 1;
-        int opens = send_update(query_id, b, c, owner_hash(owner));
+        int opens = send_update(query_id, b, c, owner_hash(owner), uv);
         float_delta = fee::node_share - opens;
+        ;; the forwarding of the top node's StateInit is paid from the balance (pay_gas_separately), so it is taken out of
+        ;; the reserve: the float pays it, not the booked value, which a price step could leave short for its handler
+        if b == 0 {
+            float_delta -= fwd_node_deploy();
+        }
     }
     emit_log(log::booking, begin_cell().store_slice(owner).store_slice(sender).store_uint(b, 32).store_coins(c).store_coins(t));
 
-    cell reply = begin_cell().store_slice(sender).store_slice(response).store_coins(fwd).store_maybe_ref(payload).end_cell();
+    ;; the owner goes last, where the wallet does not read: a bounce of deposit_booked is checked against it
+    cell reply = begin_cell().store_slice(sender).store_slice(response).store_coins(fwd).store_maybe_ref(payload)
+        .store_slice(owner).end_cell();
     builder booked = begin_cell()
         .store_uint(op::deposit_booked, 32)
         .store_uint(query_id, 64)
@@ -862,8 +885,9 @@ int tokens_for(int x, int tc, int tt) inline {
 ;;
 
 ;; From the jGRAM wallet of `sender`, which has taken x from its balance. The withdrawal is paid here, at the stored
-;; rate, and never throws: not while halted, retired or falling, not in a draw. Every action carries +16, so a failed
-;; action phase bounces the message and the wallet restores x.
+;; rate. The fee is checked first, before any state changes, and a short burn throws, so the burn bounces and the wallet
+;; restores x. After that it never throws: not while halted, retired or falling, not in a draw. Every action carries
+;; +16, so a failed action phase bounces the message and the wallet restores x.
 () burn_notification(slice src, slice s) impure inline {
     act_flag = send::bounce_if_failed;
     int query_id = s~load_uint(64);
@@ -894,18 +918,27 @@ int tokens_for(int x, int tc, int tt) inline {
         response = owner;
     }
 
+    ;; the fee check comes first, within bound::pre gas, before any state changes: a short burn throws and bounces, and
+    ;; the wallet restores the balance. A rule for every future Jackpot: the wallet's frozen minimum pays no more.
+    int pcells = 0;
+    int pbits = 0;
+    ifnot payload.null?() {
+        ( pcells, pbits ) = payload_size(payload, max_payload_cells);
+    }
+    throw_unless(err::insufficient_fee, incoming_value() >= burn_arrives(fwd, pcells, pbits));
+
     tickets -= x;
-    send_update(query_id, b, - x, -1);
-    int spent = fee::update + (last? ? fee::release : 0);
+    send_update(query_id, b, - x, -1, update_value());
+    int spent = update_value() + (last? ? release() : 0);
     if last? {
         builder close = begin_cell().store_uint(op::close_wallet, 32).store_uint(query_id, 64);
-        out(true, jwallet_address(owner), null(), close, fee::release, send::regular);
+        out(true, jwallet_address(owner), null(), close, release(), send::regular);
     }
     int w = tokens_for(x, quote_coins, quote_tokens);
     principal -= x;
 
     ( _, slice successor, int successor_fee, _ ) = unpack_retirement();
-    int move? = to_successor? & (~ successor.addr_none?()) & (value_left(spent) >= successor_fee + fwd + fee::payout);
+    int move? = to_successor? & (~ successor.addr_none?()) & (value_left(spent) >= successor_fee + fwd + payout_fee());
     emit_log(log::withdrawal, begin_cell().store_slice(owner).store_uint(b, 32).store_coins(x).store_coins(w)
         .store_int(last?, 1).store_int(move?, 1).store_uint(quote_coins, 128).store_uint(quote_tokens, 128));
 
@@ -936,7 +969,7 @@ int tokens_for(int x, int tc, int tt) inline {
 ;; Anyone may poke. The poke asks the treasury for a quote and carries its context in the quote's custom_payload.
 () poke(slice src, slice s) impure inline {
     int query_id = s~load_uint(64);
-    throw_unless(err::insufficient_fee, incoming_value() >= fee::poke);
+    throw_unless(err::insufficient_fee, incoming_value() >= poke_fee());
     cell ctx = begin_cell().store_uint(3, 4).store_uint(now(), 32).store_slice(src).end_cell();
     builder body = begin_cell()
         .store_uint(op::provide_current_quote, 32)
@@ -961,7 +994,7 @@ int tokens_for(int x, int tc, int tt) inline {
         .store_coins(u)
         .store_uint(0, 2) ;; return_excess: addr_none, which Hipo reads as the owner
         .store_uint(0, 1); ;; no custom_payload: mode auto
-    out(true, wallet.to_builder(), null(), body, fee::unstake, send::regular);
+    out(true, wallet.to_builder(), null(), body, unstake_run(), send::regular);
     emit_log(log::unstake, begin_cell().store_coins(u).store_coins(unstaking_tokens).store_coins(bal0));
 }
 
@@ -1008,7 +1041,7 @@ int boundary_work(int tc, int tt) impure inline_ref {
         int u = 0;
         builder draw_ref = null();
         if (snapshot_tickets > 0) & (pot >= min_pot) {
-            if (bal0 >= fee::unstake) & (bal0 < float::low) & unstake_allowed?() {
+            if (bal0 >= unstake_run()) & (bal0 < float::low) & unstake_allowed?() {
                 u = unstake_amount(pot, tc, tt);
             }
             int pot2 = pot - u;
@@ -1019,7 +1052,7 @@ int boundary_work(int tc, int tt) impure inline_ref {
             int p2 = rest - p0 - p1;
             if u > 0 {
                 send_unstake(u);
-                unstake_paid = fee::unstake;
+                unstake_paid = unstake_run();
             }
             reserved_tokens += pot2;
             burn_owed += burn;
@@ -1125,7 +1158,7 @@ int boundary_work(int tc, int tt) impure inline_ref {
     s.end_parse();
 
     ( int last, _, _, _, int min_gap, _, _ ) = unpack_boundary();
-    throw_unless(err::insufficient_fee, incoming_value() >= fee::submit);
+    throw_unless(err::insufficient_fee, incoming_value() >= submit_fee());
     throw_unless(err::not_waiting_for_randomness, draw_state == draw::waiting);
     throw_unless(err::too_late, now() < last + min_gap - submit_cutoff);
     throw_if(err::halted, halted?);
@@ -1153,7 +1186,7 @@ int boundary_work(int tc, int tt) impure inline_ref {
 ;; u is computed at the stored rate.
 () refill(slice src, slice s) impure inline {
     s~load_uint(64);
-    throw_unless(err::insufficient_fee, incoming_value() >= fee::refill);
+    throw_unless(err::insufficient_fee, incoming_value() >= refill_fee());
     throw_unless(err::refill_not_needed, bal0 < fee::draw_budget);
     throw_unless(err::refill_not_needed, (draw_state == draw::none) | (draw_state == draw::waiting));
     throw_unless(err::refill_not_needed, unstake_allowed?());
@@ -1317,7 +1350,7 @@ int current_reply?(int reply_tag, int slot, int j, int k) inline {
             return ();
         }
         incoming_tokens -= t;
-        refund(query_id, response, t, reason::wallet_unavailable, has_options?, fwd, payload, true, 0);
+        refund(query_id, response, t, reason::wallet_unavailable, has_options?, fwd, payload, true, 0, false);
         return ();
     }
 
@@ -1331,17 +1364,25 @@ int current_reply?(int reply_tag, int slot, int j, int k) inline {
         slice response = reply~load_msg_addr();
         int fwd = reply~load_coins();
         cell payload = reply~load_maybe_ref();
+        slice booked_owner = reply~load_msg_addr();
+        ;; only a bounce from the owner's own jGRAM wallet is an undo
+        ifnot is_jwallet_of?(src, booked_owner) {
+            return ();
+        }
         if (c > principal) | (c > tickets) | (b >= next_position) {
             return ();
         }
+        ;; the undo always commits, even on a bounce that carries little: it raises its own gas limit to a fixed bound, paid
+        ;; by the float, and sends its update and the cancel with explicit values out of the balance
+        set_gas_limit(bound::jackpot);
         int w = tokens_for(c, quote_coins, quote_tokens);
         principal -= c;
         tickets -= c;
-        send_update(query_id, b, - c, -1);
+        send_update(query_id, b, - c, -1, update_value());
         emit_log(log::booking_undone, begin_cell().store_uint(b, 32).store_coins(c).store_coins(w));
         builder cancel = begin_cell().store_uint(op::deposit_cancelled, 32).store_uint(query_id, 64);
-        out(true, src.to_builder(), null(), cancel, fee::release, send::regular);
-        refund(query_id, response, w, reason::wallet_unavailable, (fwd > 0) | (~ payload.null?()), fwd, payload, true, fee::update + fee::release);
+        out(true, src.to_builder(), null(), cancel, release(), send::regular);
+        refund(query_id, response, w, reason::wallet_unavailable, (fwd > 0) | (~ payload.null?()), fwd, payload, true, update_value() + release(), true);
         return ();
     }
 
@@ -1388,7 +1429,7 @@ builder all_burn_body(int query_id, int to_successor?, int move?) inline_ref {
     }
     throw_unless(err::bad_comment, (len == 8) & ((s.preload_uint(8) == 119) | (s.preload_uint(8) == 87)) & (s.slice_refs() == 0));
     act_flag = send::bounce_if_failed;
-    throw_unless(err::insufficient_fee, incoming_value() >= fee::comment_withdraw);
+    throw_unless(err::insufficient_fee, incoming_value() >= w_fee());
     throw_unless(err::invalid_parameters, base_addr?(src));
     send_all_burn(src, 0, false, false, 0, send::remaining_value);
 }
@@ -1398,7 +1439,7 @@ builder all_burn_body(int query_id, int to_successor?, int move?) inline_ref {
     int query_id = s~load_uint(64);
     slice owner = s~load_msg_addr();
     int include? = s~load_int(1);
-    throw_unless(err::insufficient_fee, incoming_value() >= fee::wallet_address);
+    throw_unless(err::insufficient_fee, incoming_value() >= tep89_fee());
     builder body = begin_cell().store_uint(op::take_wallet_address, 32).store_uint(query_id, 64);
     if base_addr?(owner) {
         body = body.store_slice(jwallet_address(owner).end_cell().begin_parse());
@@ -1445,12 +1486,15 @@ builder all_burn_body(int query_id, int to_successor?, int move?) inline_ref {
     int query_id = s~load_uint(64);
     int to_successor? = s~load_int(1);
     cell owners = s~load_ref();
+    int value_per_owner = s~load_coins();
     s.end_parse();
     require_governor(src);
     throw_unless(err::not_retired, retired?());
     ( _, slice successor, int successor_fee, _ ) = unpack_retirement();
     int move? = to_successor? & (~ successor.addr_none?());
-    int per = fee::comment_withdraw + (to_successor? ? successor_fee : 0);
+    ;; what each owner's wallet is sent, computed once; the Jackpot's own gas is priced on what it has used
+    int per = value_per_owner;
+    throw_unless(err::insufficient_fee, per >= w_value() + (to_successor? ? successor_fee : 0));
 
     int n = 0;
     cell c = owners;
@@ -1465,7 +1509,7 @@ builder all_burn_body(int query_id, int to_successor?, int move?) inline_ref {
         }
         c = cs.slice_refs() ? cs~load_ref() : null();
     }
-    throw_unless(err::insufficient_fee, (n > 0) & (incoming_value() >= n * (per + fee::withdraw_for_gas) + fee::handler));
+    throw_unless(err::insufficient_fee, (n > 0) & (incoming_value() >= n * per + gas_fee(gas_consumed() + 10000)));
     send_excess(src, 0);
 }
 
@@ -2105,20 +2149,43 @@ var get_addresses() method_id {
 
 var get_jackpot_fees() method_id {
     return
-        ( fee::deposit
-        , fee::withdraw
-        , fee::comment_withdraw
-        , fee::submit
-        , fee::poke
-        , fee::refill
-        , fee::unstake
+        ( deposit_fee(0, 0, 0)
+        , burn_fee(0, 0, 0)
+        , w_fee()
+        , submit_fee()
+        , poke_fee()
+        , refill_fee()
+        , unstake_run()
         , fee::sweep
         , fee::return
-        , fee::payload
+        , payload_fee_cap()
         , fee::draw_budget
         , float::low
         , float::high
-        , fee::wallet_storage
+        , wallet_storage()
         , fee::node_storage
+        , payout_fee()
+        , tep89_fee()
+        );
+}
+
+;; The burn fee for a forward amount and a payload of the given size, at the current price.
+var get_burn_fee(int forward_amount, int payload_cells, int payload_bits) method_id {
+    return burn_fee(forward_amount, payload_cells, payload_bits);
+}
+
+;; The parts the fees are built from, at the current price: for tests and monitoring.
+var get_fee_parts() method_id {
+    return
+        ( hop()
+        , update_min()
+        , update_value()
+        , release()
+        , hipo_send()
+        , hipo_unstake()
+        , booked_min(0, 0)
+        , fee::node_share
+        , w_value()
+        , burn_arrives(0, 0, 0)
         );
 }

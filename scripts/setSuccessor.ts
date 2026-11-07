@@ -32,9 +32,10 @@ export async function run(provider: NetworkProvider) {
             throw new Error('The successor cannot be this Jackpot')
         }
         const fees = await provider.open(Jackpot.createFromAddress(successor)).getJackpotFees()
-        const needed = fees.deposit + fees.return + fees.payload
+        // at least 3 times the successor's deposit fee: its price may rise before the move is made
+        const needed = 3n * fees.deposit + fees.return + fees.payload
         ui.write(
-            `The successor's fees: deposit ${amount(fees.deposit)} + return ${amount(fees.return)} + payload ` +
+            `The successor's fees: 3 x deposit ${amount(fees.deposit)} + return ${amount(fees.return)} + payload ` +
                 `${amount(fees.payload)} = ${amount(needed)} GRAM`,
         )
         depositFee = await askAmount(provider, 'Enter the deposit fee a move carries, in GRAM', amount(needed))

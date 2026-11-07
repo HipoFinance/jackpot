@@ -433,13 +433,13 @@ const reasonNames = new Map<number, string>(Object.entries(J.Reason).map(([k, v]
 
     Sc.setNow(env, (env.blockchain.now as number) + 600)
     {
-        const value = (env.fees.commentWithdraw + J.withdrawForGas) * 1n + J.handlerFee
+        const value = (await env.jackpot.getFeeParts()).wValue + G(0.1)
         const r = await env.jackpot.sendWithdrawFor(env.governor.getSender(), { value, toSuccessor: false, owners: [P.bob.address] })
         await record('withdraw-for', [r.transactions])
     }
     Sc.setNow(env, (env.blockchain.now as number) + 60)
     {
-        const value = (env.fees.commentWithdraw + fee + J.withdrawForGas) * 1n + J.handlerFee
+        const value = (await env.jackpot.getFeeParts()).wValue + fee + G(0.1)
         const r = await env.jackpot.sendWithdrawFor(env.governor.getSender(), { value, toSuccessor: true, owners: [P.dave.address] })
         await record('move', [r.transactions])
     }
