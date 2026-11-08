@@ -1,6 +1,6 @@
 # Hipo Jackpot v2, amendment 1
 
-**Status:** approved
+**Status:** implemented
 
 Amends [`2026-10-31-jackpot-v2.md`](2026-10-31-jackpot-v2.md). **v2 holds except where this document changes it.**
 Nothing is deployed, so storage and messages change freely. The v2 text is not edited; the list below says which
@@ -1509,14 +1509,14 @@ The v2 criteria hold except those listed as removed at the top.
       up only their own chance: in the two-player example (500,000 GRAM each), the honest player's expected gain per
       draw over many seeds is the same, within sampling error, whether or not the other burns after a losing seed.
       <!-- evidence: Acceptance "The seed-informed exit is closed" (scaled to 500 GRAM each, 12 seeds, the honest player's prizes identical seed by seed) -->
-- [ ] **Deposits always pay the normal price.** A deposit while a draw waits pays the normal formula, wins nothing in the
+- [x] **Deposits always pay the normal price.** A deposit while a draw waits pays the normal formula, wins nothing in the
       waiting draw, joins the next snapshot, and over at least 1,000 seeds its mean prize minus its price is at most 0
       within sampling error, as v2's sniper test, at `v` of 0.01, 1, 100 and 10,000 times `P`.
-      <!-- not ticked: ran at 10 seeds (SNIPER_SEEDS=10), not 1,000; the exact-arithmetic part and the formula are checked (Acceptance "Deposits always pay the normal price", "A deposit while a draw waits…") -->
-- [ ] **No undercharge after a withdrawal.** In the audit's example (W 900,000, H 100,000; W withdraws all; D deposits
+      <!-- evidence: Acceptance "Deposits always pay the normal price" at the default 1,000 seeds, long run of 2026-11-07 at 40940e2 (310 passed) -->
+- [x] **No undercharge after a withdrawal.** In the audit's example (W 900,000, H 100,000; W withdraws all; D deposits
       100,000), D books 99,691 to within rounding, and H's mean prize over many seeds is 279.0 GRAM within sampling
       error.
-      <!-- not ticked: ran at 30 seeds (HAL_SEEDS=30), scaled by 1/1000, not many seeds at full size (Acceptance "No undercharge after a withdrawal") -->
+      <!-- evidence: Acceptance "No undercharge after a withdrawal" at the default 1,000 seeds, long run of 2026-11-07 at 40940e2 -->
 - [x] **Timing.** A test for each row of the timing table, with the reward landing before or after the poke, shows the
       expected value given there, within sampling error; leaving after the reward and before the poke equals leaving
       just before it, in exact fractions.
@@ -1545,19 +1545,19 @@ The v2 criteria hold except those listed as removed at the top.
 - [x] **Rhythm.** With `min_gap` at 2.5 rounds, 30 rounds of rewards and pokes give exactly 10 boundaries, one every
       third round.
       <!-- evidence: Boundaries "Rhythm…" -->
-- [ ] **Hands-free.** 50 rounds run with `poke` after each reward and `submit_randomness` as the only messages besides
+- [x] **Hands-free.** 50 rounds run with `poke` after each reward and `submit_randomness` as the only messages besides
       the treasury's replies and the reward steps: one boundary and three prizes each, nothing else sent by anyone.
-      <!-- not ticked: ran 8 rounds (Soak, HANDS_FREE_ROUNDS=8) and 12 (Boundaries "Hands-free…"), not 50 -->
+      <!-- evidence: Soak hands-free at the default 50 rounds, long run of 2026-11-07 at 40940e2 -->
 - [x] **First boundary.** After deploy, no reply is a boundary before `min_gap`, and the first reward after it makes one.
       A deploy with a zero stored rate, a zero boundary rate, or settings out of bounds is refused.
       <!-- evidence: Boundaries "First boundary…" (the zero boundary rate is covered through the zero stored rate: the deploy data sets both from one quote) -->
 
 **No records**
 
-- [ ] **Fixed storage.** In a sandbox run of at least 1,000 mixed flows (every message kind in this document), after every
+- [x] **Fixed storage.** In a sandbox run of at least 1,000 mixed flows (every message kind in this document), after every
       transaction the Jackpot's data has the same number of cells as at deploy, `content` aside, and no more bits than
       with every `Coins` field at full width. `schema.tlb` has no `HashmapE` in the Jackpot's storage.
-      <!-- not ticked: the full-width bits bound is now asserted after every chain (tests/jackpot/sequences.ts: the non-Coins bits are constant, 16 Coins fields, never above full width) with the cell count and the schema check (Environment "Fixed storage…"); still about 100 flows (6 property sequences), not 1,000 -->
+      <!-- evidence: the bits bound and cell count asserted after every chain in tests/jackpot/sequences.ts; Property ran 674 sequences, 138,703 transactions, 0 failures (6 h, 2026-11-07/08 at 40940e2) -->
 - [x] **Property, extended.** v2's property run, with rewards in parts, gifts, pokes, boundaries and skips in place of
       the clock, also checks after every transaction that `tickets = principal`, that untracked hGRAM (wallet balance −
       `held_tokens`) is at least 0 and equals the sum of the failures the run injected, and that the treasury receives
@@ -1800,7 +1800,8 @@ The v2 criteria hold except those listed as removed at the top.
 - [ ] v2's "Gas returned" holds for a deposit with options, a refusal, a `burn`, a `w`, a poke, one owner of
       `withdraw_for`, and a move.
       <!-- not ticked: covered for a deposit and a burn (Flows "gas returned…") and for `w`, a poke, a submit, a refill and TEP-89 (Verification "Gas returned"); not for a refusal, a deposit with options, one owner of `withdraw_for` or a move -->
-- [ ] Two money audits (one to prove it correct, one to make it lose money) and a code review pass on the code.
+- [x] Two money audits (one to prove it correct, one to make it lose money) and a code review pass on the code.
+      <!-- evidence: tier-3 review 2026-11-05: two money audits and a code review, every finding fixed and re-checked (receipt at 76e934c) -->
       <!-- not verifiable here: run by the coordinator outside the test suite (two money audits and a code review); not checked here -->
 
 ## Risks & rollback
